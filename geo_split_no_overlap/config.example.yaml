@@ -1,0 +1,54 @@
+# geo_split_no_overlap — example config. Copy, edit paths, then:
+#   python -m geo_split_no_overlap.cli build --config this_file.yaml --dry-run
+#   python -m geo_split_no_overlap.cli build --config this_file.yaml
+
+# ── inputs (existing project artifacts — nothing is duplicated) ────────────────
+gt:                                   # "<city>=<gt_dir>" (or a plain dir; "gt_" prefix stripped)
+  - kramatorsc=~/work/gt_cramatorsc
+  - kup=~/work/gt_kup
+  - liman_day=~/work/gt_liman
+tiles_h5: ~/work/out/gallery_h5/multicity_vlad_k32.h5   # lat/lon/city/tile_id/window_size_m
+
+# ── positive rule — chosen by STRATEGY + Registry (not hard-coded here) ────────
+# Swap the rule by editing this block only. List options:
+#   python -m geo_split_no_overlap.cli list-positive-strategies
+positive_selection:
+  strategy: current_rule     # production box rule (reuses make_multicity_split semantics)
+  params:
+    query_size_m: 0.0        # 0 -> "query point inside tile square" (documented rule)
+    same_city_only: true     # match queries only against tiles of their own city
+# Alternative (point strictly inside the tile square):
+# positive_selection:
+#   strategy: contains_point
+#   params: {same_city_only: true}
+
+tile_size_m: 1000.0        # geometry fallback when a tile row lacks window_size_m
+
+# ── conflict / leakage ────────────────────────────────────────────────────────
+area_epsilon_m2: 1.0       # true-m^2 tile-overlap at or below this is NOT leakage
+grid_crs: EPSG:3857        # CRS the tile grid + positive rule live in (recorded in audit)
+
+# ── split targets ─────────────────────────────────────────────────────────────
+train_ratio: 0.70
+val_ratio: 0.15
+test_ratio: 0.15
+ratio_tolerance: 0.05      # max |actual - target| fraction, per split, over KEPT points
+seed: 0
+
+# ── policy ────────────────────────────────────────────────────────────────────
+no_positive_policy: exclude   # exclude | error
+solver: auto                  # auto | exact | cpsat | milp | heuristic
+solver_time_limit_s: 60.0
+solver_workers: 8
+
+# ── output ────────────────────────────────────────────────────────────────────
+out_dir: ~/work/out/gallery_h5/geo_split_run
+
+# ── PER-CITY mode (alternative to gt + tiles_h5 above) ────────────────────────
+# Provide one (points, H5) pair per city; each city is split train/val/test
+# independently to the ratios above, then the per-city splits are unioned. Do NOT
+# also set top-level `gt`/`tiles_h5` when using `cities`.
+# cities:
+#   - {city: kramatorsc, gt: ~/work/gt_cramatorsc, tiles_h5: ~/work/out/gallery_h5/kramatorsc.h5}
+#   - {city: kup,        gt: ~/work/gt_kup,        tiles_h5: ~/work/out/gallery_h5/kup.h5}
+#   - {city: liman,      gt: ~/work/gt_liman,      tiles_h5: ~/work/out/gallery_h5/liman.h5}
