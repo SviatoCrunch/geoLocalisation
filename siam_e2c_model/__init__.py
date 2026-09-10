@@ -2,8 +2,9 @@
 
 Switchable per-cell aggregation (``supervlad`` soft / ``vlad``==``residual`` classic) via
 a Registry, configurable vocabulary size ``k`` and output pyramid ``scales_cells``
-(default the e2c ``(8,4,2,1)``). Reuses ``siam_model_stage3`` unchanged; the residual arm
-is ported from ``train_multicity_e2c`` with a parity test.
+(default the e2c ``(8,4,2,1)``). Self-contained: the Stage-2 core is VENDORED in
+``siam_e2c_model.vendored`` (byte-faithful copy of siam_model_stage3's stage2_core) and
+the residual arm is ported from the e2c script — no external RevisitAnything dependency.
 
 Contains NO loss / batch (see ``geo_train_batching``), no split, no data IO — only the
 model contract: ``build_V`` / ``encode_query`` / ``score`` / ``scales_cells`` / params.

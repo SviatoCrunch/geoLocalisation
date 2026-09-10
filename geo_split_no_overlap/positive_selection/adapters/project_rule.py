@@ -1,9 +1,9 @@
-"""Project adapters — the ONLY reach into pre-existing repo code.
+"""Project adapters — build the subsystem's domain objects from the gallery H5 + gt roots.
 
-Reuses ``make_multicity_split`` helpers (``_merc`` projection, frame parsing, city
-resolution) and the ``multicity_vlad_*.h5`` gallery schema to build the subsystem's
-domain objects. No other module imports this file directly; it is reached only via
-the subsystem's public loaders.
+Uses the VENDORED geometry/frame helpers in :mod:`._reused` (byte-faithful copies of the
+``make_multicity_split`` functions) — no external RevisitAnything dependency. Reads the
+``multicity_vlad_*.h5`` gallery schema. No other module imports this file directly; it is
+reached only via the subsystem's public loaders.
 """
 from __future__ import annotations
 
@@ -13,20 +13,12 @@ from typing import Sequence, Tuple
 import numpy as np
 
 from ..models import GalleryIndex, GalleryTile, GeoPoint
+from . import _reused as mm
 
 _AREA_UNITS = "true_m2 (EPSG:3857 area * cos^2(lat))"
 
 
 def _import_reused():
-    try:
-        import make_multicity_split as mm
-    except Exception as e:  # pragma: no cover - environment guard
-        raise RuntimeError(
-            "positive_selection requires the top-level 'make_multicity_split' module on "
-            "sys.path (run from the repo root). Import failed: " + repr(e))
-    for n in ("_merc", "_parse_stem", "_collect_frames", "_city_and_dir"):
-        if not hasattr(mm, n):
-            raise RuntimeError(f"make_multicity_split is missing reused helper {n!r}")
     return mm
 
 

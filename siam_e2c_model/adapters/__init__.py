@@ -1,4 +1,4 @@
-"""Adapters to siam_model_stage3 (reused, never modified). Internal — reach via the model."""
+"""Adapter to the in-package vendored Stage-2 core. Internal — reach via the model."""
 from __future__ import annotations
 
 from . import stage3

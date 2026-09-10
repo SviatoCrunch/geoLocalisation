@@ -1,7 +1,7 @@
 """E2cModel — the e2c Stage-2 query-conditioned model with a switchable aggregation arm.
 
-Wraps the reused ``siam_model_stage3`` model (never modified) and a chosen aggregation
-Strategy (SuperVLAD soft / classic-residual VLAD). Exposes a uniform, model-only
+Wraps the in-package vendored Stage-2 core (``siam_e2c_model.vendored``) and a chosen
+aggregation Strategy (SuperVLAD soft / classic-residual VLAD). Exposes a uniform, model-only
 interface for a training loop + ``geo_train_batching`` to consume:
 
     build_V(grids)     encode_query(tokens)     score(Q, V)
