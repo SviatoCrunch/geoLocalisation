@@ -18,11 +18,12 @@ from .maskers import (SkyMasker, CascadingMasker, build_resolver, available_mask
                       register_masker)
 from .store import MaskStore
 from .precompute import precompute
+from .ingest import ingest_sky_masks
 
 __all__ = [
     "SkyFilterConfig", "SkyMask", "reduce_to_grid", "apply_drop",
     "SkyMasker", "CascadingMasker", "build_resolver", "available_maskers", "register_masker",
-    "MaskStore", "precompute",
+    "MaskStore", "precompute", "ingest_sky_masks",
 ]
 
 __version__ = "0.1.0"

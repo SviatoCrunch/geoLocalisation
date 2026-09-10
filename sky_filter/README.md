@@ -17,6 +17,20 @@ Sky is **DROPPED** (keep-mask; sky tokens removed before global/patch, as in Sta
 The `CascadingMasker` tries backends in `cfg.backend_order`; the first non-`None` mask
 wins and records its backend. A frame with a ready mask **never** re-runs the model.
 
+## Primary source: GT masks (`ingest_sky_masks`)
+The main path is **precomputed where a GT sky mask exists, neural where it doesn't**.
+`ingest_sky_masks(mask_dir, city, store)` reads `GT_flat_mask/*__Sky.png` (from
+`s3_gt_sync.make_masks`), **inverts** sky→keep (`keep = ~(sky>0)`), and stores one
+keep-mask per `frame_id = "<city>:<stem>"`. Frames without a `__Sky.png` are simply not
+stored → the resolver falls through to the neural backend. Corrupt `lat_lon` stems (e.g.
+a `8.59…` latitude missing the leading `4`) are skipped + reported.
+
+```python
+from sky_filter import MaskStore, ingest_sky_masks
+store = MaskStore("~/work/sky_masks")
+ingest_sky_masks("~/work/gt_cramatorsc/GT_flat_mask", "cramatorsc", store)   # GT → precomputed
+```
+
 ## Flow
 ```python
 from sky_filter import SkyFilterConfig, MaskStore, precompute
