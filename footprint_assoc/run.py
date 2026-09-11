@@ -129,9 +129,9 @@ def main(argv=None) -> int:
             n_skip_nocoord += 1
             continue
         lat, lon = ll
-        mkey = _mask_key(args.city, p.stem, store_keys)
+        mkey = _mask_key(args.city, p.stem, store_keys)     # id-stripped key to LOAD the mask
         keep_px = store.load(mkey) if mkey else None
-        frame_id = mkey or f"{args.city}:{p.stem}"
+        frame_id = p.stem                                   # KMZ label = the jpg name (keeps the number)
         if keep_px is None and not args.include_unmasked:
             n_skip_nomask += 1
             continue
