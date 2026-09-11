@@ -61,7 +61,8 @@ def train(args) -> dict:
     sr = {w: build_split_relevance(args.split_config, args.split_json, w,
                                    query_size_m=args.query_size_m, safe_eps_area=args.safe_eps_area)
           for w in ("train", "val", "test")}
-    tiles = TileGridLoader(galleries, grid_size=args.grid_size)
+    tiles = TileGridLoader(galleries, grid_size=args.grid_size)              # cached: train pair tiles
+    eval_tiles = TileGridLoader(galleries, grid_size=args.grid_size, cache=False)  # streamed: full gallery
     store = QueryTokenStore(queries)
     for w in ("train", "val", "test"):
         n = sum(1 for q in sr[w].query_ids if store.has(q))
@@ -134,7 +135,7 @@ def train(args) -> dict:
         do_eval = (epoch > 0 and epoch % args.eval_every == 0) or (epoch == args.epochs - 1)
         if do_eval:
             for w in ("val", "test"):
-                row[w] = evaluate(model, store, sr[w], tiles, dev, args.eval_chunk)
+                row[w] = evaluate(model, store, sr[w], eval_tiles, dev, args.eval_chunk, progress=True)
             if str(dev).startswith("cuda"):
                 torch.cuda.empty_cache()
             vmr = row["val"].get("median_rank", float("inf"))
@@ -152,7 +153,7 @@ def train(args) -> dict:
     logf.close()
     (out / "best.json").write_text(json.dumps(best, indent=2), encoding="utf-8")
     print(f"[ok] best epoch {best['epoch']} val md-rank {best['median_rank']} -> {out}", flush=True)
-    tiles.close(); store.close()
+    tiles.close(); eval_tiles.close(); store.close()
     return best
 
 
@@ -182,7 +183,8 @@ def main(argv=None) -> int:
     ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--tau", type=float, default=0.10)
     ap.add_argument("--grad-clip", type=float, default=1.0)
-    ap.add_argument("--eval-every", type=int, default=2)
+    ap.add_argument("--eval-every", type=int, default=5,
+                    help="eval every N epochs (full-gallery pass streams all tiles from disk — costly)")
     ap.add_argument("--patience", type=int, default=8)
     ap.add_argument("--grid-size", type=int, default=0, help="resample token grids to g×g (0=keep)")
     ap.add_argument("--eval-chunk", type=int, default=64,

@@ -5,11 +5,17 @@ import numpy as np
 import torch
 
 
-def build_gallery_V(model, tile_loader, tile_ids, tile_chunk, dev):
-    """All tiles → V (chunked to bound memory). Rows follow ``tile_ids`` order."""
+def build_gallery_V(model, tile_loader, tile_ids, tile_chunk, dev, progress=False):
+    """All tiles → V (chunked to bound memory). Rows follow ``tile_ids`` order.
+
+    ``tile_loader`` should be a NON-caching loader here: the full gallery (11465 tiles) must not be
+    held in RAM. Progress bar because this pass streams every tile grid from disk each eval."""
+    rng = range(0, len(tile_ids), tile_chunk)
+    if progress:
+        from tqdm import tqdm
+        rng = tqdm(rng, desc="eval galV", unit="chunk", total=(len(tile_ids) + tile_chunk - 1) // tile_chunk)
     parts = None
-    cuda = str(dev).startswith("cuda")
-    for s in range(0, len(tile_ids), tile_chunk):
+    for s in rng:
         G = tile_loader.stack(tile_ids[s:s + tile_chunk]).float().to(dev)
         V = model.build_V(G)
         if parts is None:
@@ -17,17 +23,15 @@ def build_gallery_V(model, tile_loader, tile_ids, tile_chunk, dev):
         for n in V:
             parts[n].append(V[n].detach())
         del G, V
-        if cuda:                                    # release the per-chunk residual cdist temp
-            torch.cuda.empty_cache()
     return {n: torch.cat(parts[n], 0) for n in parts}
 
 
 @torch.no_grad()
-def evaluate(model, store, sr, tile_loader, dev, tile_chunk=256, ks=(1, 5, 10, 20)):
+def evaluate(model, store, sr, tile_loader, dev, tile_chunk=64, ks=(1, 5, 10, 20), progress=False):
     """``sr`` = SplitRelevance (val/test). Returns Recall@ks + median rank over queries with a
     positive whose tokens exist. Gallery-row order == ``sr.tile_ids`` (== relevance pos rows)."""
     model.eval()
-    galV = build_gallery_V(model, tile_loader, sr.tile_ids, tile_chunk, dev)
+    galV = build_gallery_V(model, tile_loader, sr.tile_ids, tile_chunk, dev, progress=progress)
     qids = [q for q in sr.query_ids if store.has(q)]
     if not qids:
         return {"n": 0, "median_rank": float("nan"), **{f"R@{k}": 0.0 for k in ks}}
