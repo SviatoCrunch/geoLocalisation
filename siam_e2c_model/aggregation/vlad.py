@@ -72,13 +72,14 @@ class VladAggregation:
         res_tok = flat - C[labels]                                                   # (M,N,D)
         K = C.shape[0]
         gp = core.group_proj
-        masks = core.masks(H, W, dev)                                                # (L,N) bool
+        masks = core.masks(H, W, dev, res_tok.dtype)                                 # (L,N) fractional
         idx = labels.unsqueeze(-1).expand(-1, -1, D)                                 # (M,N,D) cluster ids
         pyr = {}
         for li in core.scales_cells:                                                 # level indices
-            m = masks[li].view(1, -1, 1).to(res_tok.dtype)                           # (1,N,1)
+            m = masks[li].view(1, -1, 1)                                             # (1,N,1) fractional
             block = torch.zeros(M, K, D, device=dev, dtype=flat.dtype)
-            block.scatter_add_(1, idx, res_tok * m)                                  # per-cluster, in-crop only
+            # assignment (hard) -> residual -> fractional spatial weighting -> per-cluster sum
+            block.scatter_add_(1, idx, res_tok * m)
             block = block.view(M, 1, K, D)
             if core.intra:
                 block = F.normalize(block, dim=3, eps=eps)

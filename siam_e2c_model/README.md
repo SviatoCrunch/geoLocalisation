@@ -87,35 +87,65 @@ concentric:
   descending, recorded in resolved config), must include `tile_size_m`, apex **exactly 250 m**,
   none `< 250`.
 
-**Token mask (deterministic rounding).** For level `s` and a token axis of length `L`, the central
-side is `round((s/tile_size_m)·L)` tokens (central block). For a **60×60** grid the sides are:
+**Fractional token mask (exact symmetric — no half-token shift).** For a token axis of length `L`,
+token `i` spans `[i/L,(i+1)/L]`; level `s` (ratio `r=s/tile_size_m`) spans `[0.5−r/2, 0.5+r/2]`. The
+1-D weight is the overlap length scaled by `L`, `w_i = L·max(0, min((i+1)/L,0.5+r/2) −
+max(i/L,0.5−r/2)) ∈ [0,1]`, and the 2-D mask is `w_y ⊗ w_x` (inner tokens 1, outer 0, boundary
+**fractional**). This fractional weight multiplies each token BEFORE the VLAD sum. `Σ w_i = r·L`
+(the nominal continuous side) and the centre of mass is the **exact** grid centre for even AND odd
+`L` (the earlier `round`-crop shifted odd sides like 43/25/21/15 by half a token ≈ 8.3 m at 1000 m —
+now fixed). For a **60×60** grid the effective sides are:
 
-| physical | 1000 | 840 | 710 | 600 | 500 | 420 | 350 | 300 | 250 |
+| physical m | 1000 | 840 | 710 | 600 | 500 | 420 | 350 | 300 | 250 |
 |---|---|---|---|---|---|---|---|---|---|
-| token side | 60 | 50 | 43 | 36 | 30 | 25 | 21 | 18 | 15 |
+| effective side (`r·L`) | 60.0 | 50.4 | 42.6 | 36.0 | 30.0 | 25.2 | 21.0 | 18.0 | 15.0 |
 
-This `round(ratio·L)` rule can differ by one token from a naive token-centre threshold (710 m →
-**43** here vs 42 by the strict `abs(x−0.5) ≤ ratio/2` test); we use `round` to match the intended
-physical side and keep symmetric nesting. Same rule for even/odd `H/W`; the centre never drifts by a
-whole token between levels; H and W use the same physical fraction independently.
+(max centre error over all 9 levels ≈ 2e-14). `mask_specs` reports `support_bounds`, `weight_sum`,
+`effective_side_h/w`, `center_error_x/y`.
 
 **Scoring formula (both modes)** — the SAME cross-scale scorer:
 `score(q, tile) = Σ_ℓ β_ℓ(q) · S_ℓ`, `β = softmax(ScaleGate(q))`,
 `S_ℓ = ⟨ L2( Σ_cells softmax(⟨V[ℓ],q⟩/τ_ℓ) · V[ℓ] ) , q ⟩`.
 Cell: level ℓ has `n²` cells, `τ_ℓ = τ_min + softplus(ρ_ℓ)` (n>1) else 1. Concentric: **1 cell**
-per level ⇒ the per-cell softmax is the identity, `τ≡1` (no `ρ`), so `S_ℓ = ⟨V[ℓ], q⟩`. Spatial
-pooling (masked mean inside the crop) is separated from cross-scale pooling (β); a concentric region
-is **not** treated as `n²` cells. `ScaleGate` width = number of levels (so it is created per config
-and lands in `state_dict`); loading a checkpoint from the other mode raises a clear error.
+per level ⇒ the per-cell softmax is the identity, `τ≡1` (no `ρ`), `S_ℓ = ⟨V[ℓ], q⟩`. Spatial pooling
+(fractional-masked mean inside the crop) is separated from cross-scale pooling (β); a concentric
+region is **not** treated as `n²` cells. `ScaleGate` width = number of levels (created per config,
+lands in `state_dict`); loading a checkpoint from the other mode raises a clear error.
+
+This is a **soft mixture of scales, not a hard selection of one footprint.** `score_with_details`
+therefore returns THREE distinct "best level" notions (do not conflate them):
+
+| key | shape | meaning |
+|---|---|---|
+| `similarity_best_level_{index,value}` | (B,M) | most-similar crop of THIS tile (`argmax_ℓ S_ℓ`) |
+| `gate_best_level_{index,value}` | (B,) | scale the ScaleGate prefers from the UAV query alone (`argmax_ℓ β_ℓ`) |
+| `contribution_best_level_{index,value}` | (B,M) | level contributing most to the tile score (`argmax_ℓ β_ℓ·S_ℓ`) |
+
+`best_level_{index,value}` is a documented backward-compat **alias of `similarity_*`**. Invariant:
+`level_contributions = level_scores·β[:,None,:]`, `level_contributions.sum(2) == tile_scores ==
+score(q,V)` (chunked and unchunked).
 
 ### Footprint interpretation (important)
 
-Retrieval loss alone does **not** make the selected level a true footprint. `score_with_details`
-separates: (1) `tile_scores` = retrieval result; (2) `level_scores` = per-level contribution;
-(3) `best_level_value` = **pseudo-footprint** estimate (physical metres in concentric mode);
-(4) a calibrated footprint is only possible after validation on frames with known footprint.
-`level_probabilities` is a **normalized level score** (softmax over retrieval scores), NOT a
-calibrated footprint probability. No scale supervision is added; the level is latent.
+Retrieval loss alone does **not** make any selected level a true footprint. `score_with_details`
+separates: (1) `tile_scores` = retrieval result; (2) `level_scores` / `level_contributions` =
+per-level contribution; (3) `*_best_level_value` = **pseudo-footprint** estimate (physical metres in
+concentric mode); (4) a calibrated footprint is possible only after validation on frames with known
+footprint. `level_probabilities` is a **normalized level score** (softmax over retrieval scores), NOT
+a calibrated footprint probability. No scale supervision is added; the level stays latent.
+
+**What the levels are.** They are PARALLEL regions of the SAME DINO token map, not sequential layers.
+Adjacent levels are **correlated** (they reuse nested tokens). And cropping already-computed tokens is
+**not** equivalent to a separate DINOv2 pass on the crop — global self-attention already mixed context
+across the whole tile (DINOv2 context leakage). None of these signals is a metric-verified footprint.
+
+### Residual VLAD in concentric mode
+
+Supported (Variant A): hard cluster assignment → residual → **fractional** spatial weighting → per-
+cluster sum → the same intra/global normalization as the cell residual arm (reference-tested in
+`tests/test_concentric_residual.py`). The parity invariant below is verified for both `supervlad`
+and `residual`. For the first clean A/B, `cell+SuperVLAD` vs `concentric+SuperVLAD` isolates the
+pyramid-shape effect from the aggregation-strategy effect.
 
 ### A/B configs
 

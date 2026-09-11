@@ -39,20 +39,50 @@ def score_tile_and_levels(core, q: torch.Tensor, V: dict, *, tile_chunk: int | N
     return torch.cat(tile_cols, dim=1), torch.cat(level_cols, dim=1), beta
 
 
+def best_levels(level_scores: torch.Tensor, beta: torch.Tensor, level_values: torch.Tensor) -> dict:
+    """Three DISTINCT 'best level' notions (they can disagree — see the docstring below).
+
+    * similarity  — per (query,tile): argmax of the raw per-level similarity S (which crop of THIS
+                    tile is most similar to the query).
+    * gate        — per query only: argmax of β=ScaleGate(q) (the scale the gate prefers from the
+                    UAV query alone, independent of any tile).
+    * contribution— per (query,tile): argmax of β_ℓ·S_ℓ (the level that contributes most to the
+                    final tile score = the mixture actually used).
+    ``level_scores`` (B,M,L), ``beta`` (B,L), ``level_values`` (L,)."""
+    contributions = level_scores * beta[:, None, :]           # (B,M,L)
+    sim_idx = level_scores.argmax(dim=2)                       # (B,M)
+    con_idx = contributions.argmax(dim=2)                      # (B,M)
+    gate_idx = beta.argmax(dim=1)                              # (B,)  query-only
+    return {
+        "level_contributions": contributions,
+        "similarity_best_level_index": sim_idx,
+        "similarity_best_level_value": level_values[sim_idx],
+        "gate_best_level_index": gate_idx,
+        "gate_best_level_value": level_values[gate_idx],
+        "contribution_best_level_index": con_idx,
+        "contribution_best_level_value": level_values[con_idx],
+    }
+
+
 def score_with_details(core, q: torch.Tensor, V: dict, level_values, pyramid_mode: str, *,
                        tile_chunk: int | None = None) -> dict:
     """Diagnostic bundle. ``level_values`` (L,) = cell counts (cell) or physical metres (concentric).
 
-    NOTE: ``level_probabilities`` is a softmax over the per-level retrieval scores — a *normalized
-    level score*, NOT a calibrated footprint probability (no scale supervision). ``best_level_value``
-    is a pseudo-footprint estimate, not a metric-verified footprint.
+    The final tile score is a SOFT MIXTURE of scales ``Σ_ℓ β_ℓ·S_ℓ``, not a hard selection of one
+    footprint — hence THREE separate 'best level' notions are returned (similarity / gate /
+    contribution) rather than a single ambiguous one. Invariant (asserted in tests):
+    ``level_contributions.sum(dim=2) == tile_scores == core.score_queries_against_tiles(q, V)``.
+
+    NOTE: ``level_probabilities`` = softmax over raw per-level similarities — a *normalized level
+    score*, NOT a calibrated footprint probability (no scale supervision). ``*_best_level_value`` are
+    pseudo-footprint estimates, not metric-verified footprints. ``best_level_{index,value}`` is a
+    documented BACKWARD-COMPAT ALIAS of ``similarity_best_level_*``.
     """
     tile_scores, level_scores, beta = score_tile_and_levels(core, q, V, tile_chunk=tile_chunk)
     B, M, L = level_scores.shape
     lv = torch.as_tensor(level_values, dtype=level_scores.dtype, device=level_scores.device)  # (L,)
 
-    best_level_index = level_scores.argmax(dim=2)              # (B, M)
-    best_level_value = lv[best_level_index]                    # (B, M) — physical m in concentric
+    bl = best_levels(level_scores, beta, lv)
     level_probabilities = F.softmax(level_scores, dim=2)       # normalized level score (NOT footprint prob)
     if L >= 2:
         top2 = level_scores.topk(2, dim=2).values
@@ -61,15 +91,18 @@ def score_with_details(core, q: torch.Tensor, V: dict, level_values, pyramid_mod
         confidence_margin = torch.zeros(B, M, dtype=level_scores.dtype, device=level_scores.device)
     entropy = -(level_probabilities.clamp_min(1e-9).log() * level_probabilities).sum(2)  # (B, M)
 
-    return {
+    out = {
         "tile_scores": tile_scores,
         "level_scores": level_scores,
+        "beta": beta,
         "level_values": lv,
         "pyramid_mode": pyramid_mode,
-        "best_level_index": best_level_index,
-        "best_level_value": best_level_value,
         "level_probabilities": level_probabilities,
         "confidence_margin": confidence_margin,
         "entropy": entropy,
-        "beta": beta,
+        **bl,
     }
+    # documented backward-compat alias == similarity_best_level_*
+    out["best_level_index"] = bl["similarity_best_level_index"]
+    out["best_level_value"] = bl["similarity_best_level_value"]
+    return out

@@ -1,9 +1,7 @@
-"""Concentric central-crop masks: centred, nested, monotone, apex 250, deterministic.
+"""Fractional concentric masks: symmetric, exactly centred, nested, apex 250, deterministic.
 
-The chosen deterministic rule is ``side = round((s/tile_size_m) * axis)`` central block. For a
-60×60 grid + levels (1000,840,710,600,500,420,350,300,250) m the expected sides are
-(60,50,43,36,30,25,21,18,15). This can differ by one token from a naive token-centre threshold
-(e.g. 710 m → 43 here vs 42 by the strict centre test) — we assert the ACTUAL round-rule result.
+Mask rule: w_i = L·max(0, min((i+1)/L, 0.5+r/2) − max(i/L, 0.5−r/2)), r = s/tile_size_m.
+Fixes the previous round-crop half-token shift (odd sides 43,25,21,15 on a 60×60 grid).
 """
 import numpy as np
 import pytest
@@ -11,62 +9,60 @@ import pytest
 from siam_e2c_model.concentric_core import concentric_token_masks
 
 FULL = (1000.0, 840.0, 710.0, 600.0, 500.0, 420.0, 350.0, 300.0, 250.0)
+NOMINAL_60 = [60.0, 50.4, 42.6, 36.0, 30.0, 25.2, 21.0, 18.0, 15.0]   # r·60 per level
 
 
-def _sides(H, W, sizes, tile=1000.0):
-    specs = concentric_token_masks(H, W, sizes, tile)
-    return specs
+def test_full_tile_is_all_ones():
+    specs = concentric_token_masks(60, 60, FULL, 1000.0)
+    assert np.allclose(specs[0]["weight"], 1.0)
+    assert specs[0]["effective_side_h"] == pytest.approx(60.0)
 
 
-def test_60x60_mapping_matches_documented_round_rule():
-    specs = _sides(60, 60, FULL)
-    got = [(s["side_h"], s["side_w"]) for s in specs]
-    exp = [(60, 60), (50, 50), (43, 43), (36, 36), (30, 30), (25, 25), (21, 21), (18, 18), (15, 15)]
-    assert got == exp
+def test_effective_sides_equal_nominal_continuous_60():
+    specs = concentric_token_masks(60, 60, FULL, 1000.0)
+    assert [s["effective_side_h"] for s in specs] == pytest.approx(NOMINAL_60)
+    assert [s["effective_side_w"] for s in specs] == pytest.approx(NOMINAL_60)
 
 
-def test_full_tile_covers_all_tokens():
-    specs = _sides(60, 60, FULL)
-    assert specs[0]["count"] == 60 * 60
-    assert bool(specs[0]["mask"].all())
-
-
-def test_apex_is_250_and_smallest():
-    specs = _sides(60, 60, FULL)
-    assert specs[-1]["size_m"] == 250.0
-    assert specs[-1]["count"] == min(s["count"] for s in specs)
+def test_weight_sum_equals_ratio_times_axis():
+    for H, W in [(60, 60), (37, 41)]:
+        for s in concentric_token_masks(H, W, FULL, 1000.0):
+            assert s["effective_side_h"] == pytest.approx(s["ratio"] * H)
+            assert s["effective_side_w"] == pytest.approx(s["ratio"] * W)
+            assert s["weight_sum"] == pytest.approx(s["ratio"] * H * s["ratio"] * W)
 
 
 @pytest.mark.parametrize("H,W", [(60, 60), (37, 37), (24, 30), (15, 15), (16, 16)])
-def test_centred_nested_monotone_nonempty_deterministic(H, W):
-    specs = concentric_token_masks(H, W, FULL, 1000.0)
-    counts = [s["count"] for s in specs]
-    # monotone non-increasing as physical level shrinks
-    assert all(counts[i] >= counts[i + 1] for i in range(len(counts) - 1))
-    # non-empty
-    assert all(c >= 1 for c in counts)
-    masks = [s["mask"].reshape(H, W) for s in specs]
-    # full level covers everything
-    assert masks[0].all()
-    for i in range(len(masks) - 1):
-        a, b = masks[i], masks[i + 1]
-        # nested: smaller ⊆ larger
-        assert bool((b & ~a).sum() == 0)
-        # centred: symmetric row/col spans (same margin each side, ±1 for odd/even parity)
-        ba, bb = specs[i]["bounds"], specs[i + 1]["bounds"]
-        h0a, h1a, w0a, w1a = ba
-        # margins on opposite sides differ by at most 1 (deterministic floor centring)
-        assert abs((h0a) - (H - h1a)) <= 1 and abs((w0a) - (W - w1a)) <= 1
-    # deterministic: rebuild → identical
-    again = concentric_token_masks(H, W, FULL, 1000.0)
-    for s1, s2 in zip(specs, again):
-        assert np.array_equal(s1["mask"], s2["mask"]) and s1["bounds"] == s2["bounds"]
+def test_center_of_mass_is_exact_grid_center(H, W):
+    # regression for the half-token shift: centre error ~0 for EVERY level, even + odd grids
+    for s in concentric_token_masks(H, W, FULL, 1000.0):
+        assert s["center_error_y"] < 1e-9
+        assert s["center_error_x"] < 1e-9
 
 
-def test_center_does_not_drift_by_a_whole_token():
-    # the block centre stays within half a token of the grid centre at every level
+def test_masks_are_nested_and_fractional_and_monotone():
     specs = concentric_token_masks(60, 60, FULL, 1000.0)
-    for s in specs:
-        h0, h1, w0, w1 = s["bounds"]
-        cy, cx = (h0 + h1 - 1) / 2.0, (w0 + w1 - 1) / 2.0
-        assert abs(cy - 29.5) <= 0.5 and abs(cx - 29.5) <= 0.5
+    ws = [s["weight"] for s in specs]
+    for w in ws:
+        assert w.min() >= 0.0 and w.max() <= 1.0 + 1e-12
+    for i in range(len(ws) - 1):
+        # nested in the fractional sense: larger level >= smaller level elementwise
+        assert np.all(ws[i] + 1e-12 >= ws[i + 1])
+        assert ws[i].sum() >= ws[i + 1].sum()               # token weight non-increasing
+    # boundary tokens carry fractional weight at a non-integer nominal side (840 m → 50.4)
+    assert 0.0 < ws[1].min() or (0.0 < ws[1]).any()
+    assert not np.allclose(ws[1], np.round(ws[1]))          # genuinely fractional, not a hard crop
+
+
+def test_apex_is_250_smallest_and_nonempty():
+    specs = concentric_token_masks(60, 60, FULL, 1000.0)
+    assert specs[-1]["size_m"] == 250.0
+    assert specs[-1]["weight_sum"] == min(s["weight_sum"] for s in specs)
+    assert all(s["weight_sum"] > 0 for s in specs)
+
+
+def test_deterministic():
+    a = concentric_token_masks(37, 37, FULL, 1000.0)
+    b = concentric_token_masks(37, 37, FULL, 1000.0)
+    for s1, s2 in zip(a, b):
+        assert np.array_equal(s1["weight"], s2["weight"]) and s1["support_bounds"] == s2["support_bounds"]

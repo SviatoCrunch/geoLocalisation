@@ -52,13 +52,20 @@ class E2cModelConfig:
             raise ValueError(f"tile_size_m must be > 0, got {self.tile_size_m}")
         object.__setattr__(self, "tile_size_m", float(self.tile_size_m))
 
-        # cell params are always validated (default mode; used only in cell mode)
-        sc = tuple(int(n) for n in self.scales_cells)
-        if not sc or any(n < 1 for n in sc):
-            raise ValueError(f"scales_cells must be non-empty ints >= 1, got {self.scales_cells}")
+        # scales_cells: coerce to an int tuple; enforce the >=1 rule ONLY in cell mode
+        # (an inactive param of the other mode must not reject a valid config).
+        try:
+            sc = tuple(int(n) for n in self.scales_cells)
+        except (TypeError, ValueError):
+            if self.pyramid_mode == "cell":
+                raise ValueError(f"scales_cells must be ints, got {self.scales_cells}")
+            sc = tuple(self.scales_cells)
         object.__setattr__(self, "scales_cells", sc)
+        if self.pyramid_mode == "cell":
+            if not sc or any(int(n) < 1 for n in sc):
+                raise ValueError(f"scales_cells must be non-empty ints >= 1, got {self.scales_cells}")
 
-        # concentric params validated + normalised to canonical descending order
+        # concentric_sizes_m validated + normalised ONLY in concentric mode
         object.__setattr__(self, "_concentric_order_normalized", False)
         if self.pyramid_mode == "concentric":
             self._validate_concentric()
