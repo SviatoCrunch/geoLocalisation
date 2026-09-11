@@ -27,11 +27,9 @@ def build_gallery_V(model, tile_loader, tile_ids, tile_chunk, dev, progress=Fals
 
 
 @torch.no_grad()
-def evaluate(model, store, sr, tile_loader, dev, tile_chunk=64, ks=(1, 5, 10, 20), progress=False):
-    """``sr`` = SplitRelevance (val/test). Returns Recall@ks + median rank over queries with a
-    positive whose tokens exist. Gallery-row order == ``sr.tile_ids`` (== relevance pos rows)."""
-    model.eval()
-    galV = build_gallery_V(model, tile_loader, sr.tile_ids, tile_chunk, dev, progress=progress)
+def score_against_gallery(model, store, sr, galV, dev, tile_chunk=64, ks=(1, 5, 10, 20)):
+    """Rank ``sr``'s queries against a PREBUILT ``galV`` → Recall@ks + median rank. Gallery-row
+    order must match ``sr.tile_ids`` (== relevance pos rows). Lets val + test share one galV."""
     qids = [q for q in sr.query_ids if store.has(q)]
     if not qids:
         return {"n": 0, "median_rank": float("nan"), **{f"R@{k}": 0.0 for k in ks}}
@@ -53,3 +51,12 @@ def evaluate(model, store, sr, tile_loader, dev, tile_chunk=64, ks=(1, 5, 10, 20
     n = len(ranks)
     return {"n": n, "median_rank": float(np.median(ranks)) if ranks else float("nan"),
             **{f"R@{k}": (hit[k] / n if n else 0.0) for k in ks}}
+
+
+@torch.no_grad()
+def evaluate(model, store, sr, tile_loader, dev, tile_chunk=64, ks=(1, 5, 10, 20), progress=False):
+    """Convenience: build ``sr``'s gallery V then score it. (The trainer builds galV once and calls
+    :func:`score_against_gallery` for both val and test — galV is identical across splits.)"""
+    model.eval()
+    galV = build_gallery_V(model, tile_loader, sr.tile_ids, tile_chunk, dev, progress=progress)
+    return score_against_gallery(model, store, sr, galV, dev, tile_chunk, ks)

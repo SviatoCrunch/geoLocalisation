@@ -50,7 +50,7 @@ def train(args) -> dict:
                                     build_cross_relevance, symmetric_multipositive_ce)
     from geo_train_batching.adapters.split_relevance import build_split_relevance, build_pairs_from_split
     from .data import TileGridLoader, QueryTokenStore
-    from .eval import evaluate
+    from .eval import build_gallery_V, score_against_gallery
 
     dev = args.device
     torch.manual_seed(args.seed)
@@ -134,8 +134,11 @@ def train(args) -> dict:
         row = {"epoch": epoch, "train_loss": ep_loss / max(nb, 1)}
         do_eval = (epoch > 0 and epoch % args.eval_every == 0) or (epoch == args.epochs - 1)
         if do_eval:
+            galV = build_gallery_V(model, eval_tiles, sr["val"].tile_ids, args.eval_chunk,
+                                   dev, progress=True)                 # built ONCE; val+test share it
             for w in ("val", "test"):
-                row[w] = evaluate(model, store, sr[w], eval_tiles, dev, args.eval_chunk, progress=True)
+                row[w] = score_against_gallery(model, store, sr[w], galV, dev, args.eval_chunk)
+            del galV
             if str(dev).startswith("cuda"):
                 torch.cuda.empty_cache()
             vmr = row["val"].get("median_rank", float("inf"))
