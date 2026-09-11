@@ -34,8 +34,23 @@ from .association import associate
 from .mask_query import sky_filtered_query          # local helper (below)
 from . import kmz
 
-_IMG_EXTS = {".jpg", ".jpeg", ".png"}
+_IMG_EXTS = {".jpg", ".jpeg"}                         # UAV frames only (never mask PNGs)
 _LAT = (44.0, 53.0)                                   # Ukraine band — reject corrupt stems
+
+
+def _strip_leading_id(stem: str) -> str:
+    """``100_48.59_37.59`` -> ``48.59_37.59`` (COCO named frames without the id prefix)."""
+    toks = stem.split("_")
+    return "_".join(toks[1:]) if len(toks) > 1 and toks[0].isdigit() else stem
+
+
+def _mask_key(city: str, stem: str, store_keys: set):
+    """Resolve the sky-store key for a jpg stem (try full, then id-stripped)."""
+    for cand in (stem, _strip_leading_id(stem)):
+        k = f"{city}:{cand}"
+        if k in store_keys:
+            return k
+    return None
 
 
 def _parse_latlon(stem: str):
@@ -103,6 +118,7 @@ def main(argv=None) -> int:
     tiles, geom = ([], {})
     if args.tiles_h5:
         tiles, geom = _load_tiles(args.tiles_h5, args.city)
+    store_keys = set(store.frame_ids())
 
     from PIL import Image
     estimates, assoc = [], {}
@@ -113,8 +129,9 @@ def main(argv=None) -> int:
             n_skip_nocoord += 1
             continue
         lat, lon = ll
-        frame_id = f"{args.city}:{p.stem}"
-        keep_px = store.load(frame_id)
+        mkey = _mask_key(args.city, p.stem, store_keys)
+        keep_px = store.load(mkey) if mkey else None
+        frame_id = mkey or f"{args.city}:{p.stem}"
         if keep_px is None and not args.include_unmasked:
             n_skip_nomask += 1
             continue
