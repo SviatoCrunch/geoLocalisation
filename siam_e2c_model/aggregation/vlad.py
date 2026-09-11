@@ -59,7 +59,36 @@ class VladAggregation:
             pyr[n] = F.normalize(block, dim=2, eps=eps)
         return pyr
 
+    def _region_concentric(self, core, grids, eps=1e-8):
+        """(M,H,W,D) → residual concentric pyramid {ℓ:(M,1,K·d_group)}. Same residual/normalise
+        math as ``_region`` with a single spatial region per level, but summed ONLY over the
+        central-crop tokens (mask). At the full-tile level (ratio 1, mask all) this reduces to the
+        cell n=1 region → parity with ``_region``."""
+        C = self._C.to(device=grids.device, dtype=torch.float32)
+        M, H, W, D = grids.shape
+        dev = grids.device
+        flat = F.normalize(grids.reshape(M, H * W, D).float(), dim=-1, eps=eps)      # (M,N,D)
+        labels = torch.cdist(flat, C.unsqueeze(0).expand(M, -1, -1)).argmin(-1)      # (M,N)
+        res_tok = flat - C[labels]                                                   # (M,N,D)
+        K = C.shape[0]
+        gp = core.group_proj
+        masks = core.masks(H, W, dev)                                                # (L,N) bool
+        idx = labels.unsqueeze(-1).expand(-1, -1, D)                                 # (M,N,D) cluster ids
+        pyr = {}
+        for li in core.scales_cells:                                                 # level indices
+            m = masks[li].view(1, -1, 1).to(res_tok.dtype)                           # (1,N,1)
+            block = torch.zeros(M, K, D, device=dev, dtype=flat.dtype)
+            block.scatter_add_(1, idx, res_tok * m)                                  # per-cluster, in-crop only
+            block = block.view(M, 1, K, D)
+            if core.intra:
+                block = F.normalize(block, dim=3, eps=eps)
+            block = F.normalize(gp(block), dim=3, eps=eps).reshape(M, 1, K * gp.d_out)
+            pyr[li] = F.normalize(block, dim=2, eps=eps)
+        return pyr
+
     def build_V(self, core, grids):
+        if getattr(core, "pyramid_mode", "cell") == "concentric":
+            return core.transform_map(self._region_concentric(core, grids, eps=core.eps))
         return core.transform_map(self._region(core, grids, eps=core.eps))
 
     # ── query side: global residual VLAD over UAV tokens ──────────────────────────────

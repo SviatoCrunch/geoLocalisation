@@ -11,9 +11,15 @@ from pathlib import Path
 
 
 def build_core_model(**kwargs):
-    """Build the Stage-2 query-conditioned model (``Stage2QueryConditionedModel``)."""
+    """Build the CELL Stage-2 query-conditioned model (``Stage2QueryConditionedModel``)."""
     from ..vendored.stage2_core import build_stage2_query_conditioned_model
     return build_stage2_query_conditioned_model(**kwargs)
+
+
+def build_concentric_core(**kwargs):
+    """Build the CONCENTRIC-pyramid model (``ConcentricStage2Model``); same agg construction."""
+    from ..concentric_core import build_concentric_model
+    return build_concentric_model(**kwargs)
 
 
 def load_assign_weight(path, *, k=None, d=None):

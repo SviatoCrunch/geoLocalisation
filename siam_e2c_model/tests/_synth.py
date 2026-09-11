@@ -15,10 +15,12 @@ def weights(k=6, d=64, seed=0):
 
 
 def build(agg="supervlad", *, k=6, d=64, scales=(4, 2, 1), d_group=8, d_out=32,
-          d_hidden=64, seed=0):
+          d_hidden=64, seed=0, pyramid_mode="cell",
+          concentric_sizes_m=(1000.0, 500.0, 250.0), tile_size_m=1000.0):
     aw, centroids = weights(k, d, seed)
     cfg = E2cModelConfig(agg=agg, k=k, d_token=d, scales_cells=scales, d_group=d_group,
-                         d_out=d_out, d_hidden=d_hidden)
+                         d_out=d_out, d_hidden=d_hidden, pyramid_mode=pyramid_mode,
+                         concentric_sizes_m=concentric_sizes_m, tile_size_m=tile_size_m)
     return build_e2c_model(cfg, assign_weight=aw, centroids=centroids), aw, centroids
 
 

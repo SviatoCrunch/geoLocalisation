@@ -1,0 +1,27 @@
+# A/B experiment — CELL pyramid (baseline). Model config for E2cModelConfig.
+# Run separately from ab_concentric.yaml; train each mode from scratch.
+pyramid_mode: cell
+scales_cells: [8, 4, 2, 1]        # 64 + 16 + 4 + 1 = 85 spatial regions
+tile_size_m: 1000.0
+
+agg: supervlad                    # or: vlad / residual (same for both arms of the A/B)
+k: 32
+assign_path: /home/ubuntu/work/out/gallery_h5/cache/k32.pt
+d_token: 1024                     # NEW d1024 galleries
+d_group: 32
+d_out: 256
+d_hidden: 512
+dropout: 0.1
+tau_min: 0.01
+tau_init: 0.1
+intra: true
+freeze_assignment: true
+
+# Fair-comparison conditions (identical across cell vs concentric):
+#   same query/gallery split, DINOv2 tokens, VLAD dictionary (k32.pt), train/val/test frames,
+#   augmentation, optimizer + LR schedule, random seed, epochs/steps.
+#   Train each mode's parameters FROM SCRATCH (scale_gate width + rho differ).
+#   Select the mode on VALIDATION; run test ONCE after selection.
+# Log: Recall@1/5/10/20, median rank, distance-based Recall@K, and from score_with_details:
+#   picked-level distribution, level-score margin, entropy of normalized level scores,
+#   fraction ambiguous, per-level score of the top-ranked tile, split by height/FoV if available.

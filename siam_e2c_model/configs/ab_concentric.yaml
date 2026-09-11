@@ -1,0 +1,24 @@
+# A/B experiment — CONCENTRIC physical pyramid. Model config for E2cModelConfig.
+# Run separately from ab_cell.yaml; train from scratch (different scale params).
+pyramid_mode: concentric
+tile_size_m: 1000.0
+concentric_sizes_m: [1000, 840, 710, 600, 500, 420, 350, 300, 250]   # 9 nested central crops; apex 250
+scales_cells: [8, 4, 2, 1]        # ignored in concentric mode (kept for a clean config diff)
+
+agg: supervlad                    # match ab_cell.yaml
+k: 32
+assign_path: /home/ubuntu/work/out/gallery_h5/cache/k32.pt
+d_token: 1024
+d_group: 32
+d_out: 256
+d_hidden: 512
+dropout: 0.1
+tau_min: 0.01                     # unused (concentric τ≡1, no rho) — kept for config symmetry
+tau_init: 0.1
+intra: true
+freeze_assignment: true
+
+# Same fair-comparison conditions + logging as ab_cell.yaml.
+# NOTE: cell has 85 regional candidates, concentric has 9 — a Recall difference is NOT a pure
+# footprint effect (region count + pooling opportunities differ). best_level_value is a
+# PSEUDO-footprint (metres), not a metric-verified footprint (no scale supervision).
