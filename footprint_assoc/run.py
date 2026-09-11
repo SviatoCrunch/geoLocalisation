@@ -5,19 +5,11 @@ Integration entry point — wires the isolated pieces for an actual run:
 
 Per UAV frame (centre parsed from the filename ``<lat>_<lon>``):
   1. DINOv2 tokens of the UAV frame; DROP sky tokens using the precomputed keep-mask
-     (frames without a mask are skipped unless --include-unmasked).
+     (or a neural SegFormer mask if --neural and no precomputed mask; else skip).
   2. Concentric satellite crops at each scale → DINOv2 tokens (levels).
   3. estimate_frame (cascade) → optional association with gallery tiles → KMZ.
 
-Example
--------
-    uv run --with torch --with rasterio --with pillow --with numpy --with h5py \
-      python -m footprint_assoc.run \
-        --cog   /home/ubuntu/work/tif/Krum_esri_48.5683N_37.6272E_z18_cog.tif \
-        --frames-dir /home/ubuntu/work/gt_cramatorsc \
-        --city cramatorsc --sky-store /home/ubuntu/work/sky_masks \
-        --tiles-h5 /home/ubuntu/work/out/gallery_h5/multicity_vlad_k32.h5 \
-        --out /home/ubuntu/work/out/footprint_kram.kmz --limit 20 --device cuda
+Single-city CLI here; :mod:`footprint_assoc.run_multicity` loops several cities into one KMZ.
 """
 from __future__ import annotations
 
@@ -28,24 +20,22 @@ from pathlib import Path
 import numpy as np
 
 from .config import FootprintConfig
-from .schemas import PyramidFeatures, QueryFeatures, LevelFeatures
+from .schemas import PyramidFeatures, LevelFeatures
 from .pipeline import estimate_frame
 from .association import associate
-from .mask_query import sky_filtered_query          # local helper (below)
+from .mask_query import sky_filtered_query
 from . import kmz
 
-_IMG_EXTS = {".jpg", ".jpeg"}                         # UAV frames only (never mask PNGs)
-_LAT = (44.0, 53.0)                                   # Ukraine band — reject corrupt stems
+_IMG_EXTS = {".jpg", ".jpeg"}
+_LAT = (44.0, 53.0)
 
 
 def _strip_leading_id(stem: str) -> str:
-    """``100_48.59_37.59`` -> ``48.59_37.59`` (COCO named frames without the id prefix)."""
     toks = stem.split("_")
     return "_".join(toks[1:]) if len(toks) > 1 and toks[0].isdigit() else stem
 
 
 def _mask_key(city: str, stem: str, store_keys: set):
-    """Resolve the sky-store key for a jpg stem (try full, then id-stripped)."""
     for cand in (stem, _strip_leading_id(stem)):
         k = f"{city}:{cand}"
         if k in store_keys:
@@ -60,7 +50,6 @@ def _parse_latlon(stem: str):
             nums.append(float(t))
         except ValueError:
             pass
-    # first pair that looks like (lat, lon) in range
     for i in range(len(nums) - 1):
         lat, lon = nums[i], nums[i + 1]
         if _LAT[0] <= lat <= _LAT[1] and 20.0 <= lon <= 45.0:
@@ -68,7 +57,7 @@ def _parse_latlon(stem: str):
     return None
 
 
-def _load_tiles(tiles_h5, city):
+def load_tiles(tiles_h5, city):
     import h5py
     with h5py.File(tiles_h5, "r") as f:
         lat = np.asarray(f["lat"], float)
@@ -86,79 +75,103 @@ def _load_tiles(tiles_h5, city):
     return tiles, geom
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cog", required=True)
-    ap.add_argument("--frames-dir", required=True)
-    ap.add_argument("--city", required=True)
-    ap.add_argument("--sky-store", required=True)
-    ap.add_argument("--out", required=True, help="output KMZ path")
-    ap.add_argument("--tiles-h5", default=None, help="gallery H5 for footprint→tile association")
-    ap.add_argument("--limit", type=int, default=0, help="process at most N frames (0 = all)")
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument("--out-px", type=int, default=224, help="satellite crop resolution")
-    ap.add_argument("--cell-sky-max", type=float, default=0.5)
-    ap.add_argument("--include-unmasked", action="store_true",
-                    help="also process frames without a sky mask (no sky drop) instead of skipping")
-    args = ap.parse_args(argv)
-
-    from .extractors.dinov2 import DinoV2Extractor
-    from .extractors.cog_crop import CogCropSource
-    from sky_filter import MaskStore
-
-    cfg = FootprintConfig()
-    cfg.validate()
-    scales = cfg.scales()
-    extractor = DinoV2Extractor(device=args.device)
-    crops = CogCropSource(args.cog, out_px=args.out_px)
-    store = MaskStore(args.sky_store)
-
-    frames = sorted(p for p in Path(args.frames_dir).expanduser().rglob("*")
-                    if p.suffix.lower() in _IMG_EXTS)
-    tiles, geom = ([], {})
-    if args.tiles_h5:
-        tiles, geom = _load_tiles(args.tiles_h5, args.city)
-    store_keys = set(store.frame_ids())
-
+def process_city(cfg, extractor, store, *, city, cog, frames_dir, tiles=None,
+                 out_px=224, cell_sky_max=0.5, neural_masker=None,
+                 include_unmasked=False, limit=0, verbose=True):
+    """Run one city; return (estimates, assoc, stats). Appends nothing to disk."""
     from PIL import Image
+    from .extractors.cog_crop import CogCropSource
+
+    crops = CogCropSource(cog, out_px=out_px)
+    scales = cfg.scales()
+    store_keys = set(store.frame_ids())
+    tiles = tiles or []
+
+    frames = sorted(p for p in Path(frames_dir).expanduser().rglob("*")
+                    if p.suffix.lower() in _IMG_EXTS)
     estimates, assoc = [], {}
-    n_done = n_skip_nocoord = n_skip_nomask = 0
+    n_done = n_nocoord = n_nomask = 0
     for p in frames:
         ll = _parse_latlon(p.stem)
         if ll is None:
-            n_skip_nocoord += 1
+            n_nocoord += 1
             continue
         lat, lon = ll
-        mkey = _mask_key(args.city, p.stem, store_keys)     # id-stripped key to LOAD the mask
+        mkey = _mask_key(city, p.stem, store_keys)
         keep_px = store.load(mkey) if mkey else None
-        frame_id = p.stem                                   # KMZ label = the jpg name (keeps the number)
-        if keep_px is None and not args.include_unmasked:
-            n_skip_nomask += 1
-            continue
-
         uav = np.asarray(Image.open(p).convert("RGB"))
-        query = sky_filtered_query(extractor, uav, keep_px, args.cell_sky_max)
-        levels = []
-        for s in scales:
-            lg, lp = extractor.extract(crops.crop(lat, lon, s))
-            levels.append(LevelFeatures(scale_m=float(s), global_vec=lg, patch_grid=lp))
+        if keep_px is None:
+            if neural_masker is not None:
+                keep_px = neural_masker.mask(p.stem, uav)          # SegFormer sky
+            elif not include_unmasked:
+                n_nomask += 1
+                continue
+        frame_id = f"{city}/{p.stem}"                              # KMZ label (city + jpg name)
+        query = sky_filtered_query(extractor, uav, keep_px, cell_sky_max)
+        levels = [LevelFeatures(float(s), *extractor.extract(crops.crop(lat, lon, s)))
+                  for s in scales]
         pyr = PyramidFeatures(frame_id, lat, lon, query, tuple(levels))
         est = estimate_frame(pyr, cfg)
         estimates.append(est)
         if tiles:
             assoc[frame_id] = associate(est, tiles, cfg)
         n_done += 1
-        print(f"[{n_done}] {frame_id} best={est.best_scale} status={est.status} conf={est.confidence:.2f}",
-              flush=True)
-        if args.limit and n_done >= args.limit:
+        if verbose:
+            print(f"[{city} {n_done}] {p.stem} best={est.best_scale} status={est.status} "
+                  f"conf={est.confidence:.2f}", flush=True)
+        if limit and n_done >= limit:
             break
+    return estimates, assoc, {"done": n_done, "no_coord": n_nocoord, "no_mask": n_nomask}
 
-    out = kmz.write_kmz(args.out, estimates, tiles_geom=geom or None,
-                        assoc=assoc or None, name=f"footprint_{args.city}")
+
+def build_neural_masker(model_id, device, sky_class):
+    from .config import FootprintConfig  # noqa
+    from sky_filter.config import SkyFilterConfig
+    from sky_filter.maskers.neural import NeuralSkyMasker
+    return NeuralSkyMasker(SkyFilterConfig(neural_model=model_id, device=device),
+                           sky_class_id=int(sky_class))
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--cog", required=True)
+    ap.add_argument("--frames-dir", required=True)
+    ap.add_argument("--city", required=True)
+    ap.add_argument("--sky-store", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--tiles-h5", default=None)
+    ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--out-px", type=int, default=224)
+    ap.add_argument("--cell-sky-max", type=float, default=0.5)
+    ap.add_argument("--include-unmasked", action="store_true")
+    ap.add_argument("--neural", action="store_true", help="SegFormer sky for frames without a GT mask")
+    ap.add_argument("--neural-model", default="nvidia/segformer-b0-finetuned-cityscapes-1024-1024")
+    ap.add_argument("--sky-class", type=int, default=10, help="sky class id (Cityscapes=10)")
+    args = ap.parse_args(argv)
+
+    from .extractors.dinov2 import DinoV2Extractor
+    from sky_filter import MaskStore
+
+    cfg = FootprintConfig(); cfg.validate()
+    extractor = DinoV2Extractor(device=args.device)
+    store = MaskStore(args.sky_store)
+    tiles, geom = ([], {})
+    if args.tiles_h5:
+        tiles, geom = load_tiles(args.tiles_h5, args.city)
+    nm = build_neural_masker(args.neural_model, args.device, args.sky_class) if args.neural else None
+
+    estimates, assoc, st = process_city(
+        cfg, extractor, store, city=args.city, cog=args.cog, frames_dir=args.frames_dir,
+        tiles=tiles, out_px=args.out_px, cell_sky_max=args.cell_sky_max,
+        neural_masker=nm, include_unmasked=args.include_unmasked, limit=args.limit)
+
+    out = kmz.write_kmz(args.out, estimates, tiles_geom=geom or None, assoc=assoc or None,
+                        name=f"footprint_{args.city}")
     from collections import Counter
-    st = Counter(e.status for e in estimates)
-    print(f"\n[ok] {n_done} frames -> {out}")
-    print(f"     status: {dict(st)} | skipped no-coord={n_skip_nocoord} no-mask={n_skip_nomask}")
+    print(f"\n[ok] {st['done']} frames -> {out}")
+    print(f"     status: {dict(Counter(e.status for e in estimates))} | "
+          f"no-coord={st['no_coord']} no-mask={st['no_mask']}")
     return 0
 
 
