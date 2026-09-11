@@ -17,6 +17,7 @@ Run::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import queue
 import threading
@@ -54,11 +55,14 @@ def _tile_to_batch(images, device: str, patch_size: int = 14, preprocess=None):
     return batch, h_r, w_r
 
 
-def _extract_level_features(extractor, batch, h_r, w_r, projector=None):
-    with torch.no_grad():
+def _extract_level_features(extractor, batch, h_r, w_r, projector=None, amp=False):
+    ctx = (torch.autocast(device_type="cuda", dtype=torch.float16)
+           if amp and batch.is_cuda else contextlib.nullcontext())
+    with torch.no_grad(), ctx:
         feat = extractor(batch)
         if projector is not None:
             feat = projector(feat)
+    feat = feat.float()                      # normalise in fp32 (features may be stored fp16 later)
     B, desc_dim = feat.shape[0], feat.shape[-1]
     f = feat.reshape(B, h_r, w_r, desc_dim).permute(0, 3, 1, 2)
     f = F.normalize(f, dim=1)
@@ -67,7 +71,8 @@ def _extract_level_features(extractor, batch, h_r, w_r, projector=None):
 
 
 def _flush_buffer(buffer, dino, f, device, patch_size=14, projector=None,
-                  preprocess=None, true_scale: float = 1.0, store_fp16: bool = False):
+                  preprocess=None, true_scale: float = 1.0, store_fp16: bool = False,
+                  amp: bool = False):
     all_images, meta = [], []
     for tile in buffer:
         for lvl_idx in sorted(tile.levels.keys()):
@@ -75,7 +80,7 @@ def _flush_buffer(buffer, dino, f, device, patch_size=14, projector=None,
             meta.append((tile, lvl_idx, tile.levels[lvl_idx]))
 
     batch, h_r, w_r = _tile_to_batch(all_images, device, patch_size, preprocess)
-    feats = _extract_level_features(dino, batch, h_r, w_r, projector)
+    feats = _extract_level_features(dino, batch, h_r, w_r, projector, amp=amp)
 
     for feat, (tile, lvl_idx, level) in zip(feats, meta):
         grp = f.create_group(f"{tile.index}_lvl{lvl_idx}")
@@ -101,7 +106,7 @@ def extract_images(image_paths, out_h5: Path, device: str = "cpu", batch_size: i
                    sky_patch_threshold: float = 0.5, backbone: str = "dinov2_vitg14",
                    dino_layer: int | None = None, dino_facet: str = "value",
                    dino_weights: str | None = None, desc_dim: int | None = None,
-                   proj_seed: int = 0) -> None:
+                   proj_seed: int = 0, amp: bool = False) -> None:
     """Extract DINO patch features from query images (stems ``{idx}_{lat}_{lon}``)."""
     from PIL import Image
 
@@ -125,7 +130,7 @@ def extract_images(image_paths, out_h5: Path, device: str = "cpu", batch_size: i
             images = [np.array(Image.open(p).convert("RGB")) for p in batch_paths]
 
             batch, h_r, w_r = _tile_to_batch(images, device, patch_size, preprocess)
-            feats = _extract_level_features(dino, batch, h_r, w_r, projector)
+            feats = _extract_level_features(dino, batch, h_r, w_r, projector, amp=amp)
 
             for feat, img_path, image_rgb in zip(feats, batch_paths, images):
                 idx, lat, lon = _parse_image_stem(img_path.stem)
@@ -185,11 +190,12 @@ def extract(tif_path, out_h5: Path, tile_size_m: float, levels: int, scale_facto
             aoi_points=None, backbone: str = "dinov2_vitg14", dino_layer: int | None = None,
             dino_facet: str = "value", dino_weights: str | None = None,
             desc_dim: int | None = None, proj_seed: int = 0,
-            true_meters: bool = False, store_fp16: bool = False) -> None:
+            true_meters: bool = False, store_fp16: bool = False, amp: bool = False) -> None:
     """GeoTIFF → DINO features → HDF5. See module docstring for ``true_meters``.
 
     ``store_fp16`` writes ``ift_dino`` as float16 (~half the file; negligible precision
-    loss on L2-normalised features — readers cast back to float32)."""
+    loss on L2-normalised features — readers cast back to float32). ``amp`` runs the DINO
+    forward under fp16 autocast (~1.5-2x on tensor-core GPUs; normalise stays fp32)."""
     true_scale = 1.0
     if true_meters:
         centre_lat = _tif_centre_lat(tif_path)
@@ -240,12 +246,14 @@ def extract(tif_path, out_h5: Path, tile_size_m: float, levels: int, scale_facto
             buffer.append(tile)
             if len(buffer) >= batch_tiles:
                 h_r, w_r = _flush_buffer(buffer, dino, f, device, patch_size, projector,
-                                         preprocess, true_scale=true_scale, store_fp16=store_fp16)
+                                         preprocess, true_scale=true_scale,
+                                         store_fp16=store_fp16, amp=amp)
                 pbar.update(len(buffer))
                 buffer.clear()
         if buffer:
             h_r, w_r = _flush_buffer(buffer, dino, f, device, patch_size, projector,
-                                     preprocess, true_scale=true_scale, store_fp16=store_fp16)
+                                     preprocess, true_scale=true_scale,
+                                     store_fp16=store_fp16, amp=amp)
             pbar.update(len(buffer))
         pbar.close()
 
@@ -313,6 +321,10 @@ def main(argv=None) -> int:
     parser.add_argument("--store_fp16", action="store_true",
                         help="Store ift_dino as float16 (~half the file; readers cast to float32). "
                              "Recommended for large --output_px galleries.")
+    parser.add_argument("--amp", action="store_true",
+                        help="Run the DINO forward under fp16 autocast (~1.5-2x on tensor-core "
+                             "GPUs like T4; normalise stays fp32). Compute-only; independent of "
+                             "--store_fp16 (which is storage-only).")
     parser.add_argument("--to_cog", action="store_true",
                         help="Convert input TIF to COG before extraction if not already COG.")
 
@@ -349,7 +361,8 @@ def main(argv=None) -> int:
             sky_pixel_threshold=args.sky_pixel_threshold,
             sky_patch_threshold=args.sky_patch_threshold, backbone=args.backbone,
             dino_layer=args.dino_layer, dino_facet=args.dino_facet,
-            dino_weights=args.dino_weights, desc_dim=args.desc_dim, proj_seed=args.proj_seed)
+            dino_weights=args.dino_weights, desc_dim=args.desc_dim, proj_seed=args.proj_seed,
+            amp=args.amp)
         return 0
 
     if args.output_px % patch_size != 0:
@@ -379,7 +392,8 @@ def main(argv=None) -> int:
         output_size_px=args.output_px, device=args.device, batch_tiles=args.batch_tiles,
         aoi_points=aoi_points, backbone=args.backbone, dino_layer=args.dino_layer,
         dino_facet=args.dino_facet, dino_weights=args.dino_weights, desc_dim=args.desc_dim,
-        proj_seed=args.proj_seed, true_meters=args.true_meters, store_fp16=args.store_fp16)
+        proj_seed=args.proj_seed, true_meters=args.true_meters, store_fp16=args.store_fp16,
+        amp=args.amp)
     return 0
 
 
