@@ -67,7 +67,7 @@ def _extract_level_features(extractor, batch, h_r, w_r, projector=None):
 
 
 def _flush_buffer(buffer, dino, f, device, patch_size=14, projector=None,
-                  preprocess=None, true_scale: float = 1.0):
+                  preprocess=None, true_scale: float = 1.0, store_fp16: bool = False):
     all_images, meta = [], []
     for tile in buffer:
         for lvl_idx in sorted(tile.levels.keys()):
@@ -79,7 +79,10 @@ def _flush_buffer(buffer, dino, f, device, patch_size=14, projector=None,
 
     for feat, (tile, lvl_idx, level) in zip(feats, meta):
         grp = f.create_group(f"{tile.index}_lvl{lvl_idx}")
-        grp.create_dataset("ift_dino", data=feat, chunks=True)
+        # fp16 halves gallery size; the L2-normalised DINO features lose negligible
+        # precision (VLAD/e2c re-cast to float on read). Readers .astype(float32).
+        data = feat.astype(np.float16) if store_fp16 else feat
+        grp.create_dataset("ift_dino", data=data, chunks=True)
         grp.attrs["tile_index"]    = tile.index
         grp.attrs["level"]         = lvl_idx
         grp.attrs["lat"]           = tile.center_lat
@@ -182,8 +185,11 @@ def extract(tif_path, out_h5: Path, tile_size_m: float, levels: int, scale_facto
             aoi_points=None, backbone: str = "dinov2_vitg14", dino_layer: int | None = None,
             dino_facet: str = "value", dino_weights: str | None = None,
             desc_dim: int | None = None, proj_seed: int = 0,
-            true_meters: bool = False) -> None:
-    """GeoTIFF → DINO features → HDF5. See module docstring for ``true_meters``."""
+            true_meters: bool = False, store_fp16: bool = False) -> None:
+    """GeoTIFF → DINO features → HDF5. See module docstring for ``true_meters``.
+
+    ``store_fp16`` writes ``ift_dino`` as float16 (~half the file; negligible precision
+    loss on L2-normalised features — readers cast back to float32)."""
     true_scale = 1.0
     if true_meters:
         centre_lat = _tif_centre_lat(tif_path)
@@ -224,6 +230,7 @@ def extract(tif_path, out_h5: Path, tile_size_m: float, levels: int, scale_facto
     with h5py.File(out_h5, "w") as f:
         f.attrs["backbone"] = backbone
         f.attrs["patch_size"] = int(patch_size)
+        f.attrs["store_dtype"] = "fp16" if store_fp16 else "fp32"
         buffer = []
         pbar = tqdm(total=total, desc="Tiles")
         while True:
@@ -232,13 +239,13 @@ def extract(tif_path, out_h5: Path, tile_size_m: float, levels: int, scale_facto
                 break
             buffer.append(tile)
             if len(buffer) >= batch_tiles:
-                h_r, w_r = _flush_buffer(buffer, dino, f, device, patch_size,
-                                         projector, preprocess, true_scale=true_scale)
+                h_r, w_r = _flush_buffer(buffer, dino, f, device, patch_size, projector,
+                                         preprocess, true_scale=true_scale, store_fp16=store_fp16)
                 pbar.update(len(buffer))
                 buffer.clear()
         if buffer:
-            h_r, w_r = _flush_buffer(buffer, dino, f, device, patch_size,
-                                     projector, preprocess, true_scale=true_scale)
+            h_r, w_r = _flush_buffer(buffer, dino, f, device, patch_size, projector,
+                                     preprocess, true_scale=true_scale, store_fp16=store_fp16)
             pbar.update(len(buffer))
         pbar.close()
 
@@ -301,7 +308,11 @@ def main(argv=None) -> int:
                              "(scale by 1/cos(centre_lat) into EPSG:3857 units). Without it, "
                              "--stride_m 250 gives ~162 m at lat 49, not 250 m.")
     parser.add_argument("--output_px", type=int, default=224,
-                        help="Pixel size of each level image, multiple of 14 (default 224)")
+                        help="Pixel size of each level image, multiple of 14 (default 224). "
+                             "224->16x16 tokens; 840->60x60 tokens (~1.2 m/px on a 1000 m tile).")
+    parser.add_argument("--store_fp16", action="store_true",
+                        help="Store ift_dino as float16 (~half the file; readers cast to float32). "
+                             "Recommended for large --output_px galleries.")
     parser.add_argument("--to_cog", action="store_true",
                         help="Convert input TIF to COG before extraction if not already COG.")
 
@@ -368,7 +379,7 @@ def main(argv=None) -> int:
         output_size_px=args.output_px, device=args.device, batch_tiles=args.batch_tiles,
         aoi_points=aoi_points, backbone=args.backbone, dino_layer=args.dino_layer,
         dino_facet=args.dino_facet, dino_weights=args.dino_weights, desc_dim=args.desc_dim,
-        proj_seed=args.proj_seed, true_meters=args.true_meters)
+        proj_seed=args.proj_seed, true_meters=args.true_meters, store_fp16=args.store_fp16)
     return 0
 
 
