@@ -38,6 +38,9 @@ def main(argv=None) -> int:
     ap.add_argument("--out", type=Path, required=True, help="dir; writes <out>/k<K>.pt")
     ap.add_argument("--per-tile", type=int, default=48, help="tokens sampled per tile (default 48)")
     ap.add_argument("--max-tokens", type=int, default=600_000, help="global sampled-token cap")
+    ap.add_argument("--max-tiles", type=int, default=0,
+                    help="evenly subsample at most N tiles across galleries to bound I/O "
+                         "(0 = read all tiles; e.g. 4000 reads ~28 GiB instead of ~80)")
     ap.add_argument("--iters", type=int, default=50, help="max Lloyd iterations (default 50)")
     ap.add_argument("--init-prob", type=float, default=0.01,
                     help="SuperVLAD assignment γ calibration target (assignment_from_centroids)")
@@ -51,7 +54,8 @@ def main(argv=None) -> int:
     from .recast import recast_centroids
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    X, n_tiles, D = sample_tokens(args.h5, args.per_tile, args.max_tokens, args.seed)
+    X, n_tiles, D = sample_tokens(args.h5, args.per_tile, args.max_tokens, args.seed,
+                                  max_tiles=args.max_tiles)
     print(f"[sample] {X.shape[0]} tokens (D={D}) from {n_tiles} tiles over {len(args.h5)} galleries")
 
     args.out.mkdir(parents=True, exist_ok=True)
