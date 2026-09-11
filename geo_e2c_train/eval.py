@@ -48,9 +48,26 @@ def score_against_gallery(model, store, sr, galV, dev, tile_chunk=64, ks=(1, 5, 
         for k in ks:
             if r < k:
                 hit[k] += 1
+    # distance-based recall: is the TOP-1 tile geographically near the query GT? (fair on a
+    # stride-250 gallery where the exact GT tile's neighbours are near-identical). EPSG:3857
+    # euclidean → true metres via ~cos(lat) at these cities (~48.9°).
+    _COS = 0.657
+    dmeters, dthr = [], (250.0, 500.0, 1000.0)
+    for bi, q in enumerate(qids):
+        pos = set(int(x) for x in sr.relevance.pos_of(qid_row[q]))
+        if not pos:
+            continue
+        top1 = int(order[bi][0])
+        d = float(np.linalg.norm(sr.tile_xy[top1] - sr.q_xy[qid_row[q]])) * _COS
+        dmeters.append(d)
     n = len(ranks)
-    return {"n": n, "median_rank": float(np.median(ranks)) if ranks else float("nan"),
-            **{f"R@{k}": (hit[k] / n if n else 0.0) for k in ks}}
+    out = {"n": n, "median_rank": float(np.median(ranks)) if ranks else float("nan"),
+           **{f"R@{k}": (hit[k] / n if n else 0.0) for k in ks}}
+    if dmeters:
+        dm = np.array(dmeters)
+        out["median_dist_m"] = float(np.median(dm))
+        out.update({f"distR@{int(t)}m": float((dm <= t).mean()) for t in dthr})
+    return out
 
 
 @torch.no_grad()
