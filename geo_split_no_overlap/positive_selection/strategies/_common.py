@@ -103,6 +103,35 @@ def centered_square(x: float, y: float, side_m: float):
     return box(x - h, y - h, x + h, y + h)
 
 
+# ── true-metre footprints in EPSG:3857 grid coordinates ─────────────────────────────
+# Gallery centres/points are stored as raw Web-Mercator coordinates, whose unit is a
+# metre inflated by 1/cos(lat). A footprint whose PHYSICAL side is a true metre count
+# must be built as a box of side ``true_m / cos(lat)`` in those coordinates. Skipping
+# this (treating 250/1000 as grid units) shrinks every footprint by cos(lat) (~0.66 at
+# lat 48.5) so a stride-250 gallery's central 250 m tops no longer tile the plane.
+
+def cos_lat(lat_deg: float) -> float:
+    """cos(latitude), validated (the EPSG:3857 grid<->true-metre scale is 1/cos(lat))."""
+    if lat_deg is None or not math.isfinite(lat_deg) or not (-89.0 <= lat_deg <= 89.0):
+        raise ValueError(f"latitude {lat_deg!r} out of range for metric scaling")
+    c = math.cos(math.radians(lat_deg))
+    if c <= 1e-9:
+        raise ValueError(f"degenerate cos(lat) at latitude {lat_deg}")
+    return c
+
+
+def true_m_to_grid(true_side_m: float, lat_deg: float) -> float:
+    """Express a TRUE-metre length in EPSG:3857 grid units at ``lat_deg`` (= side / cos(lat))."""
+    if true_side_m is None or not math.isfinite(true_side_m) or true_side_m <= 0:
+        raise ValueError(f"true side must be finite and > 0, got {true_side_m!r}")
+    return true_side_m / cos_lat(lat_deg)
+
+
+def centered_square_true(x: float, y: float, lat_deg: float, true_side_m: float):
+    """Square of ``true_side_m`` TRUE metres centred at grid ``(x, y)`` (built in grid units)."""
+    return centered_square(x, y, true_m_to_grid(true_side_m, lat_deg))
+
+
 def compute_iou(a, b) -> float:
     """Standard IoU of two geometries: |A∩B| / (|A|+|B|-|A∩B|).
 

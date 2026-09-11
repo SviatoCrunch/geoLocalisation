@@ -11,6 +11,10 @@ reaches ``threshold``:
 No pyramid, no sub-levels, no tile-centre crop — the full tile geometry is compared.
 The 1000 m sizes are FIXED semantics of this rule (recorded in resolved_config +
 fingerprint). Tiles that are not ~1000 m squares are rejected, never silently rescaled.
+
+Units: 1000 is TRUE metres. Centres/points live in raw EPSG:3857 (Web-Mercator),
+inflated by 1/cos(lat), so each box is built with grid side ``true_m / cos(lat)``
+(``centered_square_true``) — otherwise footprints shrink by cos(lat) (~0.66 at lat 48.5).
 """
 from __future__ import annotations
 
@@ -27,7 +31,7 @@ _DEFAULTS = {"threshold": None, "geometry_tolerance_m": 1.0, "same_city_only": T
 
 class TileIoU1000Selector:
     name = "tile_iou_1000"
-    version = "1.0"
+    version = "1.1"          # 1.1: footprints built in true metres (1/cos(lat) scaling)
 
     def __init__(self, threshold: float, geometry_tolerance_m: float, same_city_only: bool):
         self._threshold = float(threshold)
@@ -48,15 +52,15 @@ class TileIoU1000Selector:
 
     def select(self, point: GeoPoint, gallery: GalleryIndex) -> Sequence[PositiveMatch]:
         C.validate_metric_crs(gallery.crs)
-        query_box = C.centered_square(point.x, point.y, QUERY_SIZE_M)
-        reach = (TILE_SIZE_M + QUERY_SIZE_M) / 2.0 + self._tol
+        query_box = C.centered_square_true(point.x, point.y, point.lat, QUERY_SIZE_M)
+        reach = C.true_m_to_grid((TILE_SIZE_M + QUERY_SIZE_M) / 2.0, point.lat) + self._tol
         city = point.city if self._same_city_only else None
 
         out = []
         for t in gallery.candidates_box(city, point.x, point.y, reach):
             side = C.tile_side(t, gallery.tile_size_fallback)
             C.validate_square_size(side, TILE_SIZE_M, self._tol, what=f"tile {t.tile_id}")
-            tile_box = C.centered_square(t.center_x, t.center_y, side)
+            tile_box = C.centered_square_true(t.center_x, t.center_y, t.lat, side)
             iou = C.compute_iou(tile_box, query_box)
             if iou >= self._threshold:
                 out.append(PositiveMatch(tile_id=t.tile_id, score=iou, reason="iou_full_tile_1000"))
@@ -66,4 +70,5 @@ class TileIoU1000Selector:
         return {"threshold": self._threshold, "tile_size_m": TILE_SIZE_M,
                 "query_size_m": QUERY_SIZE_M, "geometry_tolerance_m": self._tol,
                 "same_city_only": self._same_city_only, "version": self.version,
-                "crs_expected": C.GRID_CRS, "score": "iou", "threshold_rule": ">="}
+                "crs_expected": C.GRID_CRS, "score": "iou", "threshold_rule": ">=",
+                "footprint_units": "true_metres (EPSG:3857 side scaled by 1/cos(lat))"}
