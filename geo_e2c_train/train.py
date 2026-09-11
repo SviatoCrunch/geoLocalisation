@@ -25,7 +25,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
+
+# reduce CUDA fragmentation for the eval gallery-V pass (residual cdist spikes); set before torch
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def _kv(arg: str):
@@ -131,6 +135,8 @@ def train(args) -> dict:
         if do_eval:
             for w in ("val", "test"):
                 row[w] = evaluate(model, store, sr[w], tiles, dev, args.eval_chunk)
+            if str(dev).startswith("cuda"):
+                torch.cuda.empty_cache()
             vmr = row["val"].get("median_rank", float("inf"))
             if vmr == vmr and vmr < best["median_rank"]:
                 best = {"median_rank": vmr, "epoch": epoch, **row}
@@ -179,7 +185,8 @@ def main(argv=None) -> int:
     ap.add_argument("--eval-every", type=int, default=2)
     ap.add_argument("--patience", type=int, default=8)
     ap.add_argument("--grid-size", type=int, default=0, help="resample token grids to g×g (0=keep)")
-    ap.add_argument("--eval-chunk", type=int, default=256)
+    ap.add_argument("--eval-chunk", type=int, default=64,
+                    help="tiles per gallery-V chunk at eval (residual cdist spikes — keep small on T4)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)

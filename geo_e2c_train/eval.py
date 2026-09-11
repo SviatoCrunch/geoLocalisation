@@ -8,6 +8,7 @@ import torch
 def build_gallery_V(model, tile_loader, tile_ids, tile_chunk, dev):
     """All tiles → V (chunked to bound memory). Rows follow ``tile_ids`` order."""
     parts = None
+    cuda = str(dev).startswith("cuda")
     for s in range(0, len(tile_ids), tile_chunk):
         G = tile_loader.stack(tile_ids[s:s + tile_chunk]).float().to(dev)
         V = model.build_V(G)
@@ -15,6 +16,9 @@ def build_gallery_V(model, tile_loader, tile_ids, tile_chunk, dev):
             parts = {n: [] for n in V}
         for n in V:
             parts[n].append(V[n].detach())
+        del G, V
+        if cuda:                                    # release the per-chunk residual cdist temp
+            torch.cuda.empty_cache()
     return {n: torch.cat(parts[n], 0) for n in parts}
 
 
