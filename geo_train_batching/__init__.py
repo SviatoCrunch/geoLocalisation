@@ -24,7 +24,7 @@ from .loss import (TAU_LOSS_DEFAULT, masked_logsumexp, multipositive_ce,
 from .relevance import RelevanceTable, GeometryRelevanceTable, ExplicitRelevanceTable
 from .batching import (CanonicalPair, build_pair_pool, pair_pool_to_json, NeighbourCache,
                        build_neighbour_cache, BatchPlan, plan_logical_batch, microbatch_ranges,
-                       build_cross_relevance)
+                       build_cross_relevance, build_cross_weights)
 
 __all__ = [
     # loss
@@ -36,7 +36,7 @@ __all__ = [
     # batching
     "CanonicalPair", "build_pair_pool", "pair_pool_to_json", "NeighbourCache",
     "build_neighbour_cache", "BatchPlan", "plan_logical_batch", "microbatch_ranges",
-    "build_cross_relevance",
+    "build_cross_relevance", "build_cross_weights",
 ]
 
 __version__ = "0.1.0"

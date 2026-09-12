@@ -71,12 +71,19 @@ def build_split_relevance(config_path, split_json_path, which: str = "train", *,
     want = set(data.get(which, []))
     pt_by_id = {p.point_id: p for p in points}
 
-    q_ids, q_xy, pos_rows, safe_rows = [], [], [], []
+    q_ids, q_xy, pos_rows, safe_rows, pos_weights = [], [], [], [], []
+    any_weight = False                                  # carry weights only if the strategy scored
     for pid in sorted(want):
         if pid not in mps.point_to_tile_ids:          # no positive -> not a training query
             continue
         p = pt_by_id[pid]
-        pr = np.array(sorted(row_of[t] for t in mps.point_to_tile_ids[pid]), np.int64)
+        tiles_sorted = sorted(mps.point_to_tile_ids[pid], key=lambda t: row_of[t])
+        pr = np.array([row_of[t] for t in tiles_sorted], np.int64)
+        score_by_tile = {m.tile_id: m.score for m in mps.matches.get(pid, ())}
+        wr = np.array([1.0 if score_by_tile.get(t) is None else float(score_by_tile[t])
+                       for t in tiles_sorted], np.float64)
+        if any(score_by_tile.get(t) is not None for t in tiles_sorted):
+            any_weight = True
         dx = np.abs(tile_xy[:, 0] - p.x)
         dy = np.abs(tile_xy[:, 1] - p.y)
         inter = np.clip(half - dx, 0.0, None) * np.clip(half - dy, 0.0, None)
@@ -85,10 +92,12 @@ def build_split_relevance(config_path, split_json_path, which: str = "train", *,
         q_ids.append(pid)
         q_xy.append([p.x, p.y])
         pos_rows.append(pr)
+        pos_weights.append(wr)
         safe_rows.append(safe)
 
     q_xy = np.array(q_xy, float).reshape(-1, 2)
-    rel = ExplicitRelevanceTable(q_ids, pos_rows, safe_rows)
+    rel = ExplicitRelevanceTable(q_ids, pos_rows, safe_rows,
+                                 pos_weights=(pos_weights if any_weight else None))
     return SplitRelevance(which=which, relevance=rel, query_ids=q_ids, q_xy=q_xy,
                           tile_ids=tile_ids, tile_xy=tile_xy, gallery=gallery, snapshot=mps,
                           fingerprint=mps.fingerprint)

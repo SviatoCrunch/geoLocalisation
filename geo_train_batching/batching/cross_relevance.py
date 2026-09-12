@@ -31,3 +31,22 @@ def build_cross_relevance(pairs_in_batch, relevance_table):
         bad = np.nonzero(~R_pos.any(axis=1))[0].tolist()
         raise ValueError(f"DSS anchors with no positive in the batch (rows {bad}) — check canonical pairs")
     return torch.from_numpy(R_pos), torch.from_numpy(R_cand)
+
+
+def build_cross_weights(pairs_in_batch, relevance_table, R_pos):
+    """Soft-target weight matrix ``W[B,B]`` (float) for the weighted CE: ``W[a,b]`` = the
+    positive-selection weight of pair ``b``'s canonical tile for query ``a`` (0 where not a
+    positive). Requires a relevance table that carries weights (``has_weights``)."""
+    if not getattr(relevance_table, "has_weights", False):
+        raise ValueError("relevance_table has no positive weights — use a weighting positive "
+                         "selector (e.g. overlap_weighted / tile_iou_1000)")
+    rp = R_pos.cpu().numpy() if hasattr(R_pos, "cpu") else np.asarray(R_pos)
+    B = len(pairs_in_batch)
+    tiles = [int(p.canonical_tile_row) for p in pairs_in_batch]
+    W = np.zeros((B, B), dtype=np.float64)
+    for a in range(B):
+        wa = relevance_table.weight_lookup(pairs_in_batch[a].query_index)
+        for b in range(B):
+            if rp[a, b]:
+                W[a, b] = wa.get(tiles[b], 0.0)
+    return torch.from_numpy(W)

@@ -47,7 +47,8 @@ def train(args) -> dict:
     from siam_e2c_model.config import E2cModelConfig
     from siam_e2c_model.model import build_e2c_model
     from geo_train_batching import (build_neighbour_cache, plan_logical_batch,
-                                    build_cross_relevance, symmetric_multipositive_ce)
+                                    build_cross_relevance, build_cross_weights,
+                                    symmetric_multipositive_ce)
     from geo_train_batching.adapters.split_relevance import build_split_relevance, build_pairs_from_split
     from .data import TileGridLoader, QueryTokenStore
     from .eval import build_gallery_V, score_against_gallery
@@ -61,6 +62,10 @@ def train(args) -> dict:
     sr = {w: build_split_relevance(args.split_config, args.split_json, w,
                                    query_size_m=args.query_size_m, safe_eps_area=args.safe_eps_area)
           for w in ("train", "val", "test")}
+    if args.pos_weighted_loss and not sr["train"].relevance.has_weights:
+        raise SystemExit("--pos-weighted-loss needs a weighting positive selector "
+                         "(overlap_weighted / tile_iou_1000) — the current split strategy emits "
+                         "no per-positive score")
     tiles = TileGridLoader(galleries, grid_size=args.grid_size)              # cached: train pair tiles
     eval_tiles = TileGridLoader(galleries, grid_size=args.grid_size, cache=False)  # streamed: full gallery
     store = QueryTokenStore(queries)
@@ -125,7 +130,12 @@ def train(args) -> dict:
             Q = torch.stack([q_embed(pair_qid[i]) for i in plan.pair_indices])
             S = model.score(Q, V)
             R_pos, R_cand = build_cross_relevance(pib, sr["train"].relevance)
-            loss = symmetric_multipositive_ce(S, R_pos, R_cand, tau_loss=args.tau)
+            if args.pos_weighted_loss:
+                W = build_cross_weights(pib, sr["train"].relevance, R_pos)
+                loss = symmetric_multipositive_ce(S, R_pos, R_cand, tau_loss=args.tau,
+                                                  weights=W, weight_power=args.pos_weight_power)
+            else:
+                loss = symmetric_multipositive_ce(S, R_pos, R_cand, tau_loss=args.tau)
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
             opt.step()
@@ -185,6 +195,14 @@ def main(argv=None) -> int:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--tau", type=float, default=0.10)
+    ap.add_argument("--pos-weighted-loss", action="store_true",
+                    help="ONE toggleable weighted mode: soft-label CE numerator Σ y_t·z_t "
+                         "(Game4Loc weighted-InfoNCE) instead of hard logsumexp_P; needs a "
+                         "weighting positive selector (overlap_weighted / tile_iou_1000). Off = "
+                         "byte-identical to the current hard loss.")
+    ap.add_argument("--pos-weight-power", type=float, default=1.0,
+                    help="k: soft target y ∝ weight^k over positives (1=raw ratio, larger→sharper, "
+                         "→∞≈hard nearest). Game4Loc reports k≈5 best.")
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--eval-every", type=int, default=5,
                     help="eval every N epochs (full-gallery pass streams all tiles from disk — costly)")

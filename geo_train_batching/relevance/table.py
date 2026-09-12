@@ -67,17 +67,36 @@ class GeometryRelevanceTable:
     def safe_of(self, i: int) -> np.ndarray:
         return self._safe[int(i)]
 
+    has_weights = False                       # IoU-geometry table carries no explicit weights
+
+    def weight_lookup(self, i: int) -> dict:
+        return {}
+
 
 class ExplicitRelevanceTable:
     """Relevance from explicit per-query pos/safe row lists (positives may come from an
-    external source, e.g. the split's positive-selection snapshot)."""
+    external source, e.g. the split's positive-selection snapshot).
 
-    def __init__(self, query_ids, pos_rows, safe_rows):
+    ``pos_weights`` (optional) carries a per-positive weight aligned with ``pos_rows`` — the
+    positive-selection score (e.g. overlap intersection ratio). It is inert unless a weighted
+    loss reads it; the hard loss ignores it entirely.
+    """
+
+    def __init__(self, query_ids, pos_rows, safe_rows, pos_weights=None):
         self._ids = [str(x) for x in query_ids]
         self._pos = [np.asarray(p, np.int64).reshape(-1) for p in pos_rows]
         self._safe = [np.asarray(s, np.int64).reshape(-1) for s in safe_rows]
         if not (len(self._ids) == len(self._pos) == len(self._safe)):
             raise ValueError("query_ids, pos_rows, safe_rows must be equal length")
+        if pos_weights is None:
+            self._w = None
+        else:
+            self._w = [np.asarray(w, np.float64).reshape(-1) for w in pos_weights]
+            if len(self._w) != len(self._pos):
+                raise ValueError("pos_weights must match pos_rows length")
+            for wi, pi in zip(self._w, self._pos):
+                if wi.shape[0] != pi.shape[0]:
+                    raise ValueError("each pos_weights[i] must align with pos_rows[i]")
 
     @property
     def n_queries(self) -> int:
@@ -92,3 +111,18 @@ class ExplicitRelevanceTable:
 
     def safe_of(self, i: int) -> np.ndarray:
         return self._safe[int(i)]
+
+    @property
+    def has_weights(self) -> bool:
+        return self._w is not None
+
+    def weight_of(self, i: int) -> np.ndarray:
+        if self._w is None:
+            raise ValueError("relevance table has no positive weights")
+        return self._w[int(i)]
+
+    def weight_lookup(self, i: int) -> dict:
+        """``{tile_row: weight}`` for query ``i`` (empty when no weights are attached)."""
+        if self._w is None:
+            return {}
+        return {int(r): float(w) for r, w in zip(self._pos[int(i)], self._w[int(i)])}

@@ -80,7 +80,7 @@ def write_gt(root: Path, frames):
         (root / f"{fid}_{lat}_{lon}.jpg").write_bytes(b"\xff\xd8\xff\xd9")
 
 
-def make_split_dataset(tmp: Path, n=30):
+def make_split_dataset(tmp: Path, n=30, strategy="current_rule", params=None):
     """Isolated single-city gallery + queries; returns (config_path, split_json_path)."""
     import yaml
     from geo_split_no_overlap import cli
@@ -95,7 +95,7 @@ def make_split_dataset(tmp: Path, n=30):
     write_h5(h5, tiles)
     write_gt(gt, frames)
     cfg = {"gt": [f"c={gt}"], "tiles_h5": str(h5), "out_dir": str(out),
-           "positive_selection": {"strategy": "current_rule", "params": {}},
+           "positive_selection": {"strategy": strategy, "params": params or {}},
            "train_ratio": 0.7, "val_ratio": 0.15, "test_ratio": 0.15,
            "ratio_tolerance": 0.15, "area_epsilon_m2": 1.0, "seed": 0}
     cfgp = tmp / "cfg.yaml"
