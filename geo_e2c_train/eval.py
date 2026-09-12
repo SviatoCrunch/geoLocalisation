@@ -27,7 +27,7 @@ def build_gallery_V(model, tile_loader, tile_ids, tile_chunk, dev, progress=Fals
 
 
 @torch.no_grad()
-def score_against_gallery(model, store, sr, galV, dev, tile_chunk=64, ks=(1, 5, 10, 20)):
+def score_against_gallery(model, store, sr, galV, dev, tile_chunk=64, ks=(1, 5, 10, 20, 50, 100, 200)):
     """Rank ``sr``'s queries against a PREBUILT ``galV`` → Recall@ks + median rank. Gallery-row
     order must match ``sr.tile_ids`` (== relevance pos rows). Lets val + test share one galV."""
     qids = [q for q in sr.query_ids if store.has(q)]
@@ -71,7 +71,7 @@ def score_against_gallery(model, store, sr, galV, dev, tile_chunk=64, ks=(1, 5, 
 
 
 @torch.no_grad()
-def evaluate(model, store, sr, tile_loader, dev, tile_chunk=64, ks=(1, 5, 10, 20), progress=False):
+def evaluate(model, store, sr, tile_loader, dev, tile_chunk=64, ks=(1, 5, 10, 20, 50, 100, 200), progress=False):
     """Convenience: build ``sr``'s gallery V then score it. (The trainer builds galV once and calls
     :func:`score_against_gallery` for both val and test — galV is identical across splits.)"""
     model.eval()
