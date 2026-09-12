@@ -34,7 +34,7 @@ def run(ctx) -> dict:
     out = Path(a.output_dir)
     tr, va = ctx.sr["train"], ctx.sr["val"]
     obj = candidate_set_metrics(ctx.model, ctx.store, tr, ctx.tiles, ctx.device, a.eval_chunk,
-                                cand_cap=a.objective_cap)
+                                cand_cap=a.objective_cap, progress=True, max_queries=a.max_queries)
     galV = ctx.galV()
     tr_rows, tr_full = full_gallery_per_query(ctx.model, ctx.store, tr, galV, ctx.device, a.eval_chunk)
     va_rows, va_full = full_gallery_per_query(ctx.model, ctx.store, va, galV, ctx.device, a.eval_chunk)

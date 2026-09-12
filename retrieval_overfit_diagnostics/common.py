@@ -216,7 +216,7 @@ def rank_matrix(S_np, qids, qid_row, sr, ks=(1, 5, 10, 20)):
 
 @torch.no_grad()
 def candidate_set_metrics(model, store, sr, tiles, dev, tile_chunk, ks=(1, 5, 10),
-                          cand_cap=128, seed=0):
+                          cand_cap=128, seed=0, progress=False, max_queries=0):
     """A) Metric on the TRAIN candidate pool the loss optimises: for each query, rank of its positive
     among ``pos + a bounded sample of safe`` tiles. The real DSS objective scores a LOGICAL BATCH of
     ~B_log tiles (neighbour-mined), NOT pos∪safe (which on a dense stride-250 gallery is ~the whole
@@ -226,8 +226,14 @@ def candidate_set_metrics(model, store, sr, tiles, dev, tile_chunk, ks=(1, 5, 10
     rng = np.random.RandomState(seed)
     qids = [q for q in sr.query_ids if store.has(q)]
     qid_row = {q: i for i, q in enumerate(sr.query_ids)}
+    if max_queries and len(qids) > max_queries:            # subsample train queries (speed)
+        qids = [qids[j] for j in np.sort(rng.choice(len(qids), max_queries, replace=False))]
+    it = qids
+    if progress:
+        from tqdm import tqdm
+        it = tqdm(qids, desc="train-objective", unit="q")
     ranks, hit, cand_counts = [], {k: 0 for k in ks}, []
-    for q in qids:
+    for q in it:
         i = qid_row[q]
         pos = sorted(int(x) for x in sr.relevance.pos_of(i))
         pos_set = set(pos)
