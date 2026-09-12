@@ -47,9 +47,9 @@ def create_positive_selector(config: Union[PositiveSelectionConfig, Mapping]) ->
 
 def _register_builtins() -> None:
     from .strategies import (ContainsPointSelector, CurrentRuleSelector, NearestTileSelector,
-                             PyramidTopIoU250Selector, TileIoU1000Selector)
+                             OverlapWeightedSelector, PyramidTopIoU250Selector, TileIoU1000Selector)
     for cls in (CurrentRuleSelector, ContainsPointSelector, NearestTileSelector,
-                TileIoU1000Selector, PyramidTopIoU250Selector):
+                OverlapWeightedSelector, TileIoU1000Selector, PyramidTopIoU250Selector):
         if cls.name not in _REGISTRY:
             register_positive_selector(cls.name, cls.from_params)
 
