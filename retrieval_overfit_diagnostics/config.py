@@ -25,6 +25,9 @@ def build_parser():
     ap.add_argument("--query-size-m", type=float, default=1000.0)
     ap.add_argument("--safe-eps-area", type=float, default=0.0)
     ap.add_argument("--eval-chunk", type=int, default=64)
+    ap.add_argument("--objective-cap", type=int, default=128,
+                    help="cap the train-objective candidate pool (pos + sampled safe) — a bounded "
+                         "proxy of the DSS logical-batch size; NOT the full safe set (~whole gallery)")
     ap.add_argument("--max-queries", type=int, default=0, help="cap queries per split (0=all; smoke)")
     ap.add_argument("--device", default="cuda")
     return ap

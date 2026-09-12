@@ -215,19 +215,29 @@ def rank_matrix(S_np, qids, qid_row, sr, ks=(1, 5, 10, 20)):
 
 
 @torch.no_grad()
-def candidate_set_metrics(model, store, sr, tiles, dev, tile_chunk, ks=(1, 5, 10)):
-    """A) Metric on the TRAIN candidate set actually used by the loss: for each query, rank of its
-    positive among its DSS candidate set (pos ∪ safe from the relevance table). NOT the full gallery,
-    NOT B×B in-batch — the per-query candidate pool the objective optimises."""
+def candidate_set_metrics(model, store, sr, tiles, dev, tile_chunk, ks=(1, 5, 10),
+                          cand_cap=128, seed=0):
+    """A) Metric on the TRAIN candidate pool the loss optimises: for each query, rank of its positive
+    among ``pos + a bounded sample of safe`` tiles. The real DSS objective scores a LOGICAL BATCH of
+    ~B_log tiles (neighbour-mined), NOT pos∪safe (which on a dense stride-250 gallery is ~the whole
+    gallery). We cap at ``cand_cap`` so this is a bounded proxy of that batch-sized candidate set
+    (NOT the full gallery, NOT B×B in-batch). Sampled safe = random (easy) negatives, so this is an
+    OPTIMISTIC bound on the objective's difficulty."""
+    rng = np.random.RandomState(seed)
     qids = [q for q in sr.query_ids if store.has(q)]
     qid_row = {q: i for i, q in enumerate(sr.query_ids)}
     ranks, hit, cand_counts = [], {k: 0 for k in ks}, []
     for q in qids:
         i = qid_row[q]
         pos = sorted(int(x) for x in sr.relevance.pos_of(i))
-        safe = sorted(int(x) for x in sr.relevance.safe_of(i))
-        cand = pos + [s for s in safe if s not in set(pos)]
-        if not pos or len(cand) < 2:
+        pos_set = set(pos)
+        safe = [int(x) for x in sr.relevance.safe_of(i) if int(x) not in pos_set]
+        if not pos:
+            continue
+        n_safe = min(max(cand_cap - len(pos), 1), len(safe))
+        safe_samp = list(rng.choice(safe, n_safe, replace=False)) if n_safe and safe else []
+        cand = pos + safe_samp
+        if len(cand) < 2:
             continue
         G = tiles.stack([sr.tile_ids[r] for r in cand]).float().to(dev)
         V = model.build_V(G)
@@ -242,6 +252,10 @@ def candidate_set_metrics(model, store, sr, tiles, dev, tile_chunk, ks=(1, 5, 10
                 hit[k] += 1
     n = len(ranks)
     return {"n_queries": n, "candidate_count_median": int(np.median(cand_counts)) if cand_counts else 0,
+            "cand_cap": cand_cap,
+            "candidate_set_note": "pos + up to cand_cap RANDOM safe tiles (bounded proxy of the "
+                                  "DSS logical-batch candidate size; the real objective mines ~B_log "
+                                  "neighbour negatives — this is an optimistic difficulty bound).",
             "median_rank": float(np.median(ranks)) if ranks else float("nan"),
             **{f"R@{k}": (hit[k] / n if n else 0.0) for k in ks},
             "hits": {f"R@{k}": int(hit[k]) for k in ks}}
