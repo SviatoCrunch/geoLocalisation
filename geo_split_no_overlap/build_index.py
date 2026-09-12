@@ -38,17 +38,50 @@ def _tile_groups(f):
     return sorted(keys, key=_order)
 
 
-def build_index(galleries, out_path) -> dict:
-    """galleries: list of (city, path). Writes lat/lon/city/tile_id/window_size_m datasets."""
+def _checkerboard_keep(lat, lon, city, grid_snap_m) -> np.ndarray:
+    """Boolean keep-mask sub-sampling the dense tiles to a NON-OVERLAPPING ``grid_snap_m``
+    (TRUE-metre) grid: per city, snap each tile to a cell and keep the one tile nearest the
+    cell centre → one tile per occupied cell (a "checkerboard"). A local equirectangular
+    metric (per-city origin) is enough for a single city's small extent; the exact CRS is
+    irrelevant since we only need a consistent grid to decimate on."""
+    import math
+    lat = np.asarray(lat, float); lon = np.asarray(lon, float); city = np.asarray(city, object)
+    keep = np.zeros(len(lat), bool)
+    for c in np.unique(city):
+        idx = np.nonzero(city == c)[0]
+        lat0, lon0 = float(lat[idx].mean()), float(lon[idx].mean())
+        cl = math.cos(math.radians(lat0))
+        x = (lon[idx] - lon0) * cl * 111320.0          # local TRUE metres (east)
+        y = (lat[idx] - lat0) * 110540.0               # local TRUE metres (north)
+        xmin, ymin = x.min(), y.min()
+        cx = np.floor((x - xmin) / grid_snap_m).astype(int)
+        cy = np.floor((y - ymin) / grid_snap_m).astype(int)
+        ccx = xmin + (cx + 0.5) * grid_snap_m          # cell centre
+        ccy = ymin + (cy + 0.5) * grid_snap_m
+        d2 = (x - ccx) ** 2 + (y - ccy) ** 2
+        best = {}
+        for j in range(len(idx)):
+            k = (int(cx[j]), int(cy[j]))
+            if k not in best or d2[j] < d2[best[k]]:
+                best[k] = j
+        for j in best.values():
+            keep[idx[j]] = True
+    return keep
+
+
+def build_index(galleries, out_path, grid_snap_m=None) -> dict:
+    """galleries: list of (city, path). Writes lat/lon/city/tile_id/window_size_m datasets.
+
+    ``grid_snap_m`` (TRUE metres) optionally sub-samples the dense tiles to a
+    non-overlapping checkerboard (one tile per grid cell) — see :func:`_checkerboard_keep`.
+    """
     import h5py
 
     lat, lon, win, city, tid = [], [], [], [], []
-    per_city = {}
     for c, p in galleries:
         p = Path(p).expanduser()
         if not p.exists():
             raise FileNotFoundError(f"gallery not found: {p}")
-        n0 = len(tid)
         with h5py.File(p, "r") as f:
             for k in _tile_groups(f):
                 a = f[k].attrs
@@ -57,9 +90,19 @@ def build_index(galleries, out_path) -> dict:
                 win.append(float(a.get("window_size_m", np.nan)))
                 city.append(c)
                 tid.append(f"{c}:{k}")
-        per_city[c] = len(tid) - n0
     if not tid:
         raise SystemExit("no tiles found in the input galleries")
+
+    n_dense = len(tid)
+    if grid_snap_m is not None:
+        keep = _checkerboard_keep(lat, lon, city, float(grid_snap_m))
+        lat = list(np.asarray(lat)[keep]); lon = list(np.asarray(lon)[keep])
+        win = list(np.asarray(win)[keep]); city = list(np.asarray(city, object)[keep])
+        tid = list(np.asarray(tid, object)[keep])
+
+    per_city = {}
+    for c in city:
+        per_city[c] = per_city.get(c, 0) + 1
 
     out = Path(out_path).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -74,7 +117,11 @@ def build_index(galleries, out_path) -> dict:
         f.attrs["n_tiles"] = len(tid)
         f.attrs["cities"] = list(per_city)
         f.attrs["city_counts"] = [per_city[c] for c in per_city]
-    return {"out": str(out), "n_tiles": len(tid), "per_city": per_city}
+        if grid_snap_m is not None:
+            f.attrs["grid_snap_m"] = float(grid_snap_m)     # non-overlapping checkerboard step
+            f.attrs["n_dense"] = int(n_dense)
+    return {"out": str(out), "n_tiles": len(tid), "per_city": per_city,
+            "n_dense": n_dense, "grid_snap_m": grid_snap_m}
 
 
 def main(argv=None) -> int:
@@ -82,10 +129,15 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gallery", nargs="+", required=True, help="city=path (raw group-per-tile H5)")
     ap.add_argument("--out", required=True, help="output tiles-index H5")
+    ap.add_argument("--grid-snap-m", type=float, default=None,
+                    help="sub-sample tiles to a NON-OVERLAPPING checkerboard of this TRUE-metre "
+                         "step (one tile per cell); omit to keep the dense (overlapping) gallery")
     args = ap.parse_args(argv)
     galleries = [_city_and_path(a) for a in args.gallery]
-    info = build_index(galleries, args.out)
-    print(f"[ok] {info['n_tiles']} tiles -> {info['out']}  per-city={info['per_city']}")
+    info = build_index(galleries, args.out, grid_snap_m=args.grid_snap_m)
+    tail = (f"  (checkerboard {info['grid_snap_m']:g} m: {info['n_dense']}->{info['n_tiles']})"
+            if info["grid_snap_m"] is not None else "")
+    print(f"[ok] {info['n_tiles']} tiles -> {info['out']}  per-city={info['per_city']}{tail}")
     return 0
 
 
