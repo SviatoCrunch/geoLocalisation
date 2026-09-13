@@ -27,14 +27,24 @@ def build_gallery_V(model, tile_loader, tile_ids, tile_chunk, dev, progress=Fals
 
 
 @torch.no_grad()
-def score_against_gallery(model, store, sr, galV, dev, tile_chunk=64, ks=(1, 5, 10, 20, 50, 100, 200)):
+def score_against_gallery(model, store, sr, galV, dev, tile_chunk=64, ks=(1, 5, 10, 20, 50, 100, 200),
+                          same_city=False):
     """Rank ``sr``'s queries against a PREBUILT ``galV`` → Recall@ks + median rank. Gallery-row
-    order must match ``sr.tile_ids`` (== relevance pos rows). Lets val + test share one galV."""
+    order must match ``sr.tile_ids`` (== relevance pos rows). Lets val + test share one galV.
+
+    ``same_city=True`` restricts each query's candidates to tiles of ITS OWN city (id prefix
+    ``city:``) — the ceiling for a two-stage retriever deployed in a KNOWN operating area (no
+    cross-city distractors)."""
     qids = [q for q in sr.query_ids if store.has(q)]
     if not qids:
         return {"n": 0, "median_rank": float("nan"), **{f"R@{k}": 0.0 for k in ks}}
     Q = torch.stack([model.encode_query(store.tokens(q).to(dev)) for q in qids])
     S = model.score(Q, galV, tile_chunk=tile_chunk)                 # (B, M)
+    if same_city:                                                   # mask out other cities' tiles
+        tcity = np.array([str(t).split(":", 1)[0] for t in sr.tile_ids])
+        qcity = np.array([str(q).split(":", 1)[0] for q in qids])
+        allowed = torch.from_numpy(qcity[:, None] == tcity[None, :]).to(S.device)
+        S = S.masked_fill(~allowed, float("-inf"))
     order = S.argsort(dim=1, descending=True).cpu().numpy()
     qid_row = {q: i for i, q in enumerate(sr.query_ids)}
     ranks, hit = [], {k: 0 for k in ks}

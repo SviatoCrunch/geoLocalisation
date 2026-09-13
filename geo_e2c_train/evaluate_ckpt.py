@@ -44,6 +44,8 @@ def main(argv=None) -> int:
     ap.add_argument("--eval-chunk", type=int, default=64)
     ap.add_argument("--ks", default="1,5,10,20,50,100,200",
                     help="comma recall cutoffs (shortlist sizing for two-stage rerank)")
+    ap.add_argument("--same-city", action="store_true",
+                    help="rank each query only against tiles of its own city (known-AO ceiling)")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args(argv)
     ks = tuple(int(x) for x in args.ks.split(",") if x.strip())
@@ -83,7 +85,8 @@ def main(argv=None) -> int:
         if galV is None:                              # gallery identical across splits → build once
             galV = build_gallery_V(model, eval_tiles, sr.tile_ids, args.eval_chunk, args.device,
                                    progress=True)
-        results[w] = score_against_gallery(model, store, sr, galV, args.device, args.eval_chunk, ks=ks)
+        results[w] = score_against_gallery(model, store, sr, galV, args.device, args.eval_chunk,
+                                           ks=ks, same_city=args.same_city)
         print(f"[{w}] {json.dumps(results[w])}", flush=True)
 
     out = Path(args.ckpt).with_suffix(".eval.json")
