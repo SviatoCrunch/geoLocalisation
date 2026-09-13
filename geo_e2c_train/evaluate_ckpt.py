@@ -42,7 +42,7 @@ def main(argv=None) -> int:
     ap.add_argument("--query-size-m", type=float, default=1000.0)
     ap.add_argument("--safe-eps-area", type=float, default=0.0)
     ap.add_argument("--eval-chunk", type=int, default=64)
-    ap.add_argument("--ks", default="1,5,10,20,50,100,200",
+    ap.add_argument("--ks", default="1,5,10,20,50,60,70,100,200",
                     help="comma recall cutoffs (shortlist sizing for two-stage rerank)")
     ap.add_argument("--same-city", action="store_true",
                     help="rank each query only against tiles of its own city (known-AO ceiling)")
