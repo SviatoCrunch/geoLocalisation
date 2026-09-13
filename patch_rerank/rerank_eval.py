@@ -25,7 +25,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .matcher import central_mask, grid_keypoints, grid_to_latlon, ransac_match
+from .matcher import (ESTIMATORS, GEOM_MODELS, central_mask, grid_keypoints, grid_to_latlon,
+                      matched_coords, verify_inliers)
 from .query_io import QueryGridStore
 
 _R = 6378137.0                                   # EPSG:3857 sphere radius
@@ -74,6 +75,10 @@ def main(argv=None) -> int:
                     default=[1000, 800, 600, 500, 400, 300],
                     help="concentric central-crop levels matched per tile; best (max score) wins")
     ap.add_argument("--reproj-thresh", type=float, default=2.0)
+    ap.add_argument("--models", nargs="+", default=list(GEOM_MODELS),
+                    help=f"geometric models to sweep (any of {GEOM_MODELS})")
+    ap.add_argument("--estimators", nargs="+", default=list(ESTIMATORS),
+                    help=f"RANSAC estimators to sweep (any of {ESTIMATORS})")
     ap.add_argument("--grid-size", type=int, default=0, help="resample tile token grids to g×g (0=native)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", default=None)
@@ -100,9 +105,13 @@ def main(argv=None) -> int:
                            grid_size=(args.grid_size or None), cache=False)
     dev = args.device
 
-    d_coarse, d_rerank, level_hist = [], [], {}
+    combos = [(m, e) for m in args.models for e in args.estimators]   # geom-model × estimator sweep
+    d_coarse = []
+    d_by = {c: [] for c in combos}
+    lh_by = {c: {} for c in combos}
     out = {"meta": {"shortlist": args.shortlist, "pool_cells": args.pool_cells,
-                    "max_pool": args.max_pool, "levels_m": list(args.levels_m)}, "per_query": {}}
+                    "max_pool": args.max_pool, "levels_m": list(args.levels_m),
+                    "combos": [f"{m}/{e}" for m, e in combos]}, "per_query": {}}
     for q, entry in tqdm(sj["shortlist"].items(), desc="rerank", unit="q"):
         if not qstore.has(q):
             continue
@@ -110,6 +119,7 @@ def main(argv=None) -> int:
         if not math.isfinite(qlat):
             continue
         qf = qf.to(dev)
+        n_q = int(qf.shape[0])
         pool, seen = [], set()                                  # dense tiles of top cells, cell-ranked
         for cid in entry["cells"][:args.pool_cells]:
             r = row_of.get(cid)
@@ -122,9 +132,12 @@ def main(argv=None) -> int:
                     seen.add(i); pool.append(int(i))
             if args.max_pool and len(pool) >= args.max_pool:
                 pool = pool[:args.max_pool]; break
-        if not pool:
+        c0 = row_of.get(entry["cells"][0])
+        if not pool or c0 is None:
             continue
-        best = {"score": -1.0, "i": None, "level": None, "lat": None, "lon": None}
+        # best per combo defaults to the coarse cell centre (= no-improvement fallback)
+        best = {c: {"score": -1.0, "level": None, "lat": float(lat[c0]), "lon": float(lon[c0])}
+                for c in combos}
         for i in pool:
             g = tiles.grid(ids[i])                              # (H,W,D)
             H, W, D = g.shape
@@ -134,32 +147,45 @@ def main(argv=None) -> int:
                 m = central_mask(H, W, L, args.tile_size_m)
                 if int(m.sum()) < 8:
                     continue
-                r = ransac_match(qf, tf[torch.from_numpy(m)], qxy, txy[m],
-                                 reproj_thresh=args.reproj_thresh)
-                if r.score > best["score"]:
-                    if r.n_inliers > 0:                        # sub-tile position = inlier centroid
-                        cx, cy = r.inlier_r_xy.mean(0)
-                        plat, plon = grid_to_latlon(cx, cy, H, W, lat[i], lon[i], args.tile_size_m)
-                    else:
-                        plat, plon = float(lat[i]), float(lon[i])
-                    best = {"score": r.score, "i": i, "level": float(L), "lat": plat, "lon": plon}
-        if best["i"] is None:
-            continue
-        c0 = row_of.get(entry["cells"][0])
-        dc = _haversine_m(qlat, qlon, lat[c0], lon[c0]) if c0 is not None else float("nan")
-        dr = _haversine_m(qlat, qlon, best["lat"], best["lon"])
-        d_coarse.append(dc); d_rerank.append(dr)
-        level_hist[best["level"]] = level_hist.get(best["level"], 0) + 1
-        out["per_query"][q] = {"coarse_dist_m": dc, "rerank_dist_m": dr,
-                               "rerank_tile": ids[best["i"]], "rerank_score": best["score"],
-                               "rerank_level_m": best["level"], "pool": len(pool)}
+                qm, rm, n_mut = matched_coords(qf, tf[torch.from_numpy(m)], qxy, txy[m])
+                if n_mut < 4:
+                    continue
+                for c in combos:                               # cheap: reuse the same matched pairs
+                    inl = verify_inliers(qm, rm, model=c[0], estimator=c[1],
+                                         reproj_thresh=args.reproj_thresh)
+                    sc = inl.shape[0] / n_q if n_q else 0.0
+                    if sc > best[c]["score"]:
+                        if inl.shape[0] > 0:
+                            cx, cy = inl.mean(0)
+                            plat, plon = grid_to_latlon(cx, cy, H, W, lat[i], lon[i], args.tile_size_m)
+                        else:
+                            plat, plon = float(lat[i]), float(lon[i])
+                        best[c] = {"score": sc, "level": float(L), "lat": plat, "lon": plon}
+        d_coarse.append(_haversine_m(qlat, qlon, lat[c0], lon[c0]))
+        rec = {"coarse_dist_m": d_coarse[-1], "pool": len(pool)}
+        for c in combos:
+            b = best[c]
+            d = _haversine_m(qlat, qlon, b["lat"], b["lon"])
+            d_by[c].append(d)
+            if b["level"] is not None:
+                lh_by[c][b["level"]] = lh_by[c].get(b["level"], 0) + 1
+            rec[f"{c[0]}/{c[1]}"] = {"dist_m": d, "score": b["score"], "level_m": b["level"]}
+        out["per_query"][q] = rec
 
-    res = {"coarse_top1_cell": _report("coarse", d_coarse),
-           "patch_rerank_top1": _report("rerank", d_rerank)}
-    lh = {int(k): level_hist[k] for k in sorted(level_hist)}
-    print(f"[levels] winning best-level histogram (m→count): {lh}", flush=True)
+    res = {"coarse_top1_cell": _report("coarse", d_coarse)}
+    best_combo, best_metric = None, -1.0
+    for c in combos:
+        name = f"{c[0]}/{c[1]}"
+        r = _report(name, d_by[c])
+        lh = {int(k): lh_by[c][k] for k in sorted(lh_by[c])}
+        print(f"[levels {name}] best-level hist (m→count): {lh}", flush=True)
+        r["best_level_hist_m"] = lh
+        res[name] = r
+        if r["distR@250m"] > best_metric:
+            best_metric, best_combo = r["distR@250m"], name
+    print(f"[best] geom/estimator by distR@250m = {best_combo} ({best_metric:.3f})", flush=True)
     out["summary"] = res
-    out["summary"]["best_level_hist_m"] = lh
+    out["summary"]["best_by_distR250"] = best_combo
     if args.out:
         Path(args.out).expanduser().write_text(json.dumps(out), encoding="utf-8")
         print(f"[ok] -> {args.out}", flush=True)

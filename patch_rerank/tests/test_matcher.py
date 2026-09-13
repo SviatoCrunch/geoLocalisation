@@ -31,6 +31,19 @@ def test_ransac_returns_inlier_coords():
     assert r.inlier_r_xy.shape[0] == r.n_inliers and r.inlier_r_xy.shape[1] == 2
 
 
+def test_all_models_and_estimators_verify_identity():
+    pytest.importorskip("cv2")
+    from patch_rerank.matcher import GEOM_MODELS, ESTIMATORS, matched_coords, verify_inliers
+    feat = torch.nn.functional.normalize(torch.randn(25, 16), dim=1)
+    xy = grid_keypoints(5, 5)
+    qm, rm, n = matched_coords(feat, feat.clone(), xy, xy.copy())
+    assert n == 25                                             # identity → all mutual
+    for model in GEOM_MODELS:                                  # every model×estimator runs + fits
+        for est in ESTIMATORS:
+            inl = verify_inliers(qm, rm, model=model, estimator=est)
+            assert inl.shape[1] == 2 and inl.shape[0] >= 20    # identity → mostly inliers
+
+
 def test_grid_keypoints_layout():
     kp = grid_keypoints(2, 3)                       # rows=2, cols=3 → 6 points, row-major (x,y)
     assert kp.shape == (6, 3 - 1)                   # (6,2)

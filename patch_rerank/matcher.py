@@ -64,24 +64,62 @@ class MatchResult:
     inlier_r_xy: np.ndarray = field(default_factory=lambda: np.empty((0, 2)))  # tile-side inlier coords
 
 
-def ransac_match(q_feat: torch.Tensor, r_feat: torch.Tensor, q_xy: np.ndarray, r_xy: np.ndarray,
-                 *, reproj_thresh: float = 2.0, min_matches: int = 4) -> MatchResult:
-    """Mutual-NN + homography RANSAC on patch coordinates. Score = inliers / #query patches.
-    ``inlier_r_xy`` = the tile-side coordinates of the inliers (for sub-tile position)."""
+GEOM_MODELS = ("homography", "affine", "similarity")   # 8- / 6- / 4-DOF
+ESTIMATORS = ("ransac", "magsac")                       # classic RANSAC vs MAGSAC++ (USAC)
+_MIN_MATCHES = {"homography": 4, "affine": 3, "similarity": 2}
+
+
+def matched_coords(q_feat: torch.Tensor, r_feat: torch.Tensor, q_xy: np.ndarray, r_xy: np.ndarray):
+    """Mutual-NN matched coordinate pairs. → (qm (M,2), rm (M,2), n_mutual). Compute ONCE, then run
+    any number of geometric verifiers on the same pairs."""
     q = F.normalize(q_feat.float(), dim=1)
     r = F.normalize(r_feat.float(), dim=1)
     q_idx, r_idx, _ = mutual_nn(q, r)
-    n_mutual = int(len(q_idx))
-    n_q = int(q_feat.shape[0])
-    if n_mutual < min_matches:
-        return MatchResult(0.0, n_mutual, 0)
+    return np.asarray(q_xy, np.float64)[q_idx], np.asarray(r_xy, np.float64)[r_idx], int(len(q_idx))
+
+
+def _cv2_method(estimator: str):
     import cv2
-    qm = np.asarray(q_xy, np.float64)[q_idx]
-    rm = np.asarray(r_xy, np.float64)[r_idx]
-    _, mask = cv2.findHomography(rm, qm, cv2.RANSAC, ransacReprojThreshold=float(reproj_thresh))
+    return {"ransac": cv2.RANSAC, "magsac": getattr(cv2, "USAC_MAGSAC", cv2.RANSAC),
+            "usac": getattr(cv2, "USAC_DEFAULT", cv2.RANSAC), "lmeds": cv2.LMEDS}[estimator]
+
+
+def verify_inliers(qm: np.ndarray, rm: np.ndarray, model: str = "homography",
+                   estimator: str = "ransac", reproj_thresh: float = 2.0):
+    """Fit ``model`` (homography/affine/similarity) with ``estimator`` on matched coords → the tile-
+    side inlier coordinates. Falls back to plain RANSAC if a cv2 build rejects the estimator flag."""
+    import cv2
+    if len(qm) < _MIN_MATCHES[model]:
+        return np.empty((0, 2))
+    method = _cv2_method(estimator)
+    thr = float(reproj_thresh)
+
+    def _fit(m):
+        if model == "homography":
+            return cv2.findHomography(rm, qm, m, ransacReprojThreshold=thr)[1]
+        if model == "affine":
+            return cv2.estimateAffine2D(rm, qm, method=m, ransacReprojThreshold=thr)[1]
+        return cv2.estimateAffinePartial2D(rm, qm, method=m, ransacReprojThreshold=thr)[1]
+
+    try:
+        mask = _fit(method)
+    except cv2.error:
+        mask = _fit(cv2.RANSAC)
     if mask is None:
+        return np.empty((0, 2))
+    return rm[mask.ravel().astype(bool)]
+
+
+def ransac_match(q_feat: torch.Tensor, r_feat: torch.Tensor, q_xy: np.ndarray, r_xy: np.ndarray,
+                 *, reproj_thresh: float = 2.0, model: str = "homography",
+                 estimator: str = "ransac") -> MatchResult:
+    """Mutual-NN + geometric verification. Score = inliers / #query patches; ``inlier_r_xy`` = the
+    tile-side inlier coordinates (for sub-tile position)."""
+    qm, rm, n_mutual = matched_coords(q_feat, r_feat, q_xy, r_xy)
+    n_q = int(q_feat.shape[0])
+    if n_mutual < _MIN_MATCHES[model]:
         return MatchResult(0.0, n_mutual, 0)
-    inl = mask.ravel().astype(bool)
-    n_in = int(inl.sum())
+    inl = verify_inliers(qm, rm, model=model, estimator=estimator, reproj_thresh=reproj_thresh)
+    n_in = int(inl.shape[0])
     return MatchResult(score=(n_in / n_q if n_q else 0.0), n_mutual=n_mutual, n_inliers=n_in,
-                       inlier_r_xy=rm[inl])
+                       inlier_r_xy=inl)
