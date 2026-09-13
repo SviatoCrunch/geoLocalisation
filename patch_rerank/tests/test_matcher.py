@@ -3,7 +3,32 @@ import numpy as np
 import pytest
 import torch
 
-from patch_rerank.matcher import grid_keypoints, mutual_nn, ransac_match
+from patch_rerank.matcher import (central_mask, grid_keypoints, grid_to_latlon, mutual_nn,
+                                   ransac_match)
+
+
+def test_central_mask_levels():
+    assert int(central_mask(10, 10, 1000, 1000).sum()) == 100      # full tile = all tokens
+    assert int(central_mask(10, 10, 500, 1000).sum()) == 36        # central 50% → 6x6
+    assert int(central_mask(10, 10, 300, 1000).sum()) == 16        # central 30% → 4x4
+
+
+def test_grid_to_latlon_centre_and_signs():
+    lat0, lon0 = 48.9, 37.6
+    la, lo = grid_to_latlon((10 - 1) / 2, (10 - 1) / 2, 10, 10, lat0, lon0, 1000.0)
+    assert abs(la - lat0) < 1e-9 and abs(lo - lon0) < 1e-9          # grid centre = tile centre
+    top_left, _ = grid_to_latlon(0, 0, 10, 10, lat0, lon0, 1000.0)
+    assert top_left > lat0                                          # row 0 = north → higher lat
+    _, east = grid_to_latlon(9, 0, 10, 10, lat0, lon0, 1000.0)
+    assert east > lon0                                             # last col = east → higher lon
+
+
+def test_ransac_returns_inlier_coords():
+    pytest.importorskip("cv2")
+    feat = torch.nn.functional.normalize(torch.randn(25, 16), dim=1)
+    xy = grid_keypoints(5, 5)
+    r = ransac_match(feat, feat.clone(), xy, xy.copy())
+    assert r.inlier_r_xy.shape[0] == r.n_inliers and r.inlier_r_xy.shape[1] == 2
 
 
 def test_grid_keypoints_layout():
