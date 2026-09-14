@@ -98,6 +98,7 @@ def main(argv=None) -> int:
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
+    ap.add_argument("--max-queries", type=int, default=0, help="cap queries processed (0=all; smoke run)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
 
@@ -131,7 +132,10 @@ def main(argv=None) -> int:
                     "model": args.model, "estimator": args.estimator, "backbone": backbone,
                     "projector": bool(proj)}, "per_query": {}}
 
-    for q, entry in tqdm(sj["shortlist"].items(), desc="map-rerank", unit="q"):
+    items = list(sj["shortlist"].items())
+    for q, entry in tqdm(items, desc="map-rerank", unit="q"):
+        if args.max_queries and len(d_fine) >= args.max_queries:
+            break
         if not qstore.has(q):
             continue
         city = q.split(":", 1)[0]
