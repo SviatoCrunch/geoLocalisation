@@ -102,6 +102,7 @@ def main(argv=None) -> int:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
     ap.add_argument("--max-queries", type=int, default=0, help="cap queries processed (0=all; smoke run)")
+    ap.add_argument("--only-city", default=None, help="process only queries of this city (e.g. kup)")
     ap.add_argument("--kmz", default=None, help="also write a KMZ (GT + predicted point per query)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
@@ -140,6 +141,8 @@ def main(argv=None) -> int:
     for q, entry in tqdm(items, desc="map-rerank", unit="q"):
         if args.max_queries and len(d_fine) >= args.max_queries:
             break
+        if args.only_city and q.split(":", 1)[0] != args.only_city:
+            continue
         if not qstore.has(q):
             continue
         city = q.split(":", 1)[0]
