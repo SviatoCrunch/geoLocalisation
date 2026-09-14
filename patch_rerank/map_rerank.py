@@ -190,25 +190,33 @@ def main(argv=None) -> int:
                 need.setdefault((px, py), clat)
 
         crop_keys = [(px, py, L) for (px, py) in need for L in args.levels_m]
-        # extract only MISSING grids: one rasterio read per position (derive all levels), DINO misses,
-        # cache cross-query (a map location's grid is query-independent → computed once per run)
-        miss_imgs, miss_keys = [], []
+        # qg = THIS query's grids (cache hits + freshly extracted) → always complete, so global-cache
+        # eviction can NEVER break scoring. grid_cache only serves cross-query reuse.
+        qg, miss_imgs, miss_keys = {}, [], []
         for (px, py) in need:
-            miss_L = [L for L in args.levels_m if (city, px, py, L) not in grid_cache]
-            if not miss_L:
-                continue
-            pyr = read_pyramid_from_one(src, px, py, args.levels_m, need[(px, py)], args.output_px)
-            for L in miss_L:
-                miss_imgs.append(pyr[L]); miss_keys.append((city, px, py, L))
+            miss_L = []
+            for L in args.levels_m:
+                gk = (city, px, py, L)
+                if gk in grid_cache:
+                    grid_cache.move_to_end(gk)               # LRU touch
+                    qg[(px, py, L)] = grid_cache[gk]
+                else:
+                    miss_L.append(L)
+            if miss_L:                                       # one read/position; derive all levels
+                pyr = read_pyramid_from_one(src, px, py, args.levels_m, need[(px, py)], args.output_px)
+                for L in miss_L:
+                    miss_imgs.append(pyr[L]); miss_keys.append((px, py, L))
         for b0 in range(0, len(miss_imgs), args.batch):
             grids = extract_grids(miss_imgs[b0:b0 + args.batch], ext, proj, patch, dev, amp=args.amp)
-            for gk, g in zip(miss_keys[b0:b0 + args.batch], grids):
-                grid_cache[gk] = g.half()
+            for (px, py, L), g in zip(miss_keys[b0:b0 + args.batch], grids):
+                gh = g.half()
+                qg[(px, py, L)] = gh
+                grid_cache[(city, px, py, L)] = gh
                 if cache_cap and len(grid_cache) > cache_cap:
-                    grid_cache.popitem(last=False)           # evict oldest (prior queries), keeps current
+                    grid_cache.popitem(last=False)           # evict oldest (other queries), qg unaffected
         score = {}
         for (px, py, L) in crop_keys:
-            g = grid_cache[(city, px, py, L)].float()
+            g = qg[(px, py, L)].float()
             h, w, dd = g.shape
             if args.scorer == "ransac":
                 s = ransac_match(qfeat, g.reshape(h * w, dd).to(dev), qxy, grid_keypoints(h, w),
