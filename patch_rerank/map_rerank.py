@@ -88,10 +88,11 @@ def main(argv=None) -> int:
     ap.add_argument("--queries", nargs="+", required=True)
     ap.add_argument("--tif-dir", default=None, help="dir of GeoTIFFs resolved by city name")
     ap.add_argument("--maps", nargs="+", default=None, help="city=path.tif (overrides --tif-dir)")
-    ap.add_argument("--k", type=int, default=8, help="top-K coarse cells refined per query")
+    ap.add_argument("--k", type=int, default=50, help="top-K coarse cells (from the best model) refined")
     ap.add_argument("--levels-m", type=float, nargs="+", default=[1000, 900, 800, 700, 600, 500, 400, 300])
-    ap.add_argument("--step-m", type=float, default=100.0)
-    ap.add_argument("--search-radius-m", type=float, default=500.0)
+    ap.add_argument("--step-m", type=float, default=100.0, help="sliding step WITHIN each top cell")
+    ap.add_argument("--search-radius-m", type=float, default=0.0,
+                    help="0 = auto; sliding is hard-capped to tile/2 so window centres stay in the cell")
     ap.add_argument("--output-px", type=int, default=840)
     ap.add_argument("--scorer", choices=["ransac", "cosine"], default="ransac")
     ap.add_argument("--model", default="homography")
@@ -130,10 +131,15 @@ def main(argv=None) -> int:
     srcs = {c: open_src(maps[c]) for c in cities}
     dev = args.device
 
+    # sliding is confined to WITHIN each top cell: radius hard-capped to tile/2 (per user spec)
+    radius_m = args.tile_size_m / 2.0
+    if args.search_radius_m:
+        radius_m = min(args.search_radius_m, args.tile_size_m / 2.0)
+
     sj = json.loads(Path(args.shortlist).expanduser().read_text())
     d_coarse, d_fine, kmz_entries = [], [], []
     out = {"meta": {"k": args.k, "levels_m": list(args.levels_m), "step_m": args.step_m,
-                    "search_radius_m": args.search_radius_m, "scorer": args.scorer,
+                    "search_radius_m": radius_m, "scorer": args.scorer,
                     "model": args.model, "estimator": args.estimator, "backbone": backbone,
                     "projector": bool(proj)}, "per_query": {}}
 
@@ -170,7 +176,7 @@ def main(argv=None) -> int:
         for c in uniq_cells:
             clat = lat[row_of[c]]
             cx, cy = latlon_to_merc(clat, lon[row_of[c]])
-            centres = cell_window_centres(cx, cy, clat, args.search_radius_m, args.step_m)
+            centres = cell_window_centres(cx, cy, clat, radius_m, args.step_m)
             cell_pos[c] = centres
             for (px, py) in centres:
                 need.setdefault((px, py), clat)
