@@ -26,8 +26,7 @@ def build_matched_extractor(query_h5: str, device: str = "cuda", proj_seed: int 
         for k in f.keys():
             if hasattr(f[k], "keys") and "ift_dino" in f[k]:
                 D = int(np.asarray(f[k]["ift_dino"]).shape[0]); break
-    ext = build_dino_extractor(backbone)
-    ext.to(device) if hasattr(ext, "to") else None
+    ext = build_dino_extractor(backbone, device=device)          # layer 31 / value facet = gallery defaults
     native = _BACKBONE_DIM.get(backbone)
     proj = None
     if native is not None and D is not None and native != D:      # H5 was projected → match it EXACTLY
