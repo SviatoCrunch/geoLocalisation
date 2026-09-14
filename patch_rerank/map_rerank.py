@@ -24,7 +24,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # reduce fragmentation
 
 import numpy as np
 
@@ -94,7 +97,7 @@ def main(argv=None) -> int:
     ap.add_argument("--model", default="homography")
     ap.add_argument("--estimator", default="magsac")
     ap.add_argument("--reproj-thresh", type=float, default=2.0)
-    ap.add_argument("--batch", type=int, default=32, help="crops per DINO forward batch")
+    ap.add_argument("--batch", type=int, default=8, help="crops per DINO forward batch (lower if OOM)")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
@@ -216,6 +219,8 @@ def main(argv=None) -> int:
         d_fine.append(_haversine_m(qlat, qlon, best_overall["lat"], best_overall["lon"]))
         kmz_entries.append({"name": q, "gt": (qlat, qlon),
                             "pred": (best_overall["lat"], best_overall["lon"]), "dist_m": d_fine[-1]})
+        if str(dev).startswith("cuda"):
+            torch.cuda.empty_cache()
         out["per_query"][q] = {"gt": {"lat": qlat, "lon": qlon},
                                "coarse_dist_m": d_coarse[-1], "fine_dist_m": d_fine[-1],
                                "mean_cell_sum": float(np.mean(cell_max_sums)) if cell_max_sums else 0.0,
