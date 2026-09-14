@@ -31,8 +31,6 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # 
 
 import numpy as np
 
-from collections import OrderedDict
-
 from .matcher import grid_keypoints, ransac_match
 from .map_source import (latlon_to_merc, merc_to_latlon, open_src, read_pyramid_from_one,
                          resolve_maps, true_m_to_crs)
@@ -103,8 +101,6 @@ def main(argv=None) -> int:
     ap.add_argument("--estimator", default="magsac")
     ap.add_argument("--reproj-thresh", type=float, default=2.0)
     ap.add_argument("--batch", type=int, default=8, help="crops per DINO forward batch (lower if OOM)")
-    ap.add_argument("--grid-cache", type=int, default=4000,
-                    help="cross-query LRU cache of map-crop token grids (fp16 cpu); 0=unlimited")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
@@ -143,8 +139,6 @@ def main(argv=None) -> int:
         radius_m = min(args.search_radius_m, args.tile_size_m / 2.0)
 
     sj = json.loads(Path(args.shortlist).expanduser().read_text())
-    grid_cache = OrderedDict()                          # (city,px,py,L) -> token grid (cpu fp16), cross-query
-    cache_cap = args.grid_cache
     d_coarse, d_fine, kmz_entries = [], [], []
     out = {"meta": {"k": args.k, "levels_m": list(args.levels_m), "step_m": args.step_m,
                     "search_radius_m": radius_m, "scorer": args.scorer,
@@ -189,43 +183,36 @@ def main(argv=None) -> int:
             for (px, py) in centres:
                 need.setdefault((px, py), clat)
 
-        crop_keys = [(px, py, L) for (px, py) in need for L in args.levels_m]
-        # qg = THIS query's grids (cache hits + freshly extracted) → always complete, so global-cache
-        # eviction can NEVER break scoring. grid_cache only serves cross-query reuse.
-        qg, miss_imgs, miss_keys = {}, [], []
-        for (px, py) in need:
-            miss_L = []
-            for L in args.levels_m:
-                gk = (city, px, py, L)
-                if gk in grid_cache:
-                    grid_cache.move_to_end(gk)               # LRU touch
-                    qg[(px, py, L)] = grid_cache[gk]
-                else:
-                    miss_L.append(L)
-            if miss_L:                                       # one read/position; derive all levels
-                pyr = read_pyramid_from_one(src, px, py, args.levels_m, need[(px, py)], args.output_px)
-                for L in miss_L:
-                    miss_imgs.append(pyr[L]); miss_keys.append((px, py, L))
-        for b0 in range(0, len(miss_imgs), args.batch):
-            grids = extract_grids(miss_imgs[b0:b0 + args.batch], ext, proj, patch, dev, amp=args.amp)
-            for (px, py, L), g in zip(miss_keys[b0:b0 + args.batch], grids):
-                gh = g.half()
-                qg[(px, py, L)] = gh
-                grid_cache[(city, px, py, L)] = gh
-                if cache_cap and len(grid_cache) > cache_cap:
-                    grid_cache.popitem(last=False)           # evict oldest (other queries), qg unaffected
+        # STREAMING: score each crop right after DINO, keep only SCALARS. No grid accumulation →
+        # RAM is O(#scalars) + one batch (a big-city query has ~5000 crops; holding grids = ~14 GB
+        # → host OOM). Positions are deduped per query (`need`), so each unique crop is scored once.
         score = {}
-        for (px, py, L) in crop_keys:
-            g = qg[(px, py, L)].float()
-            h, w, dd = g.shape
-            if args.scorer == "ransac":
-                s = ransac_match(qfeat, g.reshape(h * w, dd).to(dev), qxy, grid_keypoints(h, w),
-                                 model=args.model, estimator=args.estimator,
-                                 reproj_thresh=args.reproj_thresh).score
-            else:
-                cv = F.normalize(g.reshape(h * w, dd).mean(0, keepdim=True).to(dev), dim=1)
-                s = float((cv @ qvec.t()).item())
-            score[(px, py, L)] = s
+        buf_imgs, buf_keys = [], []
+
+        def _flush():
+            if not buf_imgs:
+                return
+            grids = extract_grids(buf_imgs, ext, proj, patch, dev, amp=args.amp)
+            for (px, py, L), g in zip(buf_keys, grids):
+                h, w, dd = g.shape
+                gd = g.reshape(h * w, dd).to(dev)
+                if args.scorer == "ransac":
+                    s = ransac_match(qfeat, gd, qxy, grid_keypoints(h, w), model=args.model,
+                                     estimator=args.estimator, reproj_thresh=args.reproj_thresh).score
+                else:
+                    cv = F.normalize(gd.mean(0, keepdim=True), dim=1)
+                    s = float((cv @ qvec.t()).item())
+                score[(px, py, L)] = s
+            buf_imgs.clear(); buf_keys.clear()
+
+        for (px, py) in need:                                # one read/position; derive all levels
+            pyr = read_pyramid_from_one(src, px, py, args.levels_m, need[(px, py)], args.output_px)
+            for L in args.levels_m:
+                buf_imgs.append(pyr[L]); buf_keys.append((px, py, L))
+                if len(buf_imgs) >= args.batch:
+                    _flush()
+        _flush()
+        crop_keys = [(px, py, L) for (px, py) in need for L in args.levels_m]
 
         # aggregate: per position Σ levels; cell = max; best position = fine location
         rec_cells, cell_max_sums = [], []
