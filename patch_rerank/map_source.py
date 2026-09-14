@@ -51,3 +51,23 @@ def read_window(src, cx: float, cy: float, size_crs_m: float, output_px: int) ->
     arr = src.read([1, 2, 3], window=win, out_shape=(3, output_px, output_px),
                    resampling=Resampling.bilinear, boundless=True, fill_value=0)
     return arr.transpose(1, 2, 0).astype(np.uint8)
+
+
+def read_pyramid_from_one(src, cx: float, cy: float, sizes_true_m, lat: float, output_px: int,
+                          max_internal_px: int = 1536) -> dict:
+    """Read the LARGEST level window ONCE (at high res) and derive every level by centre-crop +
+    resize — cuts rasterio I/O ~N×. → {size_true_m: (output_px,output_px,3) uint8}. Concentric
+    levels share the same centre, so smaller levels are exact centre crops of the big read."""
+    import cv2
+    sizes = list(sizes_true_m)
+    Lmax, Lmin = max(sizes), min(sizes)
+    internal = int(min(max_internal_px, max(output_px, round(output_px * Lmax / Lmin))))
+    big = read_window(src, cx, cy, true_m_to_crs(Lmax, lat), internal)      # one read
+    c = internal / 2.0
+    out = {}
+    for L in sizes:
+        half = (L / Lmax) * internal / 2.0
+        lo, hi = int(round(c - half)), int(round(c + half))
+        crop = big[max(lo, 0):hi, max(lo, 0):hi]
+        out[L] = cv2.resize(crop, (output_px, output_px), interpolation=cv2.INTER_LINEAR)
+    return out
