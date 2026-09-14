@@ -21,6 +21,7 @@ def build_matched_extractor(query_h5: str, device: str = "cuda", proj_seed: int 
     with h5py.File(query_h5, "r") as f:
         backbone = str(f.attrs.get("backbone", "dinov2_vitg14"))
         patch = int(f.attrs.get("patch_size", 14))
+        seed_h5 = f.attrs.get("projection_seed", None)           # exact seed the H5 was built with
         D = None
         for k in f.keys():
             if hasattr(f[k], "keys") and "ift_dino" in f[k]:
@@ -29,8 +30,9 @@ def build_matched_extractor(query_h5: str, device: str = "cuda", proj_seed: int 
     ext.to(device) if hasattr(ext, "to") else None
     native = _BACKBONE_DIM.get(backbone)
     proj = None
-    if native is not None and D is not None and native != D:      # H5 was projected → match it
-        proj = RandomProjector(D, seed=proj_seed)
+    if native is not None and D is not None and native != D:      # H5 was projected → match it EXACTLY
+        seed = int(seed_h5) if seed_h5 is not None else proj_seed
+        proj = RandomProjector(D, seed=seed)
     return ext, proj, patch, backbone, D
 
 

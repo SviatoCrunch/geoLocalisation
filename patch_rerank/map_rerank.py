@@ -99,6 +99,7 @@ def main(argv=None) -> int:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
     ap.add_argument("--max-queries", type=int, default=0, help="cap queries processed (0=all; smoke run)")
+    ap.add_argument("--kmz", default=None, help="also write a KMZ (GT + predicted point per query)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
 
@@ -126,7 +127,7 @@ def main(argv=None) -> int:
     dev = args.device
 
     sj = json.loads(Path(args.shortlist).expanduser().read_text())
-    d_coarse, d_fine = [], []
+    d_coarse, d_fine, kmz_entries = [], [], []
     out = {"meta": {"k": args.k, "levels_m": list(args.levels_m), "step_m": args.step_m,
                     "search_radius_m": args.search_radius_m, "scorer": args.scorer,
                     "model": args.model, "estimator": args.estimator, "backbone": backbone,
@@ -213,6 +214,8 @@ def main(argv=None) -> int:
         c0 = row_of[uniq_cells[0]]
         d_coarse.append(_haversine_m(qlat, qlon, lat[c0], lon[c0]))
         d_fine.append(_haversine_m(qlat, qlon, best_overall["lat"], best_overall["lon"]))
+        kmz_entries.append({"name": q, "gt": (qlat, qlon),
+                            "pred": (best_overall["lat"], best_overall["lon"]), "dist_m": d_fine[-1]})
         out["per_query"][q] = {"gt": {"lat": qlat, "lon": qlon},
                                "coarse_dist_m": d_coarse[-1], "fine_dist_m": d_fine[-1],
                                "mean_cell_sum": float(np.mean(cell_max_sums)) if cell_max_sums else 0.0,
@@ -222,6 +225,10 @@ def main(argv=None) -> int:
                       "map_pyramid_fine": _report("fine", d_fine)}
     Path(args.out).expanduser().write_text(json.dumps(out), encoding="utf-8")
     print(f"[ok] -> {args.out}", flush=True)
+    if args.kmz:
+        from .kmz import write_kmz
+        write_kmz(args.kmz, kmz_entries)
+        print(f"[ok] kmz ({len(kmz_entries)} queries) -> {args.kmz}", flush=True)
     for s in srcs.values():
         s.close()
     qstore.close()
