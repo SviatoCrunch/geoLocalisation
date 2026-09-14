@@ -90,6 +90,8 @@ def main(argv=None) -> int:
     ap.add_argument("--maps", nargs="+", default=None, help="city=path.tif (overrides --tif-dir)")
     ap.add_argument("--k", type=int, default=50, help="top-K coarse cells (from the best model) refined")
     ap.add_argument("--levels-m", type=float, nargs="+", default=[1000, 900, 800, 700, 600, 500, 400, 300])
+    ap.add_argument("--tile-size-m", type=float, default=1000.0,
+                    help="checkerboard cell size; sliding is confined to tile/2 around each cell")
     ap.add_argument("--step-m", type=float, default=100.0, help="sliding step WITHIN each top cell")
     ap.add_argument("--search-radius-m", type=float, default=0.0,
                     help="0 = auto; sliding is hard-capped to tile/2 so window centres stay in the cell")
