@@ -92,6 +92,7 @@ def main(argv=None) -> int:
     ap.add_argument("--dense-index", required=True)
     ap.add_argument("--k", type=int, default=50)
     ap.add_argument("--tile-size-m", type=float, default=1000.0)
+    ap.add_argument("--day-only", action="store_true", help="skip *_night queries (day map only)")
     ap.add_argument("--out-prefix", required=True)
     args = ap.parse_args(argv)
 
@@ -101,6 +102,8 @@ def main(argv=None) -> int:
         sj = json.loads(Path(args.shortlist).expanduser().read_text())["shortlist"]
         folders = []
         for q, entry in sj.items():
+            if args.day_only and "_night" in q:
+                continue
             glat, glon = _gt_from_id(q)
             body = [f"<Folder><name>{q}</name>", _pt(glat, glon, "gt", "GT")]
             for cid in entry["cells"][:args.k]:
@@ -117,6 +120,8 @@ def main(argv=None) -> int:
     rj = json.loads(Path(args.rerank_json).expanduser().read_text())["per_query"]
     coarse, rerank, final = [], [], []
     for q, rec in rj.items():
+        if args.day_only and "_night" in q:
+            continue
         gt = (rec["gt"]["lat"], rec["gt"]["lon"])
         cells = rec.get("cells", [])
         # winner = cell with max cell_score
