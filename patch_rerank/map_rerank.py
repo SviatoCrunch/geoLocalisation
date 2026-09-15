@@ -259,25 +259,27 @@ def main(argv=None) -> int:
                                      reproj_thresh=args.reproj_thresh)
                 return key, (inl.shape[0] / n_q if n_q else 0.0)
 
-            buf_keys, buf_grids, hw = [], [], [0, 0]
+            bufs = {}                                        # (h,w) -> [keys, grids]; group by shape,
+                                                             # since pyramid levels have DIFFERENT grids
 
-            def _drain():
-                if not buf_grids:
+            def _drain(hw):
+                keys, grids = bufs[hw]
+                if not grids:
                     return
-                mc = matched_coords_batch(qfeat, torch.stack(buf_grids), qxy,
-                                          grid_keypoints(hw[0], hw[1]))
-                items = [(buf_keys[i], mc[i][0], mc[i][1], mc[i][2]) for i in range(len(buf_keys))]
+                mc = matched_coords_batch(qfeat, torch.stack(grids), qxy, grid_keypoints(hw[0], hw[1]))
+                items = [(keys[i], mc[i][0], mc[i][1], mc[i][2]) for i in range(len(keys))]
                 res = pool.map(_verify, items) if pool else map(_verify, items)
                 for key, s in res:
                     score[key] = s
-                buf_keys.clear(); buf_grids.clear()
+                keys.clear(); grids.clear()
 
             for px, py, L, gd, h, w in _grid_iter():
-                hw[0], hw[1] = h, w                           # uniform across crops (same output_px)
-                buf_keys.append((px, py, L)); buf_grids.append(gd)
-                if len(buf_grids) >= args.gpu_batch:
-                    _drain()
-            _drain()
+                keys, grids = bufs.setdefault((h, w), [[], []])
+                keys.append((px, py, L)); grids.append(gd)
+                if len(grids) >= args.gpu_batch:
+                    _drain((h, w))
+            for hw in list(bufs):
+                _drain(hw)
             if pool is not None:
                 pool.shutdown()
         crop_keys = [(px, py, L) for (px, py) in need for L in args.levels_m]
