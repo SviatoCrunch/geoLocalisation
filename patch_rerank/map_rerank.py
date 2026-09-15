@@ -109,6 +109,7 @@ def main(argv=None) -> int:
                     help="precomputed rerank token-grid store (precompute_store.py) → no fresh DINO")
     ap.add_argument("--max-queries", type=int, default=0, help="cap queries processed (0=all; smoke run)")
     ap.add_argument("--only-city", default=None, help="process only queries of this city (e.g. kup)")
+    ap.add_argument("--day-only", action="store_true", help="skip *_night queries (map is day-only)")
     ap.add_argument("--kmz", default=None, help="also write a KMZ (GT + predicted point per query)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
@@ -164,6 +165,8 @@ def main(argv=None) -> int:
         if args.max_queries and len(d_fine) >= args.max_queries:
             break
         if args.only_city and q.split(":", 1)[0] != args.only_city:
+            continue
+        if args.day_only and "_night" in q:
             continue
         if not qstore.has(q):
             continue
