@@ -26,6 +26,7 @@ import concurrent.futures as cf
 import json
 import math
 import os
+import time
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # reduce fragmentation
@@ -112,6 +113,9 @@ def main(argv=None) -> int:
                     help="ransac only: crops per batched GPU mutual-NN matmul (one matmul + one host "
                          "transfer instead of per-crop .cpu() syncs — the real reranker bottleneck). "
                          "Lower if GPU OOM (mem ~ gpu_batch × Nq × Nr).")
+    ap.add_argument("--profile", action="store_true",
+                    help="print a per-query time breakdown (store read / host→device / mutual-NN / cv2 "
+                         "verify) + crop/shape/position counts, to locate the bottleneck")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
@@ -214,23 +218,39 @@ def main(argv=None) -> int:
         # STREAMING: score each crop right after DINO, keep only SCALARS. No grid accumulation →
         # RAM is O(#scalars) + one batch (a big-city query has ~5000 crops; holding grids = ~14 GB
         # → host OOM). Positions are deduped per query (`need`), so each unique crop is scored once.
+        prof = {"read": 0.0, "h2d": 0.0, "match": 0.0, "verify": 0.0,
+                "crops": 0, "shapes": set(), "pos": 0, "miss": 0}
+
         def _grid_iter():
             """Yield (px, py, L, gd, h, w) for every crop, streaming from the store or fresh DINO."""
             if store is not None:                            # precomputed grids (no DINO/map)
                 for (px, py) in need:
                     if not store.has(px, py):
+                        prof["miss"] += 1
                         continue
+                    prof["pos"] += 1
                     for L in args.levels_m:
+                        t0 = time.perf_counter()
                         g = store.grid(px, py, L); h, w, dd = g.shape
-                        yield px, py, L, g.reshape(h * w, dd).to(dev), h, w
+                        gf = g.reshape(h * w, dd)            # H5 read + decompress + numpy/torch convert
+                        t1 = time.perf_counter()
+                        gd = gf.to(dev)                      # host → device copy (async; timed coarsely)
+                        prof["read"] += t1 - t0; prof["h2d"] += time.perf_counter() - t1
+                        prof["crops"] += 1; prof["shapes"].add((h, w))
+                        yield px, py, L, gd, h, w
                 return
             buf_imgs, buf_keys = [], []                       # fresh DINO from the real map (batched)
             def _extract():
-                for (bx, by, bL), g in zip(buf_keys, extract_grids(buf_imgs, ext, proj, patch, dev, amp=args.amp)):
+                t0 = time.perf_counter()
+                grids = extract_grids(buf_imgs, ext, proj, patch, dev, amp=args.amp)
+                prof["read"] += time.perf_counter() - t0
+                for (bx, by, bL), g in zip(buf_keys, grids):
                     h, w, dd = g.shape
+                    prof["crops"] += 1; prof["shapes"].add((h, w))
                     yield bx, by, bL, g.reshape(h * w, dd).to(dev), h, w
                 buf_imgs.clear(); buf_keys.clear()
             for (px, py) in need:                            # one read/position; derive all levels
+                prof["pos"] += 1
                 pyr = read_pyramid_from_one(src, px, py, args.levels_m, need[(px, py)], args.output_px)
                 for L in args.levels_m:
                     buf_imgs.append(pyr[L]); buf_keys.append((px, py, L))
@@ -266,11 +286,14 @@ def main(argv=None) -> int:
                 keys, grids = bufs[hw]
                 if not grids:
                     return
+                t0 = time.perf_counter()
                 mc = matched_coords_batch(qfeat, torch.stack(grids), qxy, grid_keypoints(hw[0], hw[1]))
+                t1 = time.perf_counter(); prof["match"] += t1 - t0     # incl .cpu() sync (real GPU time)
                 items = [(keys[i], mc[i][0], mc[i][1], mc[i][2]) for i in range(len(keys))]
                 res = pool.map(_verify, items) if pool else map(_verify, items)
                 for key, s in res:
                     score[key] = s
+                prof["verify"] += time.perf_counter() - t1
                 keys.clear(); grids.clear()
 
             for px, py, L, gd, h, w in _grid_iter():
@@ -283,6 +306,17 @@ def main(argv=None) -> int:
             if pool is not None:
                 pool.shutdown()
         crop_keys = [(px, py, L) for (px, py) in need for L in args.levels_m]
+
+        if args.profile:
+            tot = prof["read"] + prof["h2d"] + prof["match"] + prof["verify"]
+            pct = lambda x: f"{100 * x / tot:.0f}%" if tot else "0%"
+            tqdm.write(
+                f"[prof {q}] read={prof['read']:.1f}s({pct(prof['read'])}) "
+                f"h2d={prof['h2d']:.1f}s({pct(prof['h2d'])}) "
+                f"match={prof['match']:.1f}s({pct(prof['match'])}) "
+                f"verify={prof['verify']:.1f}s({pct(prof['verify'])}) sum={tot:.1f}s | "
+                f"crops={prof['crops']} pos={prof['pos']} miss={prof['miss']} "
+                f"shapes={sorted(prof['shapes'])} cells={len(uniq_cells)}")
 
         # aggregate: per position Σ levels; cell = max; best position = fine location
         rec_cells, cell_max_sums = [], []
