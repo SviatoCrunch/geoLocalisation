@@ -99,6 +99,10 @@ def main(argv=None) -> int:
                     help="0 = auto; sliding is hard-capped to tile/2 so window centres stay in the cell")
     ap.add_argument("--output-px", type=int, default=840)
     ap.add_argument("--scorer", choices=["ransac", "cosine"], default="ransac")
+    ap.add_argument("--prefilter-topn", type=int, default=0,
+                    help="ransac only: cheap pooled-cosine GPU gate over ALL window positions, then run "
+                         "MAGSAC on just the top-N positions (0=off; big speedup, positions ranked by "
+                         "Σ-levels cosine)")
     ap.add_argument("--model", default="homography")
     ap.add_argument("--estimator", default="magsac")
     ap.add_argument("--reproj-thresh", type=float, default=2.0)
@@ -158,6 +162,7 @@ def main(argv=None) -> int:
     d_coarse, d_fine, d_fine_topk, kmz_entries = [], [], [], []
     out = {"meta": {"k": args.k, "topk": args.topk, "levels_m": list(args.levels_m), "step_m": args.step_m,
                     "search_radius_m": radius_m, "scorer": args.scorer,
+                    "prefilter_topn": args.prefilter_topn,
                     "model": args.model, "estimator": args.estimator, "backbone": backbone,
                     "projector": bool(proj)}, "per_query": {}}
 
@@ -179,7 +184,7 @@ def main(argv=None) -> int:
         if not math.isfinite(qlat):
             continue
         qfeat = qfeat.to(dev)
-        qvec = F.normalize(qfeat.mean(0, keepdim=True), dim=1) if args.scorer == "cosine" else None
+        qvec = F.normalize(qfeat.mean(0, keepdim=True), dim=1)   # pooled query (cosine scorer + prefilter gate)
 
         cells = [c for c in entry["cells"][:args.k] if c in row_of]
         # dedup cells whose centres snap to the same grid point
@@ -204,48 +209,49 @@ def main(argv=None) -> int:
         # STREAMING: score each crop right after DINO, keep only SCALARS. No grid accumulation →
         # RAM is O(#scalars) + one batch (a big-city query has ~5000 crops; holding grids = ~14 GB
         # → host OOM). Positions are deduped per query (`need`), so each unique crop is scored once.
-        score = {}
-        buf_imgs, buf_keys = [], []
+        def _score_grid(gd, h, w, mode):
+            if mode == "ransac":
+                return ransac_match(qfeat, gd, qxy, grid_keypoints(h, w), model=args.model,
+                                    estimator=args.estimator, reproj_thresh=args.reproj_thresh).score
+            cv = F.normalize(gd.mean(0, keepdim=True), dim=1)
+            return float((cv @ qvec.t()).item())
 
-        def _flush():
-            if not buf_imgs:
+        def _run(positions, mode, dst):
+            """Score (position × level) for `positions` into dst[(px,py,L)] with `mode`; streams grids."""
+            if store is not None:                            # precomputed grids (no DINO/map)
+                for (px, py) in positions:
+                    if not store.has(px, py):
+                        continue
+                    for L in args.levels_m:
+                        g = store.grid(px, py, L); h, w, dd = g.shape
+                        dst[(px, py, L)] = _score_grid(g.reshape(h * w, dd).to(dev), h, w, mode)
                 return
-            grids = extract_grids(buf_imgs, ext, proj, patch, dev, amp=args.amp)
-            for (px, py, L), g in zip(buf_keys, grids):
-                h, w, dd = g.shape
-                gd = g.reshape(h * w, dd).to(dev)
-                if args.scorer == "ransac":
-                    s = ransac_match(qfeat, gd, qxy, grid_keypoints(h, w), model=args.model,
-                                     estimator=args.estimator, reproj_thresh=args.reproj_thresh).score
-                else:
-                    cv = F.normalize(gd.mean(0, keepdim=True), dim=1)
-                    s = float((cv @ qvec.t()).item())
-                score[(px, py, L)] = s
-            buf_imgs.clear(); buf_keys.clear()
-
-        if store is not None:                                # load precomputed grids (no DINO/map)
-            for (px, py) in need:
-                if not store.has(px, py):
-                    continue
-                for L in args.levels_m:
-                    g = store.grid(px, py, L)
+            buf_imgs, buf_keys = [], []                      # fresh DINO from the real map
+            def _flush():
+                if not buf_imgs:
+                    return
+                for (px, py, L), g in zip(buf_keys, extract_grids(buf_imgs, ext, proj, patch, dev, amp=args.amp)):
                     h, w, dd = g.shape
-                    gd = g.reshape(h * w, dd).to(dev)
-                    if args.scorer == "ransac":
-                        s = ransac_match(qfeat, gd, qxy, grid_keypoints(h, w), model=args.model,
-                                         estimator=args.estimator, reproj_thresh=args.reproj_thresh).score
-                    else:
-                        cv = F.normalize(gd.mean(0, keepdim=True), dim=1)
-                        s = float((cv @ qvec.t()).item())
-                    score[(px, py, L)] = s
-        else:                                                # fresh DINO from the real map
-            for (px, py) in need:                            # one read/position; derive all levels
+                    dst[(px, py, L)] = _score_grid(g.reshape(h * w, dd).to(dev), h, w, mode)
+                buf_imgs.clear(); buf_keys.clear()
+            for (px, py) in positions:                       # one read/position; derive all levels
                 pyr = read_pyramid_from_one(src, px, py, args.levels_m, need[(px, py)], args.output_px)
                 for L in args.levels_m:
                     buf_imgs.append(pyr[L]); buf_keys.append((px, py, L))
                     if len(buf_imgs) >= args.batch:
                         _flush()
             _flush()
+
+        score = {}
+        positions = list(need.keys())
+        if args.scorer == "ransac" and args.prefilter_topn > 0 and len(positions) > args.prefilter_topn:
+            cos = {}
+            _run(positions, "cosine", cos)                   # cheap GPU gate over ALL positions
+            psum = {pp: sum(cos.get((pp[0], pp[1], L), -1e9) for L in args.levels_m) for pp in positions}
+            kept = [pp for pp, _ in sorted(psum.items(), key=lambda kv: kv[1], reverse=True)[:args.prefilter_topn]]
+            _run(kept, "ransac", score)                      # expensive MAGSAC only on the survivors
+        else:
+            _run(positions, args.scorer, score)
         crop_keys = [(px, py, L) for (px, py) in need for L in args.levels_m]
 
         # aggregate: per position Σ levels; cell = max; best position = fine location
