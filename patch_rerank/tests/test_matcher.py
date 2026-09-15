@@ -83,3 +83,27 @@ def test_ransac_random_pair_scores_low():
     xy = grid_keypoints(5, 5)
     r = ransac_match(a, b, xy, xy.copy())
     assert r.score < 0.7                             # unrelated features → few/no consistent inliers
+
+
+def test_verify_inliers_threadpool_matches_serial():
+    """map_rerank --jobs parallelises verify_inliers across threads; it must be bit-identical to
+    serial (cv2 releases the GIL and MAGSAC is internally deterministic)."""
+    pytest.importorskip("cv2")
+    from concurrent.futures import ThreadPoolExecutor
+    from patch_rerank.matcher import matched_coords, verify_inliers
+    torch.manual_seed(0)
+    xy = grid_keypoints(6, 6)
+    pairs = []                                        # a batch of distinct (qm, rm) match sets
+    for i in range(24):
+        a = torch.nn.functional.normalize(torch.randn(36, 16), dim=1)
+        b = a.clone() if i % 2 else torch.nn.functional.normalize(torch.randn(36, 16), dim=1)
+        qm, rm, _ = matched_coords(a, b, xy, xy.copy())
+        pairs.append((qm, rm))
+
+    def _n(pair):
+        return verify_inliers(pair[0], pair[1], model="homography", estimator="magsac").shape[0]
+
+    serial = [_n(p) for p in pairs]
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        parallel = list(ex.map(_n, pairs))
+    assert parallel == serial                         # threading changes nothing but wall-clock

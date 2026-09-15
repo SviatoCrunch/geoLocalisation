@@ -22,6 +22,7 @@ Run::
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import json
 import math
 import os
@@ -31,7 +32,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # 
 
 import numpy as np
 
-from .matcher import grid_keypoints, ransac_match
+from .matcher import _MIN_MATCHES, grid_keypoints, matched_coords, ransac_match, verify_inliers
 from .map_source import (latlon_to_merc, merc_to_latlon, open_src, read_pyramid_from_one,
                          resolve_maps, true_m_to_crs)
 from .map_dino import build_matched_extractor, extract_grids
@@ -103,6 +104,10 @@ def main(argv=None) -> int:
     ap.add_argument("--estimator", default="magsac")
     ap.add_argument("--reproj-thresh", type=float, default=2.0)
     ap.add_argument("--batch", type=int, default=8, help="crops per DINO forward batch (lower if OOM)")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="ransac only: CPU threads for the cv2 geometric verify (cv2 releases the GIL, "
+                         "so threads scale over cores). 1=serial (default). Try #cores-2. GPU mutual-NN "
+                         "stays on the main thread; results are identical to serial.")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
@@ -157,7 +162,7 @@ def main(argv=None) -> int:
     sj = json.loads(Path(args.shortlist).expanduser().read_text())
     d_coarse, d_fine, d_fine_topk, kmz_entries = [], [], [], []
     out = {"meta": {"k": args.k, "topk": args.topk, "levels_m": list(args.levels_m), "step_m": args.step_m,
-                    "search_radius_m": radius_m, "scorer": args.scorer,
+                    "search_radius_m": radius_m, "scorer": args.scorer, "jobs": args.jobs,
                     "model": args.model, "estimator": args.estimator, "backbone": backbone,
                     "projector": bool(proj)}, "per_query": {}}
 
@@ -204,48 +209,67 @@ def main(argv=None) -> int:
         # STREAMING: score each crop right after DINO, keep only SCALARS. No grid accumulation →
         # RAM is O(#scalars) + one batch (a big-city query has ~5000 crops; holding grids = ~14 GB
         # → host OOM). Positions are deduped per query (`need`), so each unique crop is scored once.
-        score = {}
-        buf_imgs, buf_keys = [], []
-
-        def _flush():
-            if not buf_imgs:
+        def _grid_iter():
+            """Yield (px, py, L, gd, h, w) for every crop, streaming from the store or fresh DINO."""
+            if store is not None:                            # precomputed grids (no DINO/map)
+                for (px, py) in need:
+                    if not store.has(px, py):
+                        continue
+                    for L in args.levels_m:
+                        g = store.grid(px, py, L); h, w, dd = g.shape
+                        yield px, py, L, g.reshape(h * w, dd).to(dev), h, w
                 return
-            grids = extract_grids(buf_imgs, ext, proj, patch, dev, amp=args.amp)
-            for (px, py, L), g in zip(buf_keys, grids):
-                h, w, dd = g.shape
-                gd = g.reshape(h * w, dd).to(dev)
-                if args.scorer == "ransac":
-                    s = ransac_match(qfeat, gd, qxy, grid_keypoints(h, w), model=args.model,
-                                     estimator=args.estimator, reproj_thresh=args.reproj_thresh).score
-                else:
-                    cv = F.normalize(gd.mean(0, keepdim=True), dim=1)
-                    s = float((cv @ qvec.t()).item())
-                score[(px, py, L)] = s
-            buf_imgs.clear(); buf_keys.clear()
-
-        if store is not None:                                # load precomputed grids (no DINO/map)
-            for (px, py) in need:
-                if not store.has(px, py):
-                    continue
-                for L in args.levels_m:
-                    g = store.grid(px, py, L)
+            buf_imgs, buf_keys = [], []                       # fresh DINO from the real map (batched)
+            def _extract():
+                for (bx, by, bL), g in zip(buf_keys, extract_grids(buf_imgs, ext, proj, patch, dev, amp=args.amp)):
                     h, w, dd = g.shape
-                    gd = g.reshape(h * w, dd).to(dev)
-                    if args.scorer == "ransac":
-                        s = ransac_match(qfeat, gd, qxy, grid_keypoints(h, w), model=args.model,
-                                         estimator=args.estimator, reproj_thresh=args.reproj_thresh).score
-                    else:
-                        cv = F.normalize(gd.mean(0, keepdim=True), dim=1)
-                        s = float((cv @ qvec.t()).item())
-                    score[(px, py, L)] = s
-        else:                                                # fresh DINO from the real map
+                    yield bx, by, bL, g.reshape(h * w, dd).to(dev), h, w
+                buf_imgs.clear(); buf_keys.clear()
             for (px, py) in need:                            # one read/position; derive all levels
                 pyr = read_pyramid_from_one(src, px, py, args.levels_m, need[(px, py)], args.output_px)
                 for L in args.levels_m:
                     buf_imgs.append(pyr[L]); buf_keys.append((px, py, L))
                     if len(buf_imgs) >= args.batch:
-                        _flush()
-            _flush()
+                        yield from _extract()
+            if buf_imgs:
+                yield from _extract()
+
+        score = {}
+        if args.scorer == "cosine":
+            for px, py, L, gd, h, w in _grid_iter():
+                cv = F.normalize(gd.mean(0, keepdim=True), dim=1)
+                score[(px, py, L)] = float((cv @ qvec.t()).item())
+        elif args.jobs and args.jobs > 1:
+            # PARALLEL ransac: GPU mutual-NN (main thread, streaming) → tiny point-pair arrays; the
+            # cv2 geometric verify runs in a thread pool (cv2 releases the GIL → real core scaling, no
+            # pickling). Chunked so only point pairs are held, never grids. Identical scores to serial.
+            n_q = int(qfeat.shape[0])
+            def _verify(item):
+                key, qm, rm = item
+                inl = verify_inliers(qm, rm, model=args.model, estimator=args.estimator,
+                                     reproj_thresh=args.reproj_thresh)
+                return key, (inl.shape[0] / n_q if n_q else 0.0)
+            chunk = max(args.jobs * 32, 64)
+            with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+                buf = []
+                def _drain():
+                    for key, s in ex.map(_verify, buf):
+                        score[key] = s
+                    buf.clear()
+                for px, py, L, gd, h, w in _grid_iter():
+                    qm, rm, n_mutual = matched_coords(qfeat, gd, qxy, grid_keypoints(h, w))
+                    if n_mutual < _MIN_MATCHES[args.model]:
+                        score[(px, py, L)] = 0.0
+                    else:
+                        buf.append(((px, py, L), qm, rm))
+                        if len(buf) >= chunk:
+                            _drain()
+                if buf:
+                    _drain()
+        else:                                                # serial ransac (default)
+            for px, py, L, gd, h, w in _grid_iter():
+                score[(px, py, L)] = ransac_match(qfeat, gd, qxy, grid_keypoints(h, w), model=args.model,
+                                                  estimator=args.estimator, reproj_thresh=args.reproj_thresh).score
         crop_keys = [(px, py, L) for (px, py) in need for L in args.levels_m]
 
         # aggregate: per position Σ levels; cell = max; best position = fine location
