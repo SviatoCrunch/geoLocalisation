@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +28,21 @@ import numpy as np
 
 def _fmt_gb(b):
     return f"{b / 1e9:.2f} GB" if b >= 1e9 else f"{b / 1e6:.1f} MB"
+
+
+def _proc_mem():
+    """(VmRSS_MB, MemAvailable_MB) on Linux; (None, None) elsewhere."""
+    rss = avail = None
+    try:
+        for ln in open("/proc/self/status"):
+            if ln.startswith("VmRSS:"):
+                rss = int(ln.split()[1]) / 1024.0
+        for ln in open("/proc/meminfo"):
+            if ln.startswith("MemAvailable:"):
+                avail = int(ln.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return rss, avail
 
 
 def main(argv=None) -> int:
@@ -116,7 +133,7 @@ def main(argv=None) -> int:
              if not args.only_city or q.split(":", 1)[0] == args.only_city]
     items = items[:args.max_queries]
 
-    all_positions = set()                                # cross-query reuse
+    pos_qcount = Counter()                               # position -> #queries that request it
     rows = []
     first_crop_keys = None
     for q, entry in items:
@@ -142,7 +159,7 @@ def main(argv=None) -> int:
         rows.append((q, len(uniq), len(need), len(present), len(need) - len(present),
                      len(crop_keys), bytes_q))
         for (px, py) in present:
-            all_positions.add(store._k(px, py))
+            pos_qcount[store._k(px, py)] += 1
         if first_crop_keys is None and crop_keys:
             first_crop_keys = crop_keys
 
@@ -158,32 +175,63 @@ def main(argv=None) -> int:
         print(f"    -- mean/query: crops={tot_crops // nq} bytes={_fmt_gb(tot_bytes / nq)} "
               f"present_pos={tot_present // nq}")
         print(f"    CROSS-QUERY REUSE: {tot_present} present-pos across {nq} queries vs "
-              f"{len(all_positions)} unique -> reuse x{tot_present / max(1, len(all_positions)):.2f} "
+              f"{len(pos_qcount)} unique -> reuse x{tot_present / max(1, len(pos_qcount)):.2f} "
               f"(a persistent cross-query grid cache could save ~"
-              f"{100 * (1 - len(all_positions) / max(1, tot_present)):.0f}% of reads over the whole run)")
+              f"{100 * (1 - len(pos_qcount) / max(1, tot_present)):.0f}% of reads over the whole run)")
     print("    WITHIN-QUERY level reuse: NONE - each (position, level) is a distinct dataset; in a HYBRID "
           "store the 8 levels are independent DINO extractions, NOT crops of one source grid.")
 
-    # -- 3. READ-METHOD BENCHMARK (bounded sample) ------------------------------------
+    # -- 3. CACHE-CONTROLLED READ BENCHMARK -------------------------------------------
+    # Isolates dataset ORDER from Linux page cache: cold natural and cold sorted are read on DISJOINT
+    # crop sets (even/odd of the sorted list -> same level mix + file spread, neither warms the other),
+    # so sorted is NOT re-reading data natural just cached. Then a warm re-read quantifies the cache.
+    # NOTE: the page cache persists across processes, so a "fresh process, reversed order" run cannot
+    # guarantee cold; disjoint first-touch sets are the fair test (no sudo drop_caches needed).
     print("=" * 78)
-    print(f"[3] READ BENCHMARK (first query, first {args.bench_crops} crops)")
+    print("[3] CACHE-CONTROLLED READ BENCHMARK (disjoint cold sets; page cache isolated)")
     if not first_crop_keys:
         print("    no crops to benchmark"); store.close(); return 0
-    sample = first_crop_keys[:args.bench_crops]
 
     def _read(order):
         t0 = time.perf_counter(); nb = 0
         for (i, L) in order:
-            a = np.asarray(store.f[f"p{i}/l{int(L)}"])   # raw fp16 disk read (no astype)
-            nb += a.nbytes
-        return time.perf_counter() - t0, nb
+            nb += np.asarray(store.f[f"p{i}/l{int(L)}"]).nbytes   # raw fp16 disk read (no astype)
+        return nb / 1e6 / (time.perf_counter() - t0)              # MB/s
 
-    natural = list(sample)
-    by_row = sorted(sample, key=lambda t: (t[0], t[1]))  # sequential dataset order = written order
-    for name, order in [("natural (shortlist) order", natural), ("sorted-by-dataset-row", by_row)]:
-        dt, nb = _read(order)
-        print(f"    {name:<26} {len(order)} reads {_fmt_gb(nb)} in {dt:.2f}s "
-              f"-> {nb / 1e6 / dt:.0f} MB/s  ({1000 * dt / len(order):.1f} ms/read)")
+    allk = list(first_crop_keys)                                  # natural (need) order
+    srt = sorted(allk, key=lambda t: (t[0], t[1]))
+    natrank = {k: i for i, k in enumerate(allk)}
+    pool_nat = sorted(srt[0::2], key=lambda k: natrank[k])        # disjoint; read in NATURAL order
+    pool_srt = srt[1::2]                                          # disjoint; read in SORTED order
+    bench, reps = args.bench_crops, 3
+    m0 = _proc_mem()
+    cold_nat, cold_srt = [], []
+    for r in range(reps):
+        nchunk = pool_nat[r * bench:(r + 1) * bench]              # each chunk cold (first touch)
+        schunk = sorted(pool_srt[r * bench:(r + 1) * bench], key=lambda t: (t[0], t[1]))
+        if nchunk:
+            cold_nat.append(_read(nchunk))
+        if schunk:
+            cold_srt.append(_read(schunk))
+    warm_nat = _read(pool_nat[:bench]) if pool_nat else 0.0       # re-read chunk 0 (now cached)
+    warm_srt = _read(sorted(pool_srt[:bench], key=lambda t: (t[0], t[1]))) if pool_srt else 0.0
+    m1 = _proc_mem()
+
+    def _st(xs):
+        return (min(xs), statistics.median(xs), max(xs)) if xs else (0, 0, 0)
+    for tag, xs in [("COLD natural-order ", cold_nat), ("COLD sorted-order  ", cold_srt)]:
+        lo, md, hi = _st(xs)
+        print(f"    {tag} n={len(xs)}x{bench} crops  MB/s min/med/max = {lo:.0f}/{md:.0f}/{hi:.0f}")
+    print(f"    WARM natural-order  (re-read) MB/s = {warm_nat:.0f}")
+    print(f"    WARM sorted-order   (re-read) MB/s = {warm_srt:.0f}")
+    cn = _st(cold_nat)[1]; cs = _st(cold_srt)[1]
+    print(f"    => cold ordering effect: sorted/natural = x{cs / cn:.2f} (this is the TRUE ordering gain)")
+    print(f"    => cache effect: warm/cold(nat) = x{(warm_nat / cn) if cn else 0:.2f}")
+    if m0[0] is not None:
+        print(f"    proc RSS {m0[0]:.0f}->{m1[0]:.0f} MB | MemAvailable {m0[1]:.0f}->{m1[1]:.0f} MB "
+              f"(store 65 GB >> RAM, so most is genuine disk I/O)")
+    else:
+        print("    (RSS/MemAvailable unavailable - not Linux)")
 
     # -- 4. COMPACT-PREFILTER FLOOR ---------------------------------------------------
     print("=" * 78)
@@ -204,6 +252,38 @@ def main(argv=None) -> int:
         print(f"        + full grids for {tuple(args.floor_topn)} -> {floors}")
     print(f"    (vs {_fmt_gb(mean_full)} today; e.g. mean-pool + top256 ~ "
           f"{_fmt_gb((1 * D * 2) * mean_crops + 256 * mean_grid_bytes)})")
+
+    # -- 5. EXACT UNIQUE BYTES + CROP-MAJOR FEASIBILITY (all queries) ------------------
+    print("=" * 78)
+    print("[5] EXACT UNIQUE BYTES / CROP-MAJOR FEASIBILITY (all", nq, "queries)")
+    per_pos_bytes = sum(per_level_bytes[L] for L in levels)      # fixed shapes across positions
+    l1000 = per_level_bytes.get(1000.0, 0)
+    lsmall = per_pos_bytes - l1000
+    uniq_pos = len(pos_qcount)
+    uniq_datasets = uniq_pos * len(levels)
+    uniq_bytes = uniq_pos * per_pos_bytes
+    qpc = np.array(list(pos_qcount.values())) if pos_qcount else np.array([0])
+    print(f"    unique positions={uniq_pos}  unique datasets={uniq_datasets}  "
+          f"unique bytes={_fmt_gb(uniq_bytes)}")
+    print(f"    query-major logical read (all queries) = {_fmt_gb(tot_bytes)}")
+    print(f"    crop-major read (each unique crop once) = {_fmt_gb(uniq_bytes)}  "
+          f"-> saves {100 * (1 - uniq_bytes / max(1, tot_bytes)):.0f}% of bytes ("
+          f"x{tot_bytes / max(1, uniq_bytes):.2f})")
+    print(f"    queries/position: mean={qpc.mean():.2f} max={int(qpc.max())} min={int(qpc.min())}")
+    print("    RAM to cache the whole working set:")
+    print(f"        all levels        = {_fmt_gb(uniq_bytes)}")
+    print(f"        level 1000 only   = {_fmt_gb(uniq_pos * l1000)}")
+    print(f"        levels 900..300   = {_fmt_gb(uniq_pos * lsmall)}")
+    print(f"        bounded LRU/pos   = {_fmt_gb(per_pos_bytes)} per cached position "
+          f"(e.g. 4000 pos -> {_fmt_gb(4000 * per_pos_bytes)})")
+    # crop-major accumulators (query descriptors held; per-(query,crop) score scalars)
+    score_entries = tot_present * len(levels)
+    qdesc_mb = nq * 1369 * D * 2 / 1e6                           # ~37x37 tokens x D fp16 per query (est.)
+    print("    crop-major accumulators:")
+    print(f"        {nq} query descriptors on GPU ~ {qdesc_mb:.0f} MB (est. 37x37xD fp16; exact from query H5)")
+    print(f"        score scalars = {score_entries} floats ~ {score_entries * 8 / 1e6:.1f} MB (trivial)")
+    print(f"    => crop-major keeps only 1 full grid in flight at a time + tiny accumulators; "
+          f"reads {_fmt_gb(uniq_bytes)} once vs {_fmt_gb(tot_bytes)} query-major.")
     store.close()
     return 0
 
