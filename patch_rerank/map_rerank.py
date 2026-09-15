@@ -36,6 +36,7 @@ from .map_source import (latlon_to_merc, merc_to_latlon, open_src, read_pyramid_
                          resolve_maps, true_m_to_crs)
 from .map_dino import build_matched_extractor, extract_grids
 from .query_io import QueryGridStore
+from .store import RerankStore
 
 
 def pyramid_sizes(base: float, apex: float, step: float):
@@ -104,6 +105,8 @@ def main(argv=None) -> int:
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
+    ap.add_argument("--store", default=None,
+                    help="precomputed rerank token-grid store (precompute_store.py) → no fresh DINO")
     ap.add_argument("--max-queries", type=int, default=0, help="cap queries processed (0=all; smoke run)")
     ap.add_argument("--only-city", default=None, help="process only queries of this city (e.g. kup)")
     ap.add_argument("--kmz", default=None, help="also write a KMZ (GT + predicted point per query)")
@@ -122,15 +125,24 @@ def main(argv=None) -> int:
     row_of = {t: i for i, t in enumerate(ids)}
 
     cities = sorted(qpaths)
-    maps = dict(_kv(a) for a in args.maps) if args.maps else resolve_maps(args.tif_dir, cities)
-    missing = [c for c in cities if c not in maps]
-    if missing:
-        raise SystemExit(f"no GeoTIFF resolved for cities {missing} (use --maps city=path.tif)")
-
-    ext, proj, patch, backbone, D = build_matched_extractor(qpaths[cities[0]], args.device, args.proj_seed)
-    print(f"[dino] backbone={backbone} D={D} projector={'yes' if proj else 'NO'} patch={patch}", flush=True)
+    store = RerankStore(args.store) if args.store else None
+    if store is not None:                                 # align geometry to the store; no DINO/maps
+        args.step_m, args.levels_m = store.step_m, store.levels_m
+        args.output_px, args.tile_size_m = store.output_px, store.tile_size_m
+        ext = proj = patch = None
+        backbone = str(store.f.attrs.get("backbone", "?"))
+        srcs = {}
+        print(f"[store] {args.store} step={store.step_m} levels={store.levels_m} "
+              f"output_px={store.output_px} backbone={backbone}", flush=True)
+    else:
+        maps = dict(_kv(a) for a in args.maps) if args.maps else resolve_maps(args.tif_dir, cities)
+        missing = [c for c in cities if c not in maps]
+        if missing:
+            raise SystemExit(f"no GeoTIFF resolved for cities {missing} (use --maps city=path.tif)")
+        ext, proj, patch, backbone, D = build_matched_extractor(qpaths[cities[0]], args.device, args.proj_seed)
+        print(f"[dino] backbone={backbone} D={D} projector={'yes' if proj else 'NO'} patch={patch}", flush=True)
+        srcs = {c: open_src(maps[c]) for c in cities}
     qstore = QueryGridStore(qpaths)
-    srcs = {c: open_src(maps[c]) for c in cities}
     dev = args.device
 
     # sliding is confined to WITHIN each top cell: radius hard-capped to tile/2 (per user spec)
@@ -155,7 +167,7 @@ def main(argv=None) -> int:
             continue
         city = q.split(":", 1)[0]
         src = srcs.get(city)
-        if src is None:
+        if store is None and src is None:                # with --store no GeoTIFF is needed
             continue
         qfeat, qxy, qlat, qlon = qstore.get(q)
         if not math.isfinite(qlat):
@@ -205,13 +217,29 @@ def main(argv=None) -> int:
                 score[(px, py, L)] = s
             buf_imgs.clear(); buf_keys.clear()
 
-        for (px, py) in need:                                # one read/position; derive all levels
-            pyr = read_pyramid_from_one(src, px, py, args.levels_m, need[(px, py)], args.output_px)
-            for L in args.levels_m:
-                buf_imgs.append(pyr[L]); buf_keys.append((px, py, L))
-                if len(buf_imgs) >= args.batch:
-                    _flush()
-        _flush()
+        if store is not None:                                # load precomputed grids (no DINO/map)
+            for (px, py) in need:
+                if not store.has(px, py):
+                    continue
+                for L in args.levels_m:
+                    g = store.grid(px, py, L)
+                    h, w, dd = g.shape
+                    gd = g.reshape(h * w, dd).to(dev)
+                    if args.scorer == "ransac":
+                        s = ransac_match(qfeat, gd, qxy, grid_keypoints(h, w), model=args.model,
+                                         estimator=args.estimator, reproj_thresh=args.reproj_thresh).score
+                    else:
+                        cv = F.normalize(gd.mean(0, keepdim=True), dim=1)
+                        s = float((cv @ qvec.t()).item())
+                    score[(px, py, L)] = s
+        else:                                                # fresh DINO from the real map
+            for (px, py) in need:                            # one read/position; derive all levels
+                pyr = read_pyramid_from_one(src, px, py, args.levels_m, need[(px, py)], args.output_px)
+                for L in args.levels_m:
+                    buf_imgs.append(pyr[L]); buf_keys.append((px, py, L))
+                    if len(buf_imgs) >= args.batch:
+                        _flush()
+            _flush()
         crop_keys = [(px, py, L) for (px, py) in need for L in args.levels_m]
 
         # aggregate: per position Σ levels; cell = max; best position = fine location
@@ -259,6 +287,8 @@ def main(argv=None) -> int:
         print(f"[ok] kmz ({len(kmz_entries)} queries) -> {args.kmz}", flush=True)
     for s in srcs.values():
         s.close()
+    if store is not None:
+        store.close()
     qstore.close()
     return 0
 
