@@ -17,6 +17,7 @@ import torch
 class RerankStore:
     def __init__(self, path: str):
         import h5py
+        self.path = path
         self.f = h5py.File(path, "r")
         self.px = np.asarray(self.f["px"][:], float)
         self.py = np.asarray(self.f["py"][:], float)
@@ -33,11 +34,21 @@ class RerankStore:
     def has(self, px, py) -> bool:
         return self._k(px, py) in self._idx
 
+    def open_handle(self):
+        """A fresh read-only h5py handle over the SAME file — one per thread (h5py is not thread-safe
+        on a single handle). The shared ``_idx`` (built once) is read-only, so threads reuse it."""
+        import h5py
+        return h5py.File(self.path, "r")
+
+    def grid_from(self, f, px, py, L) -> torch.Tensor:
+        """Token grid (h,w,D) float32 via a caller-supplied handle ``f`` (enables parallel reads)."""
+        i = self._idx[self._k(px, py)]
+        arr = np.asarray(f[f"p{i}/l{int(L)}"])
+        return torch.from_numpy(arr.astype(np.float32))
+
     def grid(self, px, py, L) -> torch.Tensor:
         """Token grid (h,w,D) float32 for the snapped position + level (raises if absent)."""
-        i = self._idx[self._k(px, py)]
-        arr = np.asarray(self.f[f"p{i}/l{int(L)}"])
-        return torch.from_numpy(arr.astype(np.float32))
+        return self.grid_from(self.f, px, py, L)
 
     def close(self):
         self.f.close()

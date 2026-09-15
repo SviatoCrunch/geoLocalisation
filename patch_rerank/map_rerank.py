@@ -22,10 +22,12 @@ Run::
 from __future__ import annotations
 
 import argparse
+import collections
 import concurrent.futures as cf
 import json
 import math
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -116,6 +118,10 @@ def main(argv=None) -> int:
     ap.add_argument("--profile", action="store_true",
                     help="print a per-query time breakdown (store read / host→device / mutual-NN / cv2 "
                          "verify) + crop/shape/position counts, to locate the bottleneck")
+    ap.add_argument("--read-jobs", type=int, default=1,
+                    help="--store only: threads that prefetch grids in parallel, each with its OWN h5py "
+                         "handle (store read is the reranker bottleneck, ~80%%, latency-bound). 1=serial "
+                         "(default). Try #cores. Bounded prefetch → memory ~ read_jobs×4 grids.")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
@@ -171,7 +177,7 @@ def main(argv=None) -> int:
     d_coarse, d_fine, d_fine_topk, kmz_entries = [], [], [], []
     out = {"meta": {"k": args.k, "topk": args.topk, "levels_m": list(args.levels_m), "step_m": args.step_m,
                     "search_radius_m": radius_m, "scorer": args.scorer, "jobs": args.jobs,
-                    "gpu_batch": args.gpu_batch,
+                    "gpu_batch": args.gpu_batch, "read_jobs": args.read_jobs,
                     "model": args.model, "estimator": args.estimator, "backbone": backbone,
                     "projector": bool(proj)}, "per_query": {}}
 
@@ -223,7 +229,39 @@ def main(argv=None) -> int:
 
         def _grid_iter():
             """Yield (px, py, L, gd, h, w) for every crop, streaming from the store or fresh DINO."""
-            if store is not None:                            # precomputed grids (no DINO/map)
+            if store is not None and args.read_jobs > 1:     # PARALLEL prefetch (handle per thread)
+                keys = [(px, py, L) for (px, py) in need if store.has(px, py) for L in args.levels_m]
+                prof["pos"] = sum(1 for (px, py) in need if store.has(px, py))
+                prof["miss"] = len(need) - prof["pos"]
+                tls = threading.local()
+                def _read(key):
+                    hnd = getattr(tls, "h", None)
+                    if hnd is None:
+                        hnd = tls.h = store.open_handle()    # one h5py handle per worker thread
+                    return key, store.grid_from(hnd, *key)
+                with cf.ThreadPoolExecutor(max_workers=args.read_jobs) as ex:
+                    it = iter(keys)
+                    inflight = collections.deque()           # bounded read-ahead window
+                    for _ in range(args.read_jobs * 4):
+                        k = next(it, None)
+                        if k is None:
+                            break
+                        inflight.append(ex.submit(_read, k))
+                    while inflight:
+                        t0 = time.perf_counter()
+                        (px, py, L), g = inflight.popleft().result()   # wait = read-bound stall
+                        prof["read"] += time.perf_counter() - t0
+                        k = next(it, None)
+                        if k is not None:
+                            inflight.append(ex.submit(_read, k))
+                        h, w, dd = g.shape
+                        t1 = time.perf_counter()
+                        gd = g.reshape(h * w, dd).to(dev)
+                        prof["h2d"] += time.perf_counter() - t1
+                        prof["crops"] += 1; prof["shapes"].add((h, w))
+                        yield px, py, L, gd, h, w
+                return
+            if store is not None:                            # serial precomputed grids
                 for (px, py) in need:
                     if not store.has(px, py):
                         prof["miss"] += 1
