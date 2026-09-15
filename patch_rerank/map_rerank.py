@@ -32,7 +32,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # 
 
 import numpy as np
 
-from .matcher import _MIN_MATCHES, grid_keypoints, matched_coords, ransac_match, verify_inliers
+from .matcher import _MIN_MATCHES, grid_keypoints, matched_coords_batch, verify_inliers
 from .map_source import (latlon_to_merc, merc_to_latlon, open_src, read_pyramid_from_one,
                          resolve_maps, true_m_to_crs)
 from .map_dino import build_matched_extractor, extract_grids
@@ -106,8 +106,12 @@ def main(argv=None) -> int:
     ap.add_argument("--batch", type=int, default=8, help="crops per DINO forward batch (lower if OOM)")
     ap.add_argument("--jobs", type=int, default=1,
                     help="ransac only: CPU threads for the cv2 geometric verify (cv2 releases the GIL, "
-                         "so threads scale over cores). 1=serial (default). Try #cores-2. GPU mutual-NN "
-                         "stays on the main thread; results are identical to serial.")
+                         "so threads scale over cores). 1=serial (default). GPU mutual-NN is batched "
+                         "separately; results are identical to serial.")
+    ap.add_argument("--gpu-batch", type=int, default=64,
+                    help="ransac only: crops per batched GPU mutual-NN matmul (one matmul + one host "
+                         "transfer instead of per-crop .cpu() syncs — the real reranker bottleneck). "
+                         "Lower if GPU OOM (mem ~ gpu_batch × Nq × Nr).")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
@@ -163,6 +167,7 @@ def main(argv=None) -> int:
     d_coarse, d_fine, d_fine_topk, kmz_entries = [], [], [], []
     out = {"meta": {"k": args.k, "topk": args.topk, "levels_m": list(args.levels_m), "step_m": args.step_m,
                     "search_radius_m": radius_m, "scorer": args.scorer, "jobs": args.jobs,
+                    "gpu_batch": args.gpu_batch,
                     "model": args.model, "estimator": args.estimator, "backbone": backbone,
                     "projector": bool(proj)}, "per_query": {}}
 
@@ -239,37 +244,42 @@ def main(argv=None) -> int:
             for px, py, L, gd, h, w in _grid_iter():
                 cv = F.normalize(gd.mean(0, keepdim=True), dim=1)
                 score[(px, py, L)] = float((cv @ qvec.t()).item())
-        elif args.jobs and args.jobs > 1:
-            # PARALLEL ransac: GPU mutual-NN (main thread, streaming) → tiny point-pair arrays; the
-            # cv2 geometric verify runs in a thread pool (cv2 releases the GIL → real core scaling, no
-            # pickling). Chunked so only point pairs are held, never grids. Identical scores to serial.
+        else:
+            # ransac: BATCHED GPU mutual-NN (one matmul + one host transfer per gpu_batch crops,
+            # killing the per-crop .cpu() sync latency) → tiny point pairs → cv2 verify (serial, or
+            # threaded with --jobs since cv2 releases the GIL). Grids held only within a batch.
             n_q = int(qfeat.shape[0])
+            pool = cf.ThreadPoolExecutor(max_workers=args.jobs) if (args.jobs and args.jobs > 1) else None
+
             def _verify(item):
-                key, qm, rm = item
+                key, qm, rm, n_mutual = item
+                if n_mutual < _MIN_MATCHES[args.model]:
+                    return key, 0.0
                 inl = verify_inliers(qm, rm, model=args.model, estimator=args.estimator,
                                      reproj_thresh=args.reproj_thresh)
                 return key, (inl.shape[0] / n_q if n_q else 0.0)
-            chunk = max(args.jobs * 32, 64)
-            with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
-                buf = []
-                def _drain():
-                    for key, s in ex.map(_verify, buf):
-                        score[key] = s
-                    buf.clear()
-                for px, py, L, gd, h, w in _grid_iter():
-                    qm, rm, n_mutual = matched_coords(qfeat, gd, qxy, grid_keypoints(h, w))
-                    if n_mutual < _MIN_MATCHES[args.model]:
-                        score[(px, py, L)] = 0.0
-                    else:
-                        buf.append(((px, py, L), qm, rm))
-                        if len(buf) >= chunk:
-                            _drain()
-                if buf:
-                    _drain()
-        else:                                                # serial ransac (default)
+
+            buf_keys, buf_grids, hw = [], [], [0, 0]
+
+            def _drain():
+                if not buf_grids:
+                    return
+                mc = matched_coords_batch(qfeat, torch.stack(buf_grids), qxy,
+                                          grid_keypoints(hw[0], hw[1]))
+                items = [(buf_keys[i], mc[i][0], mc[i][1], mc[i][2]) for i in range(len(buf_keys))]
+                res = pool.map(_verify, items) if pool else map(_verify, items)
+                for key, s in res:
+                    score[key] = s
+                buf_keys.clear(); buf_grids.clear()
+
             for px, py, L, gd, h, w in _grid_iter():
-                score[(px, py, L)] = ransac_match(qfeat, gd, qxy, grid_keypoints(h, w), model=args.model,
-                                                  estimator=args.estimator, reproj_thresh=args.reproj_thresh).score
+                hw[0], hw[1] = h, w                           # uniform across crops (same output_px)
+                buf_keys.append((px, py, L)); buf_grids.append(gd)
+                if len(buf_grids) >= args.gpu_batch:
+                    _drain()
+            _drain()
+            if pool is not None:
+                pool.shutdown()
         crop_keys = [(px, py, L) for (px, py) in need for L in args.levels_m]
 
         # aggregate: per position Σ levels; cell = max; best position = fine location

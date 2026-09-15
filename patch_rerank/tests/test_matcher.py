@@ -85,6 +85,24 @@ def test_ransac_random_pair_scores_low():
     assert r.score < 0.7                             # unrelated features → few/no consistent inliers
 
 
+def test_matched_coords_batch_equals_per_crop():
+    """Batched mutual-NN (map_rerank ransac path) must be identical to per-crop matched_coords."""
+    from patch_rerank.matcher import matched_coords, matched_coords_batch
+    torch.manual_seed(1)
+    Nq, Nr, D, P = 36, 36, 16, 7
+    q = torch.nn.functional.normalize(torch.randn(Nq, D), dim=1)
+    q_xy = grid_keypoints(6, 6)
+    r_xy = grid_keypoints(6, 6)
+    grids = [torch.nn.functional.normalize(torch.randn(Nr, D), dim=1) for _ in range(P)]
+    grids[0] = q.clone()                                       # include an identity (all-mutual) case
+    batch = matched_coords_batch(q, torch.stack(grids), q_xy, r_xy.copy())
+    for i, g in enumerate(grids):
+        qm, rm, n = matched_coords(q, g, q_xy, r_xy.copy())
+        bqm, brm, bn = batch[i]
+        assert bn == n
+        assert np.array_equal(bqm, qm) and np.array_equal(brm, rm)
+
+
 def test_verify_inliers_threadpool_matches_serial():
     """map_rerank --jobs parallelises verify_inliers across threads; it must be bit-identical to
     serial (cv2 releases the GIL and MAGSAC is internally deterministic)."""

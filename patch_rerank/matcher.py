@@ -78,6 +78,33 @@ def matched_coords(q_feat: torch.Tensor, r_feat: torch.Tensor, q_xy: np.ndarray,
     return np.asarray(q_xy, np.float64)[q_idx], np.asarray(r_xy, np.float64)[r_idx], int(len(q_idx))
 
 
+def matched_coords_batch(q_feat: torch.Tensor, r_feats: torch.Tensor, q_xy: np.ndarray,
+                         r_xy: np.ndarray):
+    """Batched mutual-NN for P tiles that share the query and a common token layout.
+
+    ``r_feats`` = (P, Nr, D) stacked tile grids (all Nr identical). Returns a list of P
+    ``(qm (M,2), rm (M,2), n_mutual)`` tuples — **identical** to calling :func:`matched_coords`
+    per tile, but as ONE batched matmul + a single host transfer instead of P matmuls each with
+    its own ``.cpu()`` sync (which was the serial GPU bottleneck of the reranker)."""
+    q = F.normalize(q_feat.float(), dim=1)                    # (Nq, D)
+    r = F.normalize(r_feats.float(), dim=2)                   # (P, Nr, D)
+    sims = torch.matmul(q, r.transpose(1, 2))                 # (P, Nq, Nr): q broadcast over P
+    q2r = sims.argmax(dim=2)                                  # (P, Nq) best ref per query patch
+    r2q = sims.argmax(dim=1)                                  # (P, Nr) best query per ref patch
+    back = torch.gather(r2q, 1, q2r)                          # (P, Nq): r2q[p, q2r[p, i]]
+    mutual = back == torch.arange(q.shape[0], device=q.device)   # (P, Nq)
+    mutual_c = mutual.cpu().numpy()                           # ONE transfer for the whole batch
+    q2r_c = q2r.cpu().numpy()
+    qxy = np.asarray(q_xy, np.float64)
+    rxy = np.asarray(r_xy, np.float64)
+    out = []
+    for p in range(mutual_c.shape[0]):
+        qidx = np.nonzero(mutual_c[p])[0]
+        ridx = q2r_c[p][qidx]
+        out.append((qxy[qidx], rxy[ridx], int(qidx.size)))
+    return out
+
+
 def _cv2_method(estimator: str):
     import cv2
     return {"ransac": cv2.RANSAC, "magsac": getattr(cv2, "USAC_MAGSAC", cv2.RANSAC),
