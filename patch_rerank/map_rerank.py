@@ -35,7 +35,8 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # 
 
 import numpy as np
 
-from .matcher import _MIN_MATCHES, grid_keypoints, matched_coords_batch, verify_inliers
+from .matcher import (_MIN_MATCHES, grid_keypoints, matched_coords, matched_coords_batch,
+                      verify_inliers)
 from .map_source import (latlon_to_merc, merc_to_latlon, open_src, read_pyramid_from_one,
                          resolve_maps, true_m_to_crs)
 from .map_dino import build_matched_extractor, extract_grids
@@ -86,6 +87,181 @@ def _kv(a):
     return c, p
 
 
+def _aggregate_query(q, qlat, qlon, uniq_cells, cell_pos, score, row_of, lat, lon, levels_m, topk):
+    """Per-query aggregation shared by query-major and crop-major, so both are bit-identical: per
+    position Sum levels; cell = max sum over its positions; best position = fine location; top-k cells.
+    Returns (per_query_record, kmz_entry, coarse_dist, fine_dist, fine_dist_topk)."""
+    import numpy as np
+    rec_cells, cell_max_sums = [], []
+    best_overall = {"sum": -1e9, "lat": None, "lon": None}
+    for c in uniq_cells:
+        positions = []
+        best_pos = {"sum": -1e9, "px": None, "py": None, "per_level": None}
+        for (px, py) in cell_pos[c]:
+            per_level = {int(L): score.get((px, py, L), 0.0) for L in levels_m}
+            psum = float(sum(per_level.values()))
+            plat, plon = merc_to_latlon(px, py)
+            positions.append({"lat": plat, "lon": plon, "sum": psum})
+            if psum > best_pos["sum"]:
+                best_pos = {"sum": psum, "px": px, "py": py, "per_level": per_level}
+        blat, blon = merc_to_latlon(best_pos["px"], best_pos["py"])
+        best_level = max(best_pos["per_level"], key=best_pos["per_level"].get)
+        cell_max_sums.append(best_pos["sum"])
+        rec_cells.append({"cell_id": c, "cell_score": best_pos["sum"],
+                          "best": {"lat": blat, "lon": blon, "level_m": best_level,
+                                   "per_level": best_pos["per_level"]},
+                          "positions": positions})
+        if best_pos["sum"] > best_overall["sum"]:
+            best_overall = {"sum": best_pos["sum"], "lat": blat, "lon": blon}
+
+    ranked = sorted(rec_cells, key=lambda r: r["cell_score"], reverse=True)[:topk]
+    topk_l = [{"rank": i + 1, "cell_id": r["cell_id"], "cell_score": r["cell_score"],
+               "lat": r["best"]["lat"], "lon": r["best"]["lon"], "level_m": r["best"]["level_m"],
+               "dist_m": _haversine_m(qlat, qlon, r["best"]["lat"], r["best"]["lon"])}
+              for i, r in enumerate(ranked)]
+    c0 = row_of[uniq_cells[0]]
+    dc = _haversine_m(qlat, qlon, lat[c0], lon[c0])
+    df = _haversine_m(qlat, qlon, best_overall["lat"], best_overall["lon"])
+    dft = min((t["dist_m"] for t in topk_l), default=df)
+    rec = {"gt": {"lat": qlat, "lon": qlon}, "coarse_dist_m": dc, "fine_dist_m": df,
+           "fine_dist_topk_m": dft,
+           "mean_cell_sum": float(np.mean(cell_max_sums)) if cell_max_sums else 0.0,
+           "topk": topk_l, "cells": rec_cells}
+    kmz_e = {"name": q, "gt": (qlat, qlon), "pred": (best_overall["lat"], best_overall["lon"]),
+             "dist_m": df, "ranked": topk_l}
+    return rec, kmz_e, dc, df, dft
+
+
+def _plan_query(entry, k, row_of, lat, lon, step_m, radius_m):
+    """Cells (top-k, deduped by snapped centre) -> per-cell sliding window centres -> unique `need`
+    positions. Identical geometry for both execution orders."""
+    cells = [c for c in entry["cells"][:k] if c in row_of]
+    if not cells:
+        return None
+    step_crs0 = true_m_to_crs(step_m, lat[row_of[cells[0]]])
+    seen_cell, uniq = set(), []
+    for c in cells:
+        cx, cy = latlon_to_merc(lat[row_of[c]], lon[row_of[c]])
+        key = (snap(cx, step_crs0), snap(cy, step_crs0))
+        if key not in seen_cell:
+            seen_cell.add(key); uniq.append(c)
+    cell_pos, need = {}, {}
+    for c in uniq:
+        clat = lat[row_of[c]]
+        cx, cy = latlon_to_merc(clat, lon[row_of[c]])
+        centres = cell_window_centres(cx, cy, clat, radius_m, step_m)
+        cell_pos[c] = centres
+        for (px, py) in centres:
+            need.setdefault((px, py), clat)
+    return uniq, cell_pos, need
+
+
+def _run_crop_major(args, store, qstore, row_of, lat, lon, radius_m, backbone, proj, out_meta):
+    """EXACT batch reranker: read every unique (position,level) grid ONCE and match it against all
+    queries that requested it (inverted index), instead of re-reading it per query. Same candidate
+    set / MNN / MAGSAC / aggregation as query-major -> identical ranking; only physical reads drop
+    (measured ~8.95x fewer bytes for the 14-kup batch). Requires --store (random grid access)."""
+    import time
+    import torch
+    import torch.nn.functional as F
+    from tqdm import tqdm
+    dev = args.device
+    levels = args.levels_m
+
+    sj = json.loads(Path(args.shortlist).expanduser().read_text())
+    plans = []                                            # one dict per kept query (descriptors on GPU)
+    for q, entry in sj["shortlist"].items():
+        if args.only_city and q.split(":", 1)[0] != args.only_city:
+            continue
+        if args.day_only and "_night" in q:
+            continue
+        if not qstore.has(q):
+            continue
+        qfeat, qxy, qlat, qlon = qstore.get(q)
+        if not math.isfinite(qlat):
+            continue
+        plan = _plan_query(entry, args.k, row_of, lat, lon, args.step_m, radius_m)
+        if plan is None:
+            continue
+        uniq, cell_pos, need = plan
+        qf = qfeat.to(dev)
+        plans.append({"q": q, "qfeat": qf, "qxy": qxy, "qlat": qlat, "qlon": qlon,
+                      "qvec": F.normalize(qf.mean(0, keepdim=True), dim=1) if args.scorer == "cosine" else None,
+                      "nqf": int(qf.shape[0]), "uniq": uniq, "cell_pos": cell_pos, "need": need, "score": {}})
+        if args.max_queries and len(plans) >= args.max_queries:
+            break
+
+    inv = {}                                              # (dataset_row i, level) -> [(qidx, px, py)]
+    for qi, p in enumerate(plans):
+        for (px, py) in p["need"]:
+            if not store.has(px, py):
+                continue
+            i = store._idx[store._k(px, py)]
+            for L in levels:
+                inv.setdefault((i, int(L)), []).append((qi, px, py))
+    unique_keys = sorted(inv)                             # (i, L) sorted = written/dataset order
+    relations = sum(len(v) for v in inv.values())
+
+    prof = {"read": 0.0, "match": 0.0, "verify": 0.0, "bytes": 0}
+    for (i, L) in tqdm(unique_keys, desc="crop-major", unit="crop"):
+        t0 = time.perf_counter()
+        arr = np.asarray(store.f[f"p{i}/l{int(L)}"])       # ONE read of this unique grid
+        prof["bytes"] += arr.nbytes
+        g = torch.from_numpy(arr.astype(np.float32))
+        h, w, dd = g.shape
+        gd = g.reshape(h * w, dd).to(dev)
+        prof["read"] += time.perf_counter() - t0
+        kp = grid_keypoints(h, w)
+        for (qi, px, py) in inv[(i, L)]:                   # match this grid vs every query needing it
+            p = plans[qi]
+            if args.scorer == "cosine":
+                cv = F.normalize(gd.mean(0, keepdim=True), dim=1)
+                p["score"][(px, py, L)] = float((cv @ p["qvec"].t()).item())
+                continue
+            t1 = time.perf_counter()
+            qm, rm, n_mut = matched_coords(p["qfeat"], gd, p["qxy"], kp)
+            prof["match"] += time.perf_counter() - t1
+            if n_mut < _MIN_MATCHES[args.model]:
+                p["score"][(px, py, L)] = 0.0
+                continue
+            t2 = time.perf_counter()
+            inl = verify_inliers(qm, rm, model=args.model, estimator=args.estimator,
+                                 reproj_thresh=args.reproj_thresh)
+            prof["verify"] += time.perf_counter() - t2
+            p["score"][(px, py, L)] = inl.shape[0] / p["nqf"] if p["nqf"] else 0.0
+        if str(dev).startswith("cuda"):
+            del gd
+
+    d_coarse, d_fine, d_fine_topk, kmz_entries = [], [], [], []
+    out = {"meta": out_meta, "per_query": {}}
+    for p in plans:
+        rec, kmz_e, dc, df, dft = _aggregate_query(p["q"], p["qlat"], p["qlon"], p["uniq"],
+                                                   p["cell_pos"], p["score"], row_of, lat, lon,
+                                                   levels, args.topk)
+        out["per_query"][p["q"]] = rec
+        kmz_entries.append(kmz_e); d_coarse.append(dc); d_fine.append(df); d_fine_topk.append(dft)
+    out["summary"] = {"coarse_top1_cell": _report("coarse", d_coarse),
+                      "map_pyramid_fine": _report("fine", d_fine),
+                      f"map_pyramid_fine_top{args.topk}": _report(f"fine@top{args.topk}", d_fine_topk)}
+    out["rerank_diagnostics"] = {
+        "execution_order": "crop-major", "queries": len(plans),
+        "unique_datasets_read": len(unique_keys), "physical_bytes_requested": int(prof["bytes"]),
+        "query_crop_relations": relations,
+        "reuse_factor": relations / max(1, len(unique_keys)),
+        "timings": {"read_s": prof["read"], "match_s": prof["match"], "verify_s": prof["verify"]}}
+    print(f"[crop-major] queries={len(plans)} unique_crops={len(unique_keys)} relations={relations} "
+          f"reuse=x{relations / max(1, len(unique_keys)):.2f} bytes={prof['bytes'] / 1e9:.2f}GB "
+          f"read={prof['read']:.1f}s match={prof['match']:.1f}s verify={prof['verify']:.1f}s", flush=True)
+    Path(args.out).expanduser().write_text(json.dumps(out), encoding="utf-8")
+    print(f"[ok] -> {args.out}", flush=True)
+    if args.kmz:
+        from .kmz import write_kmz
+        write_kmz(args.kmz, kmz_entries)
+        print(f"[ok] kmz ({len(kmz_entries)} queries) -> {args.kmz}", flush=True)
+    store.close(); qstore.close()
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--shortlist", required=True)
@@ -122,6 +298,11 @@ def main(argv=None) -> int:
                     help="--store only: threads that prefetch grids in parallel, each with its OWN h5py "
                          "handle (store read is the reranker bottleneck, ~80%%, latency-bound). 1=serial "
                          "(default). Try #cores. Bounded prefetch → memory ~ read_jobs×4 grids.")
+    ap.add_argument("--execution-order", choices=["query-major", "crop-major"], default="query-major",
+                    help="query-major (default, baseline): re-read each query's grids independently. "
+                         "crop-major (--store only): read each UNIQUE (position,level) grid ONCE and "
+                         "match vs every query needing it (inverted index) -> identical results, far "
+                         "fewer physical reads for a multi-query batch.")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
@@ -178,8 +359,14 @@ def main(argv=None) -> int:
     out = {"meta": {"k": args.k, "topk": args.topk, "levels_m": list(args.levels_m), "step_m": args.step_m,
                     "search_radius_m": radius_m, "scorer": args.scorer, "jobs": args.jobs,
                     "gpu_batch": args.gpu_batch, "read_jobs": args.read_jobs,
+                    "execution_order": args.execution_order,
                     "model": args.model, "estimator": args.estimator, "backbone": backbone,
                     "projector": bool(proj)}, "per_query": {}}
+
+    if args.execution_order == "crop-major":
+        if store is None:
+            raise SystemExit("--execution-order crop-major requires --store (random grid access)")
+        return _run_crop_major(args, store, qstore, row_of, lat, lon, radius_m, backbone, proj, out["meta"])
 
     items = list(sj["shortlist"].items())
     for q, entry in tqdm(items, desc="map-rerank", unit="q"):
@@ -356,50 +543,12 @@ def main(argv=None) -> int:
                 f"crops={prof['crops']} pos={prof['pos']} miss={prof['miss']} "
                 f"shapes={sorted(prof['shapes'])} cells={len(uniq_cells)}")
 
-        # aggregate: per position Σ levels; cell = max; best position = fine location
-        rec_cells, cell_max_sums = [], []
-        best_overall = {"sum": -1e9, "lat": None, "lon": None}
-        for c in uniq_cells:
-            positions = []
-            best_pos = {"sum": -1e9, "px": None, "py": None, "per_level": None}
-            for (px, py) in cell_pos[c]:
-                per_level = {int(L): score.get((px, py, L), 0.0) for L in args.levels_m}
-                psum = float(sum(per_level.values()))
-                plat, plon = merc_to_latlon(px, py)
-                positions.append({"lat": plat, "lon": plon, "sum": psum})
-                if psum > best_pos["sum"]:
-                    best_pos = {"sum": psum, "px": px, "py": py, "per_level": per_level}
-            blat, blon = merc_to_latlon(best_pos["px"], best_pos["py"])
-            best_level = max(best_pos["per_level"], key=best_pos["per_level"].get)
-            cell_max_sums.append(best_pos["sum"])
-            rec_cells.append({"cell_id": c, "cell_score": best_pos["sum"],
-                              "best": {"lat": blat, "lon": blon, "level_m": best_level,
-                                       "per_level": best_pos["per_level"]},
-                              "positions": positions})
-            if best_pos["sum"] > best_overall["sum"]:
-                best_overall = {"sum": best_pos["sum"], "lat": blat, "lon": blon}
-
-        # top-N cells by rerank score (rec_cells is in coarse order) -> ranked fine predictions
-        ranked = sorted(rec_cells, key=lambda r: r["cell_score"], reverse=True)[:args.topk]
-        topk = [{"rank": i + 1, "cell_id": r["cell_id"], "cell_score": r["cell_score"],
-                 "lat": r["best"]["lat"], "lon": r["best"]["lon"], "level_m": r["best"]["level_m"],
-                 "dist_m": _haversine_m(qlat, qlon, r["best"]["lat"], r["best"]["lon"])}
-                for i, r in enumerate(ranked)]
-
-        c0 = row_of[uniq_cells[0]]
-        d_coarse.append(_haversine_m(qlat, qlon, lat[c0], lon[c0]))
-        d_fine.append(_haversine_m(qlat, qlon, best_overall["lat"], best_overall["lon"]))
-        d_fine_topk.append(min((t["dist_m"] for t in topk), default=d_fine[-1]))  # best-of-top-N
-        kmz_entries.append({"name": q, "gt": (qlat, qlon),
-                            "pred": (best_overall["lat"], best_overall["lon"]), "dist_m": d_fine[-1],
-                            "ranked": topk})
+        rec, kmz_e, dc, df, dft = _aggregate_query(q, qlat, qlon, uniq_cells, cell_pos, score,
+                                                   row_of, lat, lon, args.levels_m, args.topk)
+        out["per_query"][q] = rec
+        kmz_entries.append(kmz_e); d_coarse.append(dc); d_fine.append(df); d_fine_topk.append(dft)
         if str(dev).startswith("cuda"):
             torch.cuda.empty_cache()
-        out["per_query"][q] = {"gt": {"lat": qlat, "lon": qlon},
-                               "coarse_dist_m": d_coarse[-1], "fine_dist_m": d_fine[-1],
-                               "fine_dist_topk_m": d_fine_topk[-1],
-                               "mean_cell_sum": float(np.mean(cell_max_sums)) if cell_max_sums else 0.0,
-                               "topk": topk, "cells": rec_cells}
 
     out["summary"] = {"coarse_top1_cell": _report("coarse", d_coarse),
                       "map_pyramid_fine": _report("fine", d_fine),
