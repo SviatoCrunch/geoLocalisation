@@ -87,6 +87,12 @@ def _kv(a):
     return c, p
 
 
+def _dump_scores_row(score):
+    """Serialize a per-query {(px,py,L): geom_score} dict -> [[px,py,level,score], ...] for the survival
+    baseline (exact per-crop scores)."""
+    return [[float(px), float(py), int(L), float(s)] for (px, py, L), s in score.items()]
+
+
 def _aggregate_query(q, qlat, qlon, uniq_cells, cell_pos, score, row_of, lat, lon, levels_m, topk):
     """Per-query aggregation shared by query-major and crop-major, so both are bit-identical: per
     position Sum levels; cell = max sum over its positions; best position = fine location; top-k cells.
@@ -254,6 +260,10 @@ def _run_crop_major(args, store, qstore, row_of, lat, lon, radius_m, backbone, p
           f"read={prof['read']:.1f}s match={prof['match']:.1f}s verify={prof['verify']:.1f}s", flush=True)
     Path(args.out).expanduser().write_text(json.dumps(out), encoding="utf-8")
     print(f"[ok] -> {args.out}", flush=True)
+    if args.dump_scores:
+        Path(args.dump_scores).expanduser().write_text(
+            json.dumps({p["q"]: _dump_scores_row(p["score"]) for p in plans}), encoding="utf-8")
+        print(f"[ok] per-crop scores -> {args.dump_scores}", flush=True)
     if args.kmz:
         from .kmz import write_kmz
         write_kmz(args.kmz, kmz_entries)
@@ -303,6 +313,9 @@ def main(argv=None) -> int:
                          "crop-major (--store only): read each UNIQUE (position,level) grid ONCE and "
                          "match vs every query needing it (inverted index) -> identical results, far "
                          "fewer physical reads for a multi-query batch.")
+    ap.add_argument("--dump-scores", default=None,
+                    help="also write per-(query,position,level) exact geometric scores to this JSON "
+                         "(the baseline for compact_survival). {query: [[px,py,level,score],...]}")
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--proj-seed", type=int, default=0)
@@ -368,6 +381,7 @@ def main(argv=None) -> int:
             raise SystemExit("--execution-order crop-major requires --store (random grid access)")
         return _run_crop_major(args, store, qstore, row_of, lat, lon, radius_m, backbone, proj, out["meta"])
 
+    dumped = {}                                          # query -> per-crop exact scores (--dump-scores)
     items = list(sj["shortlist"].items())
     for q, entry in tqdm(items, desc="map-rerank", unit="q"):
         if args.max_queries and len(d_fine) >= args.max_queries:
@@ -547,6 +561,8 @@ def main(argv=None) -> int:
                                                    row_of, lat, lon, args.levels_m, args.topk)
         out["per_query"][q] = rec
         kmz_entries.append(kmz_e); d_coarse.append(dc); d_fine.append(df); d_fine_topk.append(dft)
+        if args.dump_scores:
+            dumped[q] = _dump_scores_row(score)
         if str(dev).startswith("cuda"):
             torch.cuda.empty_cache()
 
@@ -555,6 +571,9 @@ def main(argv=None) -> int:
                       f"map_pyramid_fine_top{args.topk}": _report(f"fine@top{args.topk}", d_fine_topk)}
     Path(args.out).expanduser().write_text(json.dumps(out), encoding="utf-8")
     print(f"[ok] -> {args.out}", flush=True)
+    if args.dump_scores:
+        Path(args.dump_scores).expanduser().write_text(json.dumps(dumped), encoding="utf-8")
+        print(f"[ok] per-crop scores -> {args.dump_scores}", flush=True)
     if args.kmz:
         from .kmz import write_kmz
         write_kmz(args.kmz, kmz_entries)
