@@ -90,6 +90,7 @@ def main(argv=None) -> int:
     ap.add_argument("--tif-dir", default=None, help="dir of GeoTIFFs resolved by city name")
     ap.add_argument("--maps", nargs="+", default=None, help="city=path.tif (overrides --tif-dir)")
     ap.add_argument("--k", type=int, default=50, help="top-K coarse cells (from the best model) refined")
+    ap.add_argument("--topk", type=int, default=5, help="report the top-N cells by rerank score per query")
     ap.add_argument("--levels-m", type=float, nargs="+", default=[1000, 900, 800, 700, 600, 500, 400, 300])
     ap.add_argument("--tile-size-m", type=float, default=1000.0,
                     help="checkerboard cell size; sliding is confined to tile/2 around each cell")
@@ -154,8 +155,8 @@ def main(argv=None) -> int:
         radius_m = min(args.search_radius_m, args.tile_size_m / 2.0)
 
     sj = json.loads(Path(args.shortlist).expanduser().read_text())
-    d_coarse, d_fine, kmz_entries = [], [], []
-    out = {"meta": {"k": args.k, "levels_m": list(args.levels_m), "step_m": args.step_m,
+    d_coarse, d_fine, d_fine_topk, kmz_entries = [], [], [], []
+    out = {"meta": {"k": args.k, "topk": args.topk, "levels_m": list(args.levels_m), "step_m": args.step_m,
                     "search_radius_m": radius_m, "scorer": args.scorer,
                     "model": args.model, "estimator": args.estimator, "backbone": backbone,
                     "projector": bool(proj)}, "per_query": {}}
@@ -270,20 +271,31 @@ def main(argv=None) -> int:
             if best_pos["sum"] > best_overall["sum"]:
                 best_overall = {"sum": best_pos["sum"], "lat": blat, "lon": blon}
 
+        # top-N cells by rerank score (rec_cells is in coarse order) -> ranked fine predictions
+        ranked = sorted(rec_cells, key=lambda r: r["cell_score"], reverse=True)[:args.topk]
+        topk = [{"rank": i + 1, "cell_id": r["cell_id"], "cell_score": r["cell_score"],
+                 "lat": r["best"]["lat"], "lon": r["best"]["lon"], "level_m": r["best"]["level_m"],
+                 "dist_m": _haversine_m(qlat, qlon, r["best"]["lat"], r["best"]["lon"])}
+                for i, r in enumerate(ranked)]
+
         c0 = row_of[uniq_cells[0]]
         d_coarse.append(_haversine_m(qlat, qlon, lat[c0], lon[c0]))
         d_fine.append(_haversine_m(qlat, qlon, best_overall["lat"], best_overall["lon"]))
+        d_fine_topk.append(min((t["dist_m"] for t in topk), default=d_fine[-1]))  # best-of-top-N
         kmz_entries.append({"name": q, "gt": (qlat, qlon),
-                            "pred": (best_overall["lat"], best_overall["lon"]), "dist_m": d_fine[-1]})
+                            "pred": (best_overall["lat"], best_overall["lon"]), "dist_m": d_fine[-1],
+                            "ranked": topk})
         if str(dev).startswith("cuda"):
             torch.cuda.empty_cache()
         out["per_query"][q] = {"gt": {"lat": qlat, "lon": qlon},
                                "coarse_dist_m": d_coarse[-1], "fine_dist_m": d_fine[-1],
+                               "fine_dist_topk_m": d_fine_topk[-1],
                                "mean_cell_sum": float(np.mean(cell_max_sums)) if cell_max_sums else 0.0,
-                               "cells": rec_cells}
+                               "topk": topk, "cells": rec_cells}
 
     out["summary"] = {"coarse_top1_cell": _report("coarse", d_coarse),
-                      "map_pyramid_fine": _report("fine", d_fine)}
+                      "map_pyramid_fine": _report("fine", d_fine),
+                      f"map_pyramid_fine_top{args.topk}": _report(f"fine@top{args.topk}", d_fine_topk)}
     Path(args.out).expanduser().write_text(json.dumps(out), encoding="utf-8")
     print(f"[ok] -> {args.out}", flush=True)
     if args.kmz:
