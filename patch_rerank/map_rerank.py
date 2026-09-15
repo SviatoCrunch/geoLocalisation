@@ -127,13 +127,15 @@ def main(argv=None) -> int:
     cities = sorted(qpaths)
     store = RerankStore(args.store) if args.store else None
     if store is not None:                                 # align geometry to the store; no DINO/maps
-        args.step_m, args.levels_m = store.step_m, store.levels_m
+        args.step_m = store.step_m
         args.output_px, args.tile_size_m = store.output_px, store.tile_size_m
+        req = [L for L in args.levels_m if L in store.levels_m]   # honor a --levels-m SUBSET (speed)
+        args.levels_m = req if req else store.levels_m
         ext = proj = patch = None
         backbone = str(store.f.attrs.get("backbone", "?"))
         srcs = {}
-        print(f"[store] {args.store} step={store.step_m} levels={store.levels_m} "
-              f"output_px={store.output_px} backbone={backbone}", flush=True)
+        print(f"[store] {args.store} step={store.step_m} levels(use)={args.levels_m} "
+              f"of stored {store.levels_m} output_px={store.output_px} backbone={backbone}", flush=True)
     else:
         maps = dict(_kv(a) for a in args.maps) if args.maps else resolve_maps(args.tif_dir, cities)
         missing = [c for c in cities if c not in maps]
