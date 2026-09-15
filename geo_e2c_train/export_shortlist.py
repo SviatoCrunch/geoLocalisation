@@ -113,14 +113,19 @@ def main(argv=None) -> int:
     out = {"meta": {"ckpt": args.ckpt, "epoch": ck.get("epoch"), "k": args.k,
                     "border_m": args.border_m, "n_dense": len(dense_ids)},
            "shortlist": {}}
+    split_data = json.loads(Path(args.split_json).expanduser().read_text(encoding="utf-8"))
     for w in args.which:
         sr = build_split_relevance(args.split_config, args.split_json, w,
                                    query_size_m=args.query_size_m)
         if galV is None:
             galV = build_gallery_V(model, tiles, sr.tile_ids, args.eval_chunk, args.device, progress=True)
         cell_city_of_row = np.array([str(t).split(":", 1)[0] for t in sr.tile_ids])
-        qids = [q for q in sr.query_ids if store.has(q)]
-        qid_row = {q: i for i, q in enumerate(sr.query_ids)}
+        pos_row = {q: i for i, q in enumerate(sr.query_ids)}          # only queries WITH a positive cell
+        # EVERY split query we have tokens for gets a shortlist — a query without a positive checkerboard
+        # cell (strict rule / near a gap) is still scored and localized; positives feed only the recall
+        # diagnostic below, so a geometry-rule mismatch no longer silently drops frames.
+        qids = [q for q in split_data.get(w, []) if store.has(q)]
+        no_token = [q for q in split_data.get(w, []) if not store.has(q)]
         Q = torch.stack([model.encode_query(store.tokens(q).to(args.device)) for q in qids])
         S = model.score(Q, galV, tile_chunk=args.eval_chunk)         # (B, cells)
         qcity = np.array([str(q).split(":", 1)[0] for q in qids])
@@ -128,11 +133,12 @@ def main(argv=None) -> int:
         S = S.masked_fill(~allowed, float("-inf"))
         order = S.argsort(dim=1, descending=True).cpu().numpy()
 
-        hit, counts = 0, []
+        hit, npos, counts = 0, 0, []
         for bi, q in enumerate(qids):
             topk = [int(r) for r in order[bi][:args.k]]
-            pos = set(int(x) for x in sr.relevance.pos_of(qid_row[q]))
-            if pos:
+            pos = set(int(x) for x in sr.relevance.pos_of(pos_row[q])) if q in pos_row else set()
+            if pos:                                               # recall only over queries with a GT cell
+                npos += 1
                 hit += int(any(r in pos for r in topk))          # coarse recall@K (GT cell in shortlist)
             dense_rows = gather_dense(topk, sr.tile_xy, dense_xy, dense_city, cell_city_of_row, reach_grid)
             counts.append(len(dense_rows))
@@ -140,11 +146,16 @@ def main(argv=None) -> int:
                                    "dense": [dense_ids[r] for r in dense_rows]}
         cnt = np.array(counts) if counts else np.array([0])
         n = len(qids)
-        print(f"[{w}] n={n} coarse_recall@{args.k}={hit/n if n else 0:.3f} "
+        print(f"[{w}] n={n} (with_pos={npos}, no_token={len(no_token)}) "
+              f"coarse_recall@{args.k}={hit/npos if npos else 0:.3f} "
               f"dense/query median={int(np.median(cnt))} min={int(cnt.min())} max={int(cnt.max())}",
               flush=True)
+        if no_token:
+            print(f"[{w}] no tokens in query store for {len(no_token)}: {no_token[:5]}"
+                  f"{' …' if len(no_token) > 5 else ''}", flush=True)
         out["meta"].setdefault("per_split", {})[w] = {
-            "n": n, "coarse_recall_at_k": (hit / n if n else 0.0),
+            "n": n, "with_pos": npos, "no_token": len(no_token),
+            "coarse_recall_at_k": (hit / npos if npos else 0.0),
             "dense_per_query_median": int(np.median(cnt))}
 
     Path(args.out).write_text(json.dumps(out), encoding="utf-8")
