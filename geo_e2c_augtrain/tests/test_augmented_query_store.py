@@ -27,11 +27,12 @@ def _patch(monkeypatch):
     monkeypatch.setattr("map_extract.dino.build_dino_extractor", lambda *a, **k: _Ext())
     monkeypatch.setattr("map_extract.dino.RandomProjector", lambda *a, **k: (lambda x: x))
     monkeypatch.setattr("map_extract.extract._tile_to_batch",
-                        lambda imgs, dev, ps, pp: (imgs, 2, 2))            # (batch, h_r, w_r)
+                        lambda imgs, dev, ps, pp: (imgs, 2, 2))            # batch = the (augmented) images
+    # feat DEPENDS on image content (like real DINO) so different augmentation -> different tokens
     monkeypatch.setattr("map_extract.extract._extract_level_features",
                         lambda dino, batch, h, w, proj, amp=False:
-                        [np.random.default_rng(i).standard_normal((1, 16, h, w)).astype(np.float32)
-                         for i in range(len(batch))])
+                        [np.random.default_rng(int(np.asarray(im).astype(np.int64).sum()) & 0xFFFFFFFF)
+                         .standard_normal((1, 16, h, w)).astype(np.float32) for im in batch])
 
 
 def test_store_reencode_shape_and_determinism(tmp_path, monkeypatch):
