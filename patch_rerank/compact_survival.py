@@ -118,6 +118,12 @@ def main(argv=None) -> int:
     reps_avail = [p for p in args.representations if p in ix]
     print(f"[survival] index={args.compact_index} crops={len(ci_pos)} reps={reps_avail} "
           f"grid_score={args.grid_score} budgets={args.budgets}", flush=True)
+    # load each representation fully into RAM ONCE — per-query h5py fancy-indexing (list of rows) is
+    # pathologically slow on the big grid8 dataset; numpy gather from a resident array is instant.
+    rep_arr = {}
+    for rep in reps_avail:
+        rep_arr[rep] = np.asarray(ix[rep][:])
+        print(f"    loaded {rep} {rep_arr[rep].shape} {rep_arr[rep].nbytes / 1e9:.2f} GB into RAM", flush=True)
 
     baseline = json.loads(Path(args.baseline).expanduser().read_text())
     qstore = QueryGridStore(dict(a.split("=", 1) for a in args.queries))
@@ -176,15 +182,12 @@ def main(argv=None) -> int:
             rows.append(r); valid.append(r is not None)
         valid = np.array(valid)
 
+        vr = np.array([rows[j] for j in range(len(crops)) if valid[j]], dtype=np.int64)
+        idx_valid = np.nonzero(valid)[0]                          # baseline-crop indices with a desc
         for rep in reps_avail:
-            desc_all = ix[rep]
-            vr = [rows[j] for j in range(len(crops)) if valid[j]]
-            order_rows = np.argsort(vr)                           # sorted rows -> one contiguous h5 read
-            sel = np.array(vr)[order_rows]
-            arr = torch.from_numpy(np.asarray(desc_all[sel.tolist()]).astype(np.float32)).to(dev)
+            arr = torch.from_numpy(rep_arr[rep][vr].astype(np.float32)).to(dev)   # RAM gather (fast)
             cheap_v = _cheap_scores(rep, qtok, arr, args.grid_score)
             cheap = np.full(len(crops), -1e9)
-            idx_valid = np.nonzero(valid)[0][order_rows]
             cheap[idx_valid] = cheap_v
             order = list(np.argsort(-cheap))                      # best cheap first (invalids sink)
             for b in args.budgets:
