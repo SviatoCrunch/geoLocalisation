@@ -54,13 +54,29 @@ def _ensure_cog(tif_path: Path) -> Path:
 
 
 def _load_aoi_from_kmz(kmz_path, name_filter: str | None = None) -> np.ndarray:
-    """Parse KMZ Point placemarks → convex-hull polygon as (N,2) [[lat,lon]] array."""
+    """Parse a KMZ AOI → (N,2) ``[[lat, lon]]`` array.
+
+    Two supported geometries:
+      * ``<Polygon>`` — its outer ``LinearRing`` is returned verbatim, preserving
+        the drawn shape (including concavities). First matching polygon wins.
+      * ``<Point>`` placemarks (≥3) — returned as their convex hull (legacy).
+    A polygon, when present, takes priority over loose points.
+    """
     import zipfile
     import xml.etree.ElementTree as ET
     from shapely.geometry import MultiPoint
 
     KML_NS = "{http://www.opengis.net/kml/2.2}"
     points: list[tuple[float, float]] = []
+    ring: list[tuple[float, float]] = []
+
+    def _parse_coords(text: str) -> list[tuple[float, float]]:
+        out: list[tuple[float, float]] = []
+        for tok in text.strip().split():
+            parts = tok.split(",")
+            if len(parts) >= 2:
+                out.append((float(parts[0]), float(parts[1])))  # (lon, lat)
+        return out
 
     with zipfile.ZipFile(kmz_path) as z:
         kml_files = [n for n in z.namelist() if n.endswith(".kml")]
@@ -74,21 +90,30 @@ def _load_aoi_from_kmz(kmz_path, name_filter: str | None = None) -> np.ndarray:
             name_el = placemark.find(f"{KML_NS}name")
             if name_el is None or name_filter.lower() not in (name_el.text or "").lower():
                 continue
+        if not ring:  # first non-empty polygon outer ring wins
+            poly = placemark.find(f".//{KML_NS}Polygon")
+            if poly is not None:
+                outer = poly.find(f".//{KML_NS}outerBoundaryIs//{KML_NS}coordinates")
+                if outer is None:
+                    outer = poly.find(f".//{KML_NS}coordinates")
+                if outer is not None and outer.text:
+                    ring = _parse_coords(outer.text)
         pt = placemark.find(f".//{KML_NS}Point")
-        if pt is None:
-            continue
-        coords_el = pt.find(f"{KML_NS}coordinates")
-        if coords_el is None or not coords_el.text:
-            continue
-        for tok in coords_el.text.strip().split():
-            parts = tok.split(",")
-            if len(parts) >= 2:
-                lon, lat = float(parts[0]), float(parts[1])
-                points.append((lon, lat))
+        if pt is not None:
+            coords_el = pt.find(f"{KML_NS}coordinates")
+            if coords_el is not None and coords_el.text:
+                points.extend(_parse_coords(coords_el.text))
+
+    if ring:
+        if len(ring) > 1 and ring[0] == ring[-1]:
+            ring = ring[:-1]                      # drop the closing duplicate vertex
+        if len(ring) < 3:
+            raise ValueError(f"Polygon AOI ring has <3 vertices, got {len(ring)}")
+        return np.array([[lat, lon] for lon, lat in ring])
 
     if len(points) < 3:
         raise ValueError(
-            f"Need ≥3 Point placemarks for an AOI polygon, got {len(points)}"
+            f"Need a <Polygon> or ≥3 Point placemarks for an AOI, got {len(points)} points"
             + (f" (filter: '{name_filter}')" if name_filter else ""))
 
     hull = MultiPoint(points).convex_hull

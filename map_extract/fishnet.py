@@ -43,8 +43,14 @@ def make_valid_aoi_polygon(
     except ImportError:
         raise ImportError("shapely is required: pip install shapely")
 
-    ordered = order_aoi_points(aoi_points)
+    # Prefer the given vertex order (a real ring, e.g. a KMZ <Polygon>, keeps its
+    # concavities); only fall back to polar-angle sorting for unordered clouds
+    # (e.g. loose Point placemarks) whose given order self-intersects.
+    ordered = list(aoi_points)
     polygon = Polygon([(lon, lat) for lat, lon in ordered])
+    if not polygon.is_valid:
+        ordered = order_aoi_points(aoi_points)
+        polygon = Polygon([(lon, lat) for lat, lon in ordered])
 
     if not polygon.is_valid:
         polygon = make_valid(polygon)
