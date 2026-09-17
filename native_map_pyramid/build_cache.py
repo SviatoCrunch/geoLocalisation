@@ -86,11 +86,12 @@ def compute_tile_cell_sums(center_x, center_y, tile_true_m, true_scale, output_p
     grids = dino_batch_fn(imgs)                               # 21 grids, shared backbone
     if len(grids) != len(imgs):
         raise RuntimeError(f"dino_batch_fn returned {len(grids)} grids for {len(imgs)} crops")
+    dev = agg.assign.weight.device                            # run aggregation on agg's device
+    grids = [g.to(dev) for g in grids]
     by = {k: g for k, g in zip(keys, grids)}
 
     K = agg.n_groups
     Dv = grids[0].shape[-1]
-    dev = grids[0].device
     S8 = torch.zeros(64, K, Dv, device=dev)
     S4 = torch.zeros(16, K, Dv, device=dev)
     S2 = torch.zeros(4, K, Dv, device=dev)
