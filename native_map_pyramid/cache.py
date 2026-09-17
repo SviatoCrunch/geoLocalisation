@@ -115,6 +115,8 @@ def assert_compatible(cache_ident: dict, expected_ident: dict) -> None:
 def write_cache(path, S_all, tile_ids, ident: dict, extra_meta: dict | None = None) -> None:
     """Write ``S_all`` (M,85,K,Dv) fp16 + tile ids + identity/fingerprint attrs to an H5 cache."""
     import h5py
+    from pathlib import Path
+    Path(path).parent.mkdir(parents=True, exist_ok=True)          # ensure parent dir exists
     S_all = np.asarray(S_all)
     if S_all.ndim != 4 or S_all.shape[1] != N_CELLS_TOTAL:
         raise ValueError(f"S_all must be (M,{N_CELLS_TOTAL},K,Dv), got {S_all.shape}")
@@ -128,6 +130,85 @@ def write_cache(path, S_all, tile_ids, ident: dict, extra_meta: dict | None = No
         f.attrs["fingerprint"] = ident["fingerprint"]
         f.attrs["identity_json"] = json.dumps(ident, sort_keys=True)
         f.attrs["meta_json"] = json.dumps(extra_meta or {}, sort_keys=True)
+
+
+class NativeCacheWriter:
+    """Incremental, resumable writer for the native ``S`` cache.
+
+    Pre-creates the full ``S (M,85,K,Dv)`` dataset + a ``done (M,)`` bool mask and writes one tile
+    at a time (flushing periodically), so a crash/interrupt loses at most the un-flushed tail. On
+    re-open, if the file exists with the SAME identity + tile_ids + shape, completed rows are kept
+    and skipped (resume); otherwise a fresh file is created (unless it exists but is incompatible,
+    which raises unless ``fresh=True``)."""
+
+    def __init__(self, path, tile_ids, n_groups, d_value, ident: dict,
+                 extra_meta: dict | None = None, *, fresh: bool = False, flush_every: int = 25):
+        import os
+        import h5py
+        from pathlib import Path
+        self.path = str(path)
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self._ids = [str(t) for t in tile_ids]
+        M = len(self._ids)
+        self.flush_every = int(flush_every)
+        self.resumed = False
+
+        can_resume = False
+        if os.path.exists(self.path) and not fresh:
+            try:
+                with h5py.File(self.path, "r") as f:
+                    prev = json.loads(f.attrs["identity_json"])
+                    ids_ok = [t.decode() if isinstance(t, bytes) else str(t)
+                              for t in f["tile_id"][:]] == self._ids
+                    shape_ok = tuple(f["S"].shape) == (M, N_CELLS_TOTAL, n_groups, d_value)
+                    same = (prev.get("fingerprint") == ident["fingerprint"]) and ids_ok and shape_ok
+                if same:
+                    can_resume = True
+                elif not fresh:
+                    raise CacheIncompatibleError(
+                        f"{self.path} exists but does not match this run (identity/tile_ids/shape). "
+                        f"Pass fresh=True (--fresh) to overwrite, or point --out at a new path.")
+            except (KeyError, OSError):
+                can_resume = False
+
+        if can_resume:
+            self._f = h5py.File(self.path, "r+")
+            self.resumed = True
+        else:
+            self._f = h5py.File(self.path, "w")
+            self._f.create_dataset("S", shape=(M, N_CELLS_TOTAL, n_groups, d_value), dtype="float16",
+                                   chunks=(1, N_CELLS_TOTAL, n_groups, d_value),
+                                   compression="gzip", compression_opts=4)
+            self._f.create_dataset("tile_id", data=np.array(self._ids, dtype=object),
+                                   dtype=h5py.string_dtype())
+            self._f.create_dataset("done", data=np.zeros(M, dtype=bool))
+            self._f.attrs["fingerprint"] = ident["fingerprint"]
+            self._f.attrs["identity_json"] = json.dumps(ident, sort_keys=True)
+            self._f.attrs["meta_json"] = json.dumps(extra_meta or {}, sort_keys=True)
+        self._done = np.asarray(self._f["done"][:], dtype=bool)
+
+    def is_done(self, row: int) -> bool:
+        return bool(self._done[row])
+
+    def n_done(self) -> int:
+        return int(self._done.sum())
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def write(self, row: int, S_row) -> None:
+        self._f["S"][row] = np.asarray(S_row, dtype=np.float16)
+        self._f["done"][row] = True
+        self._done[row] = True
+        if self.n_done() % self.flush_every == 0:
+            self._f.flush()
+
+    def finalize(self) -> int:
+        """Flush + close; return the number of tiles still missing (0 = complete)."""
+        self._f.flush()
+        missing = int((~self._done).sum())
+        self._f.close()
+        return missing
 
 
 class NativeCellCache:

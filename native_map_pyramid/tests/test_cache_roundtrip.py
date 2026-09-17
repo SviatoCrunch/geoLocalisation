@@ -86,6 +86,50 @@ def test_incompatible_raises_naming_field(tmp_path, field, val):
     cache.close()
 
 
+def test_writer_incremental_roundtrip(tmp_path):
+    S = _synth_S(M=4)
+    ids = [f"c:{i}" for i in range(4)]
+    path = tmp_path / "S.h5"
+    w = C.NativeCacheWriter(path, ids, 32, 1024, _ident())
+    assert not w.resumed and w.n_done() == 0
+    for r in range(4):
+        w.write(r, S[r])
+    assert w.finalize() == 0
+    cache = C.NativeCellCache(path)
+    recon = torch.cat([cache.load(ids)[n] for n in (8, 4, 2, 1)], dim=1).numpy()
+    assert np.allclose(recon, S.astype(np.float16).astype(np.float32), atol=1e-3, rtol=1e-2)
+    cache.close()
+
+
+def test_writer_resume_skips_done(tmp_path):
+    S = _synth_S(M=4)
+    ids = [f"c:{i}" for i in range(4)]
+    path = tmp_path / "S.h5"
+    w = C.NativeCacheWriter(path, ids, 32, 1024, _ident())
+    w.write(0, S[0]); w.write(1, S[1])
+    assert w.finalize() == 2                              # 2 tiles still missing
+    w2 = C.NativeCacheWriter(path, ids, 32, 1024, _ident())   # re-open → resume
+    assert w2.resumed and w2.is_done(0) and w2.is_done(1) and not w2.is_done(2)
+    w2.write(2, S[2]); w2.write(3, S[3])
+    assert w2.finalize() == 0
+    cache = C.NativeCellCache(path)
+    recon = torch.cat([cache.load(ids)[n] for n in (8, 4, 2, 1)], dim=1).numpy()
+    assert np.allclose(recon, S.astype(np.float16).astype(np.float32), atol=1e-3, rtol=1e-2)
+    cache.close()
+
+
+def test_writer_incompatible_refuses_without_fresh(tmp_path):
+    S = _synth_S(M=3)
+    ids = ["c:a", "c:b", "c:c"]
+    path = tmp_path / "S.h5"
+    C.NativeCacheWriter(path, ids, 32, 1024, _ident()).finalize()
+    with pytest.raises(C.CacheIncompatibleError):
+        C.NativeCacheWriter(path, ids, 32, 1024, _ident(backbone="dinov3_vitl16"))
+    w = C.NativeCacheWriter(path, ids, 32, 1024, _ident(backbone="dinov3_vitl16"), fresh=True)
+    assert not w.resumed
+    w.finalize()
+
+
 def test_scale_order_change_is_detected():
     # A cache whose token_order/scale layout differs must not validate against the canonical run.
     a = _ident()

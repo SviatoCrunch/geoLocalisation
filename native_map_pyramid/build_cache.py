@@ -154,8 +154,11 @@ def main(argv=None) -> int:
     ap.add_argument("--proj-seed", type=int, default=0)
     ap.add_argument("--tile-size-m", type=float, default=1000.0)
     ap.add_argument("--k", type=int, default=32)
+    ap.add_argument("--proj-in-dim", type=int, default=1536, help="native DINO dim before projection "
+                    "(vitg14=1536); part of the fingerprint, must match geo_e2c_train --native-proj-in-dim")
     ap.add_argument("--batch-crops", type=int, default=16)
     ap.add_argument("--amp", action="store_true")
+    ap.add_argument("--fresh", action="store_true", help="ignore any existing cache at --out (no resume)")
     ap.add_argument("--limit", type=int, default=0, help="cap #tiles (debug)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")
@@ -194,9 +197,25 @@ def main(argv=None) -> int:
         _, clat = Transformer.from_crs(srcs[c].crs, "EPSG:4326", always_xy=True).transform(cx, cy)
         true_scale[c] = mercator_true_scale(float(clat))        # SAME single map-centre scale as extraction
 
-    S_all = np.zeros((len(keep), C.N_CELLS_TOTAL, args.k, args.desc_dim), dtype=np.float16)
-    out_ids = []
+    out_ids = [tid[i] for i in keep]
+    # identity is DETERMINISTIC (no dependence on a lazily-built projector) so it can be written
+    # before the loop and matches geo_e2c_train's build_expected_identity(proj_in_dim=…).
+    projection = "random_gaussian_jl" if args.desc_dim < args.proj_in_dim else "none"
+    ident = C.build_fingerprint(
+        backbone=args.backbone, dino_layer=args.dino_layer, dino_facet=args.dino_facet,
+        output_px=args.output_px, tile_size_m=args.tile_size_m, patch_size=patch_size,
+        projection=projection, projection_seed=args.proj_seed,
+        projection_in_dim=args.proj_in_dim, projection_out_dim=args.desc_dim,
+        n_groups=args.k, d_value=args.desc_dim, vlad_dict_id=C.vlad_dict_id(aw))
+    writer = C.NativeCacheWriter(args.out, out_ids, args.k, args.desc_dim, ident, fresh=args.fresh,
+                                 extra_meta={"cities": sorted(set(city[i] for i in keep)),
+                                             "true_scale": {c: true_scale[c] for c in srcs}})
+    if writer.resumed:
+        print(f"[resume] {writer.n_done()}/{len(writer)} tiles already done — skipping them", flush=True)
+
     for row, i in enumerate(tqdm(keep, desc="native S", unit="tile")):
+        if writer.is_done(row):
+            continue
         c = city[i]
         cx, cy = to_merc(lon[i], lat[i])
         Sfn = lambda a, b_, d, e, px, src=srcs[c]: read_crop(src, a, b_, d, e, px)
@@ -205,24 +224,15 @@ def main(argv=None) -> int:
                                            Sfn, dino_batch_fn, agg)
         if nv != N_VIEWS_PER_TILE:
             raise RuntimeError(f"tile {tid[i]} produced {nv} DINO views, expected {N_VIEWS_PER_TILE}")
-        S_all[row] = S.cpu().numpy().astype(np.float16)
-        out_ids.append(tid[i])
+        writer.write(row, S.cpu().numpy())                    # incremental, resumable
     for s in srcs.values():
         s.close()
 
-    proj_attrs = projector.h5_attrs()
-    ident = C.build_fingerprint(
-        backbone=args.backbone, dino_layer=args.dino_layer, dino_facet=args.dino_facet,
-        output_px=args.output_px, tile_size_m=args.tile_size_m, patch_size=patch_size,
-        projection=proj_attrs.get("projection", "none"), projection_seed=args.proj_seed,
-        projection_in_dim=int(proj_attrs.get("projection_in_dim", args.desc_dim)),
-        projection_out_dim=int(proj_attrs.get("projection_out_dim", args.desc_dim)),
-        n_groups=args.k, d_value=args.desc_dim, vlad_dict_id=C.vlad_dict_id(aw))
-    C.write_cache(args.out, S_all, out_ids, ident,
-                  extra_meta={"n_tiles": len(out_ids), "cities": sorted(set(city[i] for i in keep)),
-                              "true_scale": {c: true_scale[c] for c in srcs}})
-    print(f"[ok] native cache → {args.out}  ({len(out_ids)} tiles, {S_all.nbytes/1e9:.2f} GB fp16)",
-          flush=True)
+    missing = writer.finalize()
+    if missing:
+        raise RuntimeError(f"native cache incomplete: {missing}/{len(out_ids)} tiles missing "
+                           f"(re-run the same command to resume)")
+    print(f"[ok] native cache → {args.out}  ({len(out_ids)} tiles)", flush=True)
     return 0
 
 
