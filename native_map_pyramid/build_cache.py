@@ -140,7 +140,9 @@ def main(argv=None) -> int:
     from map_extract.geometry import mercator_true_scale
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--index", required=True, help="geometry index H5 (lat/lon/city/tile_id/window_size_m)")
+    ap.add_argument("--index", nargs="+", required=True,
+                    help="geometry index H5(s) with lat/lon/city/tile_id (one combined file, or the "
+                         "per-city checker files the split uses — pass all of them)")
     ap.add_argument("--cog", nargs="+", required=True, help="city=path to the source COG")
     ap.add_argument("--assign", required=True, help="dict/k32.pt (frozen VLAD assignment)")
     ap.add_argument("--backbone", default="dinov2_vitg14")
@@ -168,11 +170,15 @@ def main(argv=None) -> int:
                                        amp=args.amp, batch=args.batch_crops)
     to_merc = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform
 
-    with h5py.File(args.index, "r") as f:
-        lat = np.asarray(f["lat"], float); lon = np.asarray(f["lon"], float)
-        city = [c.decode() if isinstance(c, bytes) else str(c) for c in f["city"][:]]
-        tid = [t.decode() if isinstance(t, bytes) else str(t) for t in f["tile_id"][:]] \
-            if "tile_id" in f else [f"{city[i]}:row{i}" for i in range(len(lat))]
+    lat_l, lon_l, city, tid = [], [], [], []
+    for ipath in args.index:                                   # one combined index OR per-city checkers
+        with h5py.File(ipath, "r") as f:
+            la = np.asarray(f["lat"], float); lo = np.asarray(f["lon"], float)
+            cy = [c.decode() if isinstance(c, bytes) else str(c) for c in f["city"][:]]
+            ti = [t.decode() if isinstance(t, bytes) else str(t) for t in f["tile_id"][:]] \
+                if "tile_id" in f else [f"{cy[i]}:row{i}" for i in range(len(la))]
+        lat_l.append(la); lon_l.append(lo); city += cy; tid += ti
+    lat = np.concatenate(lat_l); lon = np.concatenate(lon_l)
 
     keep = [i for i in range(len(tid)) if city[i] in cogs]
     if args.limit:
