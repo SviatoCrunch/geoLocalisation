@@ -41,9 +41,18 @@ class E2cModelConfig:
     intra: bool = True
     freeze_assignment: bool = True
 
+    # ── map-cell feature SOURCE (experimental; does not change the model tail) ─────────
+    #   legacy_token_partition — cells = n×n token splits of ONE 1000 m DINO grid (default)
+    #   native_hierarchical    — cells = independent native COG crops (1×1000+4×500+16×250 m),
+    #                            n=8 = 2×2 quadrants of each 250 m DINO grid (see native_map_pyramid)
+    map_pyramid_source: str = "legacy_token_partition"
+
     def validate(self) -> None:
         if self.agg not in ("supervlad", "vlad", "residual"):
             raise ValueError(f"unknown agg {self.agg!r} (supervlad|vlad|residual)")
+        if self.map_pyramid_source not in ("legacy_token_partition", "native_hierarchical"):
+            raise ValueError(f"map_pyramid_source must be 'legacy_token_partition' or "
+                             f"'native_hierarchical', got {self.map_pyramid_source!r}")
         if int(self.k) <= 0:
             raise ValueError("k (n_groups) must be > 0")
         if self.pyramid_mode not in ("cell", "concentric"):

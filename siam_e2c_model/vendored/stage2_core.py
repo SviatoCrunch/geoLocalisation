@@ -243,6 +243,63 @@ def _pyramid_per_group_fast(alpha, value, group_proj, scales_cells, Hm, Wm, dev,
     return pyr
 
 
+# ── native-map-pyramid support: frozen per-cell per-group sums as the cache boundary ─────
+# These are ADDITIVE helpers for the `native_hierarchical` map-pyramid source. They do NOT
+# change any legacy code path; ``cell_group_sums_from_grid`` + ``pyramid_from_cell_group_sums``
+# reproduce ``_pyramid_per_group_fast`` bit-for-bit (see native_map_pyramid parity test).
+def cell_group_sums_from_grid(tok_grids: torch.Tensor, agg: CellSuperVLAD,
+                              scales_cells, eps: float = 1e-8) -> dict[int, torch.Tensor]:
+    """FROZEN per-cell per-group residual sums ``S{n:(M,n²,K,Dv)}``.
+
+    ``S[m,c,k] = Σ_{tokens t in cell c} α_k(t)·value(t)`` — the intermediate that sits AFTER the
+    frozen assignment/value (``agg.alpha``/``agg.value``, ψ=identity) but BEFORE the trainable
+    ``PerGroupProjection``. This is the legacy token-partition SOURCE of the cell pyramid and the
+    cacheable frozen quantity for the native map source. See :func:`pyramid_from_cell_group_sums`."""
+    M, Hm, Wm, D = tok_grids.shape
+    dev = tok_grids.device
+    flat = F.normalize(tok_grids.reshape(M, Hm * Wm, D), dim=-1, eps=eps)
+    alpha = agg.alpha(flat)                              # (M,N,K)  frozen assignment
+    value = agg.value(flat)                              # (M,N,Dv) frozen (identity ψ)
+    weighted = alpha.unsqueeze(-1) * value.unsqueeze(2)  # (M,N,K,Dv)
+    K, Dv = alpha.shape[-1], value.shape[-1]
+    out: dict[int, torch.Tensor] = {}
+    for n in scales_cells:
+        rid = _region_ids_cached(Hm, Wm, n, dev)
+        S = torch.zeros(M, n * n, K, Dv, device=dev, dtype=weighted.dtype)
+        S.index_add_(1, rid, weighted)
+        out[n] = S
+    return out
+
+
+def tokens_to_group_sum(tok_grid: torch.Tensor, agg: CellSuperVLAD,
+                        eps: float = 1e-8) -> torch.Tensor:
+    """FROZEN single-cell per-group residual sum for ONE token grid → ``(K, Dv)``.
+
+    ``Σ_t α_k(t)·value(t)`` over ALL tokens of the grid (one cell). Used by the native source to
+    build ``S[cell,k]`` per native crop / per 30×30 quadrant. Same frozen ops as
+    :func:`cell_group_sums_from_grid`, just without cell partitioning."""
+    x = F.normalize(tok_grid.reshape(-1, tok_grid.shape[-1]), dim=-1, eps=eps)
+    a = agg.alpha(x)                     # (N,K)
+    v = agg.value(x)                     # (N,Dv)
+    return a.transpose(0, 1) @ v         # (K,Dv)
+
+
+def pyramid_from_cell_group_sums(S_by_scale: dict, group_proj: "PerGroupProjection",
+                                 eps: float = 1e-8) -> dict[int, torch.Tensor]:
+    """Trainable-tail replay: frozen per-cell per-group sums ``S{n:(M,n²,K,Dv)}`` →
+    ``{n:(M,n²,K·d_group)}``. Reuses the trainable ``group_proj``; bit-parity with
+    :func:`_pyramid_per_group_fast` because ``A_k`` is bias-free linear:
+    ``A_k(Σ α_k·value) = Σ α_k·A_k(value)`` (pool-then-project == project-then-pool)."""
+    w = group_proj.weight
+    pyr: dict[int, torch.Tensor] = {}
+    for n, S in S_by_scale.items():
+        M, C, K, Dv = S.shape
+        pk = torch.einsum("mckd,kod->mcko", S, w.to(S.dtype))    # (M,C,K,d_group)
+        pk = F.normalize(pk, dim=3, eps=eps)                     # per-group L2
+        pyr[n] = F.normalize(pk.reshape(M, C, K * pk.shape[-1]), dim=2, eps=eps)  # global L2
+    return pyr
+
+
 def super_global(tok_keep: torch.Tensor, agg: CellSuperVLAD, intra: bool = True,
                  eps: float = 1e-8,
                  group_proj: "PerGroupProjection | None" = None) -> torch.Tensor:
@@ -407,6 +464,29 @@ class Stage2QueryConditionedModel(nn.Module):
             for n in self.scales_cells:
                 parts[n].append(V[n])
         return {n: torch.cat(parts[n], 0) for n in self.scales_cells}
+
+    def build_V_from_cell_sums(self, S_by_scale: dict, *, tile_chunk: int | None = None) -> dict:
+        """Cell pyramid V {n:(M,n²,d_out)} from FROZEN per-cell per-group sums (native map source).
+
+        Reuses the SAME trainable ``group_proj`` + ``map_head`` as :meth:`build_V` and adds NO
+        parameters. Numerically identical to ``build_V`` when ``S_by_scale`` is produced from the
+        same token grid via :func:`cell_group_sums_from_grid` (proven by the parity test)."""
+        dev = self._dev()
+        scales = self.scales_cells
+
+        def _tail(S: dict) -> dict:
+            region = pyramid_from_cell_group_sums({n: S[n] for n in scales}, self.group_proj, self.eps)
+            return self.transform_map({n: self.reduce(region[n]) for n in scales})
+
+        M = S_by_scale[scales[0]].shape[0]
+        if not tile_chunk or M <= tile_chunk:
+            return _tail({n: S_by_scale[n].to(dev) for n in scales})
+        parts: dict[int, list] = {n: [] for n in scales}
+        for s in range(0, M, int(tile_chunk)):
+            V = _tail({n: S_by_scale[n][s:s + int(tile_chunk)].to(dev) for n in scales})
+            for n in scales:
+                parts[n].append(V[n])
+        return {n: torch.cat(parts[n], 0) for n in scales}
 
     # ── query side: UAV tokens → q ────────────────────────────────────────────────────
     def encode_query_from_tokens(self, tok_keep: torch.Tensor) -> torch.Tensor:

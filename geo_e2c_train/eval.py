@@ -5,24 +5,32 @@ import numpy as np
 import torch
 
 
-def build_gallery_V(model, tile_loader, tile_ids, tile_chunk, dev, progress=False):
+def build_gallery_V(model, tile_loader, tile_ids, tile_chunk, dev, progress=False, build_V_fn=None):
     """All tiles → V (chunked to bound memory). Rows follow ``tile_ids`` order.
 
     ``tile_loader`` should be a NON-caching loader here: the full gallery (11465 tiles) must not be
-    held in RAM. Progress bar because this pass streams every tile grid from disk each eval."""
+    held in RAM. Progress bar because this pass streams every tile grid from disk each eval.
+
+    ``build_V_fn(ids)`` (optional) overrides how a chunk of tile ids becomes V — used by the
+    ``native_hierarchical`` map source to read cached per-cell sums instead of token grids. When
+    ``None`` (default) the legacy token-grid path is used and behaviour is byte-identical."""
     rng = range(0, len(tile_ids), tile_chunk)
     if progress:
         from tqdm import tqdm
         rng = tqdm(rng, desc="eval galV", unit="chunk", total=(len(tile_ids) + tile_chunk - 1) // tile_chunk)
     parts = None
     for s in rng:
-        G = tile_loader.stack(tile_ids[s:s + tile_chunk]).float().to(dev)
-        V = model.build_V(G)
+        ids = tile_ids[s:s + tile_chunk]
+        if build_V_fn is not None:
+            V = build_V_fn(ids)
+        else:
+            G = tile_loader.stack(ids).float().to(dev)
+            V = model.build_V(G)
         if parts is None:
             parts = {n: [] for n in V}
         for n in V:
             parts[n].append(V[n].detach())
-        del G, V
+        del V
     return {n: torch.cat(parts[n], 0) for n in parts}
 
 

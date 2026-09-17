@@ -49,6 +49,16 @@ class E2cModel:
         """Query tokens (N,D) → query embedding (d_out,). Mode-independent (global)."""
         return self.agg.encode_query(self.core, tokens)
 
+    def build_V_from_cell_sums(self, S_by_scale, *, tile_chunk=None):
+        """Native-hierarchical map source: build V {n:(M,n²,d_out)} from precomputed FROZEN
+        per-cell per-group sums instead of token grids. Cell/supervlad core only; reuses the
+        same trainable tail (``group_proj`` + ``map_head``), adds no parameters."""
+        if not hasattr(self.core, "build_V_from_cell_sums"):
+            raise NotImplementedError(
+                f"build_V_from_cell_sums is only available for the cell core, not "
+                f"{type(self.core).__name__} (pyramid_mode={self.pyramid_mode!r}, agg={self.cfg.agg!r})")
+        return self.core.build_V_from_cell_sums(S_by_scale, tile_chunk=tile_chunk)
+
     def score(self, Q, V, *, tile_chunk=None):
         """Query-conditioned scores: Q (B,d), V → (B,M)."""
         return self.core.score_queries_against_tiles(Q, V, tile_chunk=tile_chunk)
