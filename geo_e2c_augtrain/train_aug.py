@@ -71,9 +71,12 @@ def train(args) -> dict:
     pair_qid = [sr["train"].query_ids[p.query_index] for p in pairs]
     pair_trow = [int(p.canonical_tile_row) for p in pairs]
     tid = sr["train"].tile_ids
-    print(f"[pairs] {len(pairs)} train pairs | preloading {len(set(pair_trow))} tile grids ...", flush=True)
-    for r in tqdm(sorted(set(pair_trow)), desc="preload grids", unit="tile"):
-        tiles.grid(tid[r])
+    if args.map_pyramid_source == "legacy_token_partition":
+        print(f"[pairs] {len(pairs)} train pairs | preloading {len(set(pair_trow))} tile grids ...", flush=True)
+        for r in tqdm(sorted(set(pair_trow)), desc="preload grids", unit="tile"):
+            tiles.grid(tid[r])
+    else:
+        print(f"[pairs] {len(pairs)} train pairs | native source (S cache, no grid preload)", flush=True)
     train_qids = sorted(set(pair_qid))
 
     cfg = E2cModelConfig(agg=args.agg, k=args.k, assign_path=args.assign, d_token=args.d_token,
@@ -81,7 +84,7 @@ def train(args) -> dict:
                          concentric_sizes_m=tuple(args.concentric_sizes) if args.concentric_sizes
                          else (1000.0, 840.0, 710.0, 600.0, 500.0, 420.0, 350.0, 300.0, 250.0),
                          tile_size_m=args.tile_size_m, d_group=args.d_group, d_out=args.d_out,
-                         d_hidden=args.d_hidden)
+                         d_hidden=args.d_hidden, map_pyramid_source=args.map_pyramid_source)
     model = build_e2c_model(cfg, device=dev)
     if args.resume:
         ck = torch.load(Path(args.resume).expanduser(), map_location=dev, weights_only=False)
@@ -90,6 +93,31 @@ def train(args) -> dict:
     params = model.trainable_parameters()
     print(f"[model] trainable {sum(p.numel() for p in params)/1e6:.2f}M | agg={args.agg} "
           f"pyramid={model.resolved_config().get('pyramid_mode')}", flush=True)
+
+    # ── map-pyramid SOURCE strategy (same 2-point dispatch as geo_e2c_train.train) ─────
+    from native_map_pyramid.source import (LegacyTokenPartitionSource, NativeHierarchicalSource,
+                                           build_expected_identity, open_native_cache)
+    native_ident = None
+    if args.map_pyramid_source == "native_hierarchical":
+        if not (args.agg == "supervlad" and args.pyramid_mode == "cell"):
+            raise SystemExit("native_hierarchical requires --agg supervlad --pyramid-mode cell")
+        if not args.native_cache:
+            raise SystemExit("--native-cache is required for --map-pyramid-source native_hierarchical")
+        expected = build_expected_identity(
+            assign_weight=model.core.agg.assign.weight, k=args.k, d_token=args.d_token,
+            backbone=args.native_backbone, dino_layer=args.native_dino_layer,
+            dino_facet=args.native_dino_facet, output_px=args.native_output_px,
+            tile_size_m=args.tile_size_m, proj_seed=args.native_proj_seed,
+            proj_in_dim=args.native_proj_in_dim)
+        ncache = open_native_cache(args.native_cache, expected)          # STRICT fingerprint check
+        native_ident = ncache.identity
+        train_source = eval_source = NativeHierarchicalSource(ncache, dev)
+        print(f"[map-source] native_hierarchical | cache={args.native_cache} "
+              f"fp={ncache.fingerprint[:12]} tiles={len(ncache.tile_ids)}", flush=True)
+    else:
+        train_source = LegacyTokenPartitionSource(tiles, dev)
+        eval_source = LegacyTokenPartitionSource(eval_tiles, dev)
+        print("[map-source] legacy_token_partition", flush=True)
 
     def q_embed(qid):
         return model.encode_query(aug.tokens(qid).to(dev))
@@ -104,6 +132,12 @@ def train(args) -> dict:
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     best = {"median_rank": float("inf"), "epoch": -1}
     logf = (out / "metrics.jsonl").open("w", encoding="utf-8")
+    (out / "run_config.json").write_text(json.dumps(
+        {"map_pyramid_source": args.map_pyramid_source,
+         "resolved_config": model.resolved_config(),
+         "native_cache": ({"path": args.native_cache, "fingerprint": native_ident.get("fingerprint"),
+                           "identity": native_ident} if native_ident else None),
+         "args": {k: v for k, v in vars(args).items()}}, indent=2, default=str), encoding="utf-8")
 
     for epoch in tqdm(range(args.epochs), desc=f"aug {args.agg}/{args.pyramid_mode}", unit="ep"):
         if epoch > 0:
@@ -121,8 +155,8 @@ def train(args) -> dict:
             if plan.B_log_actual < 2:
                 continue
             pib = [pairs[i] for i in plan.pair_indices]
-            G = tiles.stack([tid[pair_trow[i]] for i in plan.pair_indices]).float().to(dev)
-            V = model.build_V(G)
+            batch_tile_ids = [tid[pair_trow[i]] for i in plan.pair_indices]
+            V = train_source.build_V(model, batch_tile_ids)         # legacy grids OR native S cache
             Q = torch.stack([q_embed(pair_qid[i]) for i in plan.pair_indices])
             S = model.score(Q, V)
             R_pos, R_cand = build_cross_relevance(pib, sr["train"].relevance)
@@ -137,11 +171,15 @@ def train(args) -> dict:
             opt.step()
             ep_loss += float(loss.detach()); nb += 1
 
-        row = {"epoch": epoch, "train_loss": ep_loss / max(nb, 1)}
+        row = {"epoch": epoch, "train_loss": ep_loss / max(nb, 1),
+               "map_pyramid_source": args.map_pyramid_source}
         do_eval = (epoch > 0 and epoch % args.eval_every == 0) or (epoch == args.epochs - 1)
         if do_eval:
             model.eval()
-            galV = build_gallery_V(model, eval_tiles, sr["val"].tile_ids, args.eval_chunk, dev, progress=True)
+            _bvf = None if args.map_pyramid_source == "legacy_token_partition" \
+                else (lambda ids: eval_source.build_V(model, ids))
+            galV = build_gallery_V(model, eval_tiles, sr["val"].tile_ids, args.eval_chunk, dev,
+                                   progress=True, build_V_fn=_bvf)
             for w in ("val", "test"):                     # eval on FROZEN (clean) tokens
                 row[w] = score_against_gallery(model, frozen, sr[w], galV, dev, args.eval_chunk)
             del galV
@@ -207,6 +245,17 @@ def main(argv=None) -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=0)
+    # ── experimental map-pyramid source (default = legacy = current behaviour) ─────────
+    ap.add_argument("--map-pyramid-source", choices=["legacy_token_partition", "native_hierarchical"],
+                    default="legacy_token_partition",
+                    help="map-cell feature source (native = COG-crop hierarchy; needs --native-cache)")
+    ap.add_argument("--native-cache", default=None, help="native_hierarchical: path to the S cache H5")
+    ap.add_argument("--native-backbone", default="dinov2_vitg14")
+    ap.add_argument("--native-dino-layer", type=int, default=None)
+    ap.add_argument("--native-dino-facet", default="value")
+    ap.add_argument("--native-output-px", type=int, default=840)
+    ap.add_argument("--native-proj-seed", type=int, default=0)
+    ap.add_argument("--native-proj-in-dim", type=int, default=1536)
     args = ap.parse_args(argv)
     args.grid_size = args.grid_size or None
     train(args)
