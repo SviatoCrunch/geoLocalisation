@@ -44,6 +44,19 @@ def test_roundtrip_numeric_and_metadata(tmp_path):
     cache.close()
 
 
+def test_preload_matches_lazy(tmp_path):
+    S = _synth_S(M=5)
+    ids = [f"c:{i}" for i in range(5)]
+    path = tmp_path / "S.h5"
+    C.write_cache(path, S, ids, _ident())
+    lazy = C.NativeCellCache(path, preload=False)
+    mem = C.NativeCellCache(path, preload=True)
+    want = ["c:3", "c:0", "c:4"]                          # reordered subset
+    for n in (8, 4, 2, 1):
+        assert torch.allclose(lazy.load(want)[n], mem.load(want)[n])
+    lazy.close(); mem.close()
+
+
 def test_subset_and_reordered_load(tmp_path):
     S = _synth_S(M=4)
     ids = ["c:a", "c:b", "c:c", "c:d"]

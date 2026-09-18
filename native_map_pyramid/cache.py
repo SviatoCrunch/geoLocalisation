@@ -214,7 +214,7 @@ class NativeCacheWriter:
 class NativeCellCache:
     """Reader for a native ``S`` cache. Use :meth:`assert_compatible` before :meth:`load`."""
 
-    def __init__(self, path):
+    def __init__(self, path, *, preload: bool = False):
         import h5py
         self._f = h5py.File(path, "r")
         self._S = self._f["S"]                                   # (M,85,K,Dv) fp16, lazy
@@ -225,6 +225,9 @@ class NativeCellCache:
         self.meta = json.loads(self._f.attrs.get("meta_json", "{}"))
         self.fingerprint = self._f.attrs["fingerprint"]
         self._slices = scale_row_slices()
+        # optional one-time RAM preload (fp16 ~ n_tiles·85·K·Dv·2 B) so per-batch loads are
+        # instant — matches the legacy TileGridLoader's RAM cache for the train loop.
+        self._S_mem = np.asarray(self._S[:]) if preload else None
 
     @property
     def shape(self):
@@ -243,10 +246,11 @@ class NativeCellCache:
         if missing:
             raise KeyError(f"{len(missing)} tile_id(s) not in native cache, e.g. {missing[:3]}")
         rows = np.array([self._row[t] for t in tile_ids])
-        order = np.argsort(rows, kind="stable")                  # h5py fancy-index needs ascending
-        arr = self._S[rows[order].tolist()]                      # (m,85,K,Dv) fp16
-        inv = np.argsort(order, kind="stable")
-        arr = arr[inv]                                           # restore requested order
+        if self._S_mem is not None:
+            arr = self._S_mem[rows]                              # RAM fancy-index (any order)
+        else:
+            order = np.argsort(rows, kind="stable")              # h5py fancy-index needs ascending
+            arr = self._S[rows[order].tolist()][np.argsort(order, kind="stable")]
         t = torch.from_numpy(arr.astype(np.float32))
         return {n: t[:, self._slices[n], :, :].contiguous() for n in SCALES}
 

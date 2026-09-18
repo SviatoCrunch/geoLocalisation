@@ -58,8 +58,11 @@ def build_expected_identity(*, assign_weight, k: int, d_token: int, backbone: st
         n_groups=k, d_value=d_token, vlad_dict_id=C.vlad_dict_id(assign_weight))
 
 
-def open_native_cache(path, expected_identity: dict) -> "C.NativeCellCache":
-    """Open + STRICTLY validate a native cache; raises :class:`cache.CacheIncompatibleError`."""
-    cache = C.NativeCellCache(path)
+def open_native_cache(path, expected_identity: dict, *, preload: bool = True) -> "C.NativeCellCache":
+    """Open + STRICTLY validate a native cache; raises :class:`cache.CacheIncompatibleError`.
+
+    ``preload=True`` (default for training) loads all ``S`` into RAM once so per-batch reads are
+    instant (parity with the legacy TileGridLoader RAM cache)."""
+    cache = C.NativeCellCache(path, preload=preload)
     cache.assert_compatible(expected_identity)
     return cache
