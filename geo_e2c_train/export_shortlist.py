@@ -63,8 +63,11 @@ def main(argv=None) -> int:
     ap.add_argument("--split-json", required=True)
     ap.add_argument("--galleries", nargs="+", required=True, help="city=dense d1024 H5 (coarse V source)")
     ap.add_argument("--queries", nargs="+", required=True)
-    ap.add_argument("--dense-index", required=True,
-                    help="tiles_index H5 of the FULL dense stride-250 gallery (build_index, no --grid-snap-m)")
+    ap.add_argument("--dense-index", default=None,
+                    help="tiles_index H5 of the FULL dense stride-250 gallery (build_index, no "
+                         "--grid-snap-m). OMIT to emit a cells-only shortlist (dense=[]): the fine "
+                         "reranker then slides fresh DINO within the top-K cells straight off the "
+                         "GeoTIFF, so no dense (overlapping) gallery is needed at all.")
     ap.add_argument("--assign", default=None)
     ap.add_argument("--k", type=int, default=70, help="shortlist size (top-K coarse cells)")
     ap.add_argument("--border-m", type=float, default=0.0,
@@ -101,13 +104,20 @@ def main(argv=None) -> int:
     tiles = TileGridLoader(galleries, grid_size=None, cache=False)
     store = QueryTokenStore(queries)
 
-    # dense geometry (full stride-250 gallery) — centres in the same EPSG:3857 grid as the cells
-    dense = build_gallery_index(args.dense_index, "EPSG:3857", args.tile_size_m)
-    dtiles = dense.all_tiles()
-    dense_ids = [t.tile_id for t in dtiles]
-    dense_xy = np.array([[t.center_x, t.center_y] for t in dtiles], float).reshape(-1, 2)
-    dense_city = np.array([t.city for t in dtiles])
-    reach_grid = (args.tile_size_m / 2.0 + args.border_m) / _COS      # true metres → grid units
+    # dense geometry (full stride-250 gallery) — centres in the same EPSG:3857 grid as the cells.
+    # Optional: without it we emit a cells-only shortlist and the fine reranker slides fresh DINO
+    # within the top-K cells off the GeoTIFF (no dense/overlapping gallery needed).
+    if args.dense_index:
+        dense = build_gallery_index(args.dense_index, "EPSG:3857", args.tile_size_m)
+        dtiles = dense.all_tiles()
+        dense_ids = [t.tile_id for t in dtiles]
+        dense_xy = np.array([[t.center_x, t.center_y] for t in dtiles], float).reshape(-1, 2)
+        dense_city = np.array([t.city for t in dtiles])
+        reach_grid = (args.tile_size_m / 2.0 + args.border_m) / _COS  # true metres → grid units
+    else:
+        dense_ids, dense_xy, dense_city, reach_grid = [], np.zeros((0, 2)), np.array([]), 0.0
+        print("[shortlist] no --dense-index -> cells-only shortlist (dense=[]); "
+              "fine rerank = fresh DINO within top-K cells", flush=True)
 
     galV = None
     out = {"meta": {"ckpt": args.ckpt, "epoch": ck.get("epoch"), "k": args.k,
@@ -140,7 +150,8 @@ def main(argv=None) -> int:
             if pos:                                               # recall only over queries with a GT cell
                 npos += 1
                 hit += int(any(r in pos for r in topk))          # coarse recall@K (GT cell in shortlist)
-            dense_rows = gather_dense(topk, sr.tile_xy, dense_xy, dense_city, cell_city_of_row, reach_grid)
+            dense_rows = (gather_dense(topk, sr.tile_xy, dense_xy, dense_city, cell_city_of_row,
+                                       reach_grid) if dense_ids else [])
             counts.append(len(dense_rows))
             out["shortlist"][q] = {"cells": [sr.tile_ids[r] for r in topk],
                                    "dense": [dense_ids[r] for r in dense_rows]}
