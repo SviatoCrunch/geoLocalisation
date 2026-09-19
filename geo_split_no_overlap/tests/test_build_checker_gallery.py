@@ -70,6 +70,15 @@ def test_standalone_checker_gallery_roundtrip(tmp_path):
     loader.close()
 
 
+def test_checker_path_accepts_city_prefix():
+    from geo_split_no_overlap.build_checker_gallery import _checker_path
+    # bare path unchanged
+    assert str(_checker_path("/a/b/checker_kup.h5")) == str(__import__("pathlib").Path("/a/b/checker_kup.h5"))
+    # "city=path" strips the city label (it is read from the file, not the CLI)
+    assert _checker_path("kup=/a/b/checker_kup.h5").name == "checker_kup.h5"
+    assert "kup=" not in str(_checker_path("kup=/a/b/checker_kup.h5"))
+
+
 def test_missing_tile_raises(tmp_path):
     pytest.importorskip("h5py")
     from geo_split_no_overlap.build_checker_gallery import build

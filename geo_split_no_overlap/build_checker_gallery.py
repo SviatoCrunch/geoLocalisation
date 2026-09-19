@@ -48,6 +48,17 @@ def _kv(arg: str):
     return c, Path(p).expanduser()
 
 
+def _checker_path(arg: str) -> Path:
+    """Accept a bare ``path`` OR ``city=path`` (the city label is ignored — it is read from the
+    file's ``city`` dataset). Lets ``--checker`` mirror the ``city=path`` form of ``--dense``/``--out``
+    without the ``city=`` prefix leaking into the path."""
+    if "=" in arg:
+        head, tail = arg.split("=", 1)
+        if "/" not in head and "\\" not in head:            # a city token, not a drive/path with '='
+            return Path(tail).expanduser()
+    return Path(arg).expanduser()
+
+
 def _decode(x):
     return x.decode() if isinstance(x, bytes) else str(x)
 
@@ -147,13 +158,14 @@ def main(argv=None) -> int:
     ap.add_argument("--dense", nargs="+", required=True, help="city=dense gallery H5 (group-per-tile)")
     ap.add_argument("--checker", nargs="+", required=True,
                     help="checker-index H5(s): per-city checker1000_noverlap_<city>.h5 or a combined "
-                         "tiles_index_checker1000.h5 (selection = its tile_id list)")
+                         "tiles_index_checker1000.h5 (selection = its tile_id list). Bare path or "
+                         "city=path (the city label is ignored — read from the file).")
     ap.add_argument("--out", nargs="+", required=True, help="city=output checker gallery H5")
     args = ap.parse_args(argv)
 
     dense_by_city = dict(_kv(a) for a in args.dense)
     out_by_city = dict(_kv(a) for a in args.out)
-    checker_paths = [Path(p).expanduser() for p in args.checker]
+    checker_paths = [_checker_path(p) for p in args.checker]
     infos = build(dense_by_city, checker_paths, out_by_city)
     for info in infos:
         print(f"[ok] {info['city']}: {info['n_tiles']} checker tiles -> {info['out']}")
