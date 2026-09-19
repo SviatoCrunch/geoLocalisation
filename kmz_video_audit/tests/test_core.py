@@ -38,6 +38,30 @@ def test_video_in_extended_data_mp4():
     assert hit.reason == "ext:.mp4" and hit.where == "ExtendedData:video" and hit.placemark == "Pt2"
 
 
+def test_s3_uri_video_link():
+    # a "video link on S3" is an s3:// URI — a http-only detector would miss it
+    kml = _kml('<Placemark><name>Pt-s3</name>'
+               '<description>відео: s3://mediamtx-recordings-crunch/live/0/clip.mp4</description>'
+               '</Placemark>')
+    a = audit_kml_bytes(kml, "s3.kml")
+    assert a.has_video
+    hit = a.video_links[0]
+    assert hit.reason == "ext:.mp4" and hit.url.startswith("s3://")
+
+
+def test_s3_bucket_host_without_ext():
+    kml = _kml('<Placemark><ExtendedData><Data name="rec">'
+               '<value>s3://drone-detections-map/2.0/session</value></Data></ExtendedData></Placemark>')
+    a = audit_kml_bytes(kml, "b.kml")
+    assert a.has_video and a.video_links[0].reason == "host:drone-detections-map"
+
+
+def test_rtsp_stream_is_video():
+    kml = _kml('<Placemark><Link><href>rtsp://cam.local:554/stream1</href></Link></Placemark>')
+    a = audit_kml_bytes(kml, "r.kml")
+    assert a.has_video and a.video_links[0].reason == "scheme:rtsp"
+
+
 def test_no_video_link():
     kml = _kml('<Placemark><name>Pt3</name>'
                '<description>just a map screenshot, https://example.com/page.html</description>'

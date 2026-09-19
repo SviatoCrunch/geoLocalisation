@@ -15,13 +15,17 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 # A URL inside element text, a description CDATA (HTML <a href>), or an attribute value.
-_URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+", re.IGNORECASE)
+# Matches http(s), s3:// URIs, and rtsp/rtmp streams — a "video link on S3" is typically an
+# ``s3://bucket/key.mp4`` (or a presigned https S3 URL), which a http-only pattern would miss.
+_URL_RE = re.compile(r"(?:https?|s3|rtsp|rtmp)://[^\s<>\"'\)\]]+", re.IGNORECASE)
 
 # Classification signals (broad on purpose — this is an investigation tool).
 _VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".flv", ".wmv",
                ".mpg", ".mpeg", ".ts", ".m3u8")
 _VIDEO_HOSTS = ("youtube.com", "youtu.be", "vimeo.com", "rutube.ru", "dailymotion.com",
-                "streamable.com", "twitch.tv", "t.me")
+                "streamable.com", "twitch.tv", "t.me",
+                # this project's own video/recording buckets (S3 links point here)
+                "mediamtx-recordings-crunch", "drone-detections-map")
 
 
 def _localname(tag: str) -> str:
@@ -32,6 +36,8 @@ def _localname(tag: str) -> str:
 def _classify_url(url: str) -> str | None:
     """Return a short reason string if ``url`` looks like a video, else None."""
     low = url.lower()
+    if low.startswith(("rtsp://", "rtmp://")):           # a live stream is a video by definition
+        return f"scheme:{low.split(':', 1)[0]}"
     # strip a query string for the extension test (…/clip.mp4?token=… still counts)
     path = low.split("?", 1)[0].split("#", 1)[0]
     for ext in _VIDEO_EXTS:
