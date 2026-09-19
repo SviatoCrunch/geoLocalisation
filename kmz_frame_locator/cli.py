@@ -104,6 +104,8 @@ def main(argv=None) -> int:
                 continue
             kmz_rec = {"kmz": kurl, "videos": []}
             for vurl, frames in by_video.items():
+                if args.limit and n_done >= args.limit:
+                    break                                      # stop before downloading more chunks
                 local = td / Path(vurl).name
                 if not local.exists():
                     subprocess.run(["aws", "s3", "cp", vurl, str(local)],
