@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -74,23 +75,32 @@ def _full_fps_config(quality_repo: Path, frames_dir: Path, td: Path) -> Path:
     return out
 
 
-def grade_chunk(chunk: Path, q_python: str, q_repo: Path, config: Path, td: Path, log) -> list[str]:
-    """Grade every frame of a chunk with quality-cls -> list of grades index-aligned (0..N-1)."""
+def grade_chunk(chunk: Path, q_python: str, q_repo: Path, config: Path, frames_dir: Path,
+                td: Path, log) -> list[str]:
+    """Grade every frame of a chunk with quality-cls -> grades index-aligned (0..N-1).
+
+    Cleans up the extracted frames + predictions CSV before returning: only the in-memory grades
+    are kept, so disk footprint stays minimal even over a long multi-chunk run (per user: no video/
+    frame artifacts must linger)."""
     csv = td / f"pred_{chunk.stem}.csv"
     cmd = [q_python, "-m", "quality_cls.score", str(chunk), "--config", str(config), "--out", str(csv)]
     log(f"  quality-cls grading {chunk.name} ...")
     p = subprocess.run(cmd, cwd=str(q_repo), capture_output=True, text=True)
-    if p.returncode != 0 or not csv.exists():
-        raise RuntimeError(f"quality-cls failed on {chunk.name}: {p.stderr[-1500:]}")
-    grades = {}
-    import csv as _csv
-    with csv.open(encoding="utf-8") as f:
-        for row in _csv.DictReader(f):
-            m = _IDX_RE.search(row["frame_path"])
-            if m:
-                grades[int(m.group(1))] = row["pred_label"]
-    n = (max(grades) + 1) if grades else 0
-    return [grades.get(i, "bad") for i in range(n)]
+    try:
+        if p.returncode != 0 or not csv.exists():
+            raise RuntimeError(f"quality-cls failed on {chunk.name}: {p.stderr[-1500:]}")
+        grades = {}
+        import csv as _csv
+        with csv.open(encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                m = _IDX_RE.search(row["frame_path"])
+                if m:
+                    grades[int(m.group(1))] = row["pred_label"]
+        n = (max(grades) + 1) if grades else 0
+        return [grades.get(i, "bad") for i in range(n)]
+    finally:
+        shutil.rmtree(frames_dir, ignore_errors=True)   # drop the extracted frames
+        csv.unlink(missing_ok=True)                       # drop the predictions csv
 
 
 def split_subvideos(grades: list[str]) -> list[tuple[int, int]]:
@@ -127,9 +137,11 @@ def process_kmz(kmz_url: str, gt: dict, q_python: str, q_repo: Path, td: Path, l
         if not local.exists():
             rec["videos"].append({"video": vurl, "error": "download failed"}); continue
         try:
-            grades = grade_chunk(local, q_python, q_repo, config, td, log)
+            grades = grade_chunk(local, q_python, q_repo, config, frames_dir, td, log)
         except Exception as e:                                  # noqa: BLE001
-            rec["videos"].append({"video": vurl, "error": str(e)[:300]}); continue
+            rec["videos"].append({"video": vurl, "error": str(e)[:300]})
+            local.unlink(missing_ok=True)                       # never leave the chunk behind
+            continue
         subs = split_subvideos(grades)
         # match each GT still -> abs frame index, then locate its sub-video
         matched = {}
