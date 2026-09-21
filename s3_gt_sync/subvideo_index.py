@@ -28,6 +28,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import cv2
+import numpy as np
+
 from kmz_frame_locator.core import match_still, parse_placemarks
 from kmz_video_audit.core import extract_kml_bytes
 
@@ -104,7 +107,11 @@ def grade_chunk(chunk: Path, q_python: str, q_repo: Path, config: Path, frames_d
 
 
 def split_subvideos(grades: list[str]) -> list[tuple[int, int]]:
-    """Maximal runs of good/usable frames (inclusive start .. inclusive end)."""
+    """Maximal runs of good/usable frames (inclusive start .. inclusive end).
+
+    QUALITY-ONLY split (legacy): a run breaks only on a `bad` frame. It does NOT
+    see scene cuts between two good frames (a spliced chunk) -> see
+    ``split_by_quality_and_overlap`` for the continuity-aware version."""
     runs, s = [], None
     for i, g in enumerate(list(grades) + ["__bad__"]):
         good = g in KEEP
@@ -115,12 +122,124 @@ def split_subvideos(grades: list[str]) -> list[tuple[int, int]]:
     return runs
 
 
+# ----------------------- structure annotation (JSON only) -----------------------
+
+def rle_grades(grades: list[str]) -> list[dict]:
+    """Run-length timeline of the raw quality grades: the FULL video structure in
+    a compact form, so downstream tools know it by index without touching video."""
+    out: list[dict] = []
+    for i, g in enumerate(grades):
+        if out and out[-1]["label"] == g and out[-1]["end"] == i - 1:
+            out[-1]["end"] = i
+        else:
+            out.append({"label": g, "start": i, "end": i})
+    return out
+
+
+def bad_frame_ranges(grades: list[str]) -> list[list[int]]:
+    """[[start, end], ...] inclusive index ranges of frames graded not good/usable."""
+    return [[r["start"], r["end"]] for r in rle_grades(grades) if r["label"] not in KEEP]
+
+
+# ------------------- continuity-aware split (ORB + RANSAC, CPU) -------------------
+
+def overlap_ratio(desc_a, kp_a, desc_b, kp_b, matcher, ransac_thr: float) -> float:
+    """RANSAC-homography inlier ratio between two frames' ORB features.
+
+    High = same continuous scene (survives fast UAV ego-motion, which a homography
+    explains); low = a cut/splice (no consistent planar transform). This is the
+    UAV-appropriate continuity signal (see literature: motion-compensated overlap)."""
+    if desc_a is None or desc_b is None or len(kp_a) < 8 or len(kp_b) < 8:
+        return 0.0
+    matches = matcher.match(desc_a, desc_b)
+    if len(matches) < 8:
+        return 0.0
+    pa = np.float32([kp_a[m.queryIdx].pt for m in matches])
+    pb = np.float32([kp_b[m.trainIdx].pt for m in matches])
+    _H, mask = cv2.findHomography(pa, pb, cv2.RANSAC, ransac_thr)
+    if mask is None:
+        return 0.0
+    return float(mask.sum()) / float(len(matches))
+
+
+def link_runs(keep_indices, ratio_of, *, bridge_max_gap: int, min_inlier_ratio: float,
+              min_scene_len: int) -> list[tuple[int, int]]:
+    """Group KEEP frames into continuous-scene runs (pure, testable).
+
+    A boundary is inserted between consecutive KEEP frames when the overlap
+    (``ratio_of(prev, cur)``) drops below ``min_inlier_ratio`` OR the bad-frame gap
+    between them exceeds ``bridge_max_gap`` (a long dropout -> do not bridge). Short
+    bad gaps with sufficient overlap are BRIDGED into one sub-video. Runs shorter
+    than ``min_scene_len`` frames are dropped."""
+    runs: list[tuple[int, int]] = []
+    start = prev = None
+    for idx in keep_indices:
+        if prev is None:
+            start = idx
+        else:
+            bad_between = idx - prev - 1
+            cont = (bad_between <= bridge_max_gap) and (ratio_of(prev, idx) >= min_inlier_ratio)
+            if not cont:
+                runs.append((start, prev)); start = idx
+        prev = idx
+    if start is not None:
+        runs.append((start, prev))
+    return [(a, b) for a, b in runs if b - a + 1 >= min_scene_len]
+
+
+def split_by_quality_and_overlap(chunk_path, grades: list[str], *, orb_features=1200,
+        downscale=2, ransac_thr=4.0, min_inlier_ratio=0.15, bridge_max_gap=8,
+        min_scene_len=6, log=None) -> list[tuple[int, int]]:
+    """Sub-videos = continuous-scene runs of KEEP frames.
+
+    Cuts a good run at splices (inlier ratio collapses) and bridges short bad-frame
+    dropouts (overlap survives). CPU ORB is cheap at this scale. Returns inclusive
+    (start_frame, end_frame) runs, indexed in the chunk."""
+    keep = [i for i, g in enumerate(grades) if g in KEEP]
+    if not keep:
+        return []
+    keepset = set(keep)
+    orb = cv2.ORB_create(nfeatures=orb_features)
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    cap = cv2.VideoCapture(str(chunk_path))
+    ratios: dict[tuple[int, int], float] = {}
+    prev = None  # (idx, kp, desc)
+    idx = -1
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        idx += 1
+        if idx >= len(grades):
+            break
+        if idx not in keepset:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if downscale > 1:
+            gray = cv2.resize(gray, (gray.shape[1] // downscale, gray.shape[0] // downscale))
+        kp, desc = orb.detectAndCompute(gray, None)
+        if prev is not None:
+            pidx, pkp, pdesc = prev
+            if idx - pidx - 1 <= bridge_max_gap:   # only score pairs we might bridge
+                ratios[(pidx, idx)] = overlap_ratio(pdesc, pkp, desc, kp, matcher, ransac_thr)
+        prev = (idx, kp, desc)
+    cap.release()
+    runs = link_runs(keep, lambda a, b: ratios.get((a, b), 0.0),
+                     bridge_max_gap=bridge_max_gap, min_inlier_ratio=min_inlier_ratio,
+                     min_scene_len=min_scene_len)
+    if log:
+        log(f"  overlap split: {len(keep)} keep frames -> {len(runs)} sub-videos "
+            f"(quality-only: {len(split_subvideos(grades))})")
+    return runs
+
+
 def _city_ver(kmz_url: str) -> tuple[str, str]:
     m = re.search(r"gt/raw/([^/]+)/([^/]+)/", kmz_url)
     return (m.group(1), m.group(2)) if m else ("unknown", Path(kmz_url).stem)
 
 
-def process_kmz(kmz_url: str, gt: dict, q_python: str, q_repo: Path, td: Path, log) -> dict:
+def process_kmz(kmz_url: str, gt: dict, q_python: str, q_repo: Path, td: Path, log,
+                overlap: dict | None = None) -> dict:
     city, ver = _city_ver(kmz_url)
     pms = parse_placemarks(extract_kml_bytes(_aws_bytes(kmz_url)))
     by_video: dict = {}
@@ -142,7 +261,17 @@ def process_kmz(kmz_url: str, gt: dict, q_python: str, q_repo: Path, td: Path, l
             rec["videos"].append({"video": vurl, "error": str(e)[:300]})
             local.unlink(missing_ok=True)                       # never leave the chunk behind
             continue
-        subs = split_subvideos(grades)
+        if overlap and overlap.get("enable", True):
+            subs = split_by_quality_and_overlap(
+                local, grades, log=log,
+                orb_features=overlap.get("orb_features", 1200),
+                downscale=overlap.get("downscale", 2),
+                ransac_thr=overlap.get("ransac_thr", 4.0),
+                min_inlier_ratio=overlap.get("min_inlier_ratio", 0.15),
+                bridge_max_gap=overlap.get("bridge_max_gap", 8),
+                min_scene_len=overlap.get("min_scene_len", 6))
+        else:
+            subs = split_subvideos(grades)
         # match each GT still -> abs frame index, then locate its sub-video
         matched = {}
         fps = 30.0
@@ -152,7 +281,10 @@ def process_kmz(kmz_url: str, gt: dict, q_python: str, q_repo: Path, td: Path, l
                 continue
             idx, fps, t_s, ncc, _frame, _nfr = m
             matched[pm.n] = (idx, t_s, ncc, pm)
-        vrec = {"video": vurl, "fps": round(fps, 3), "n_frames": len(grades), "sub_videos": []}
+        vrec = {"video": vurl, "fps": round(fps, 3), "n_frames": len(grades),
+                "bad_frames": bad_frame_ranges(grades),   # index ranges, video untouched
+                "grades_rle": rle_grades(grades),         # full quality structure
+                "sub_videos": []}
         for si, (a, b) in enumerate(subs):
             sv = {"sub_index": si, "start_frame": a, "end_frame": b,
                   "start_s": round(a / fps, 3) if fps else None,
@@ -182,7 +314,29 @@ def main(argv=None) -> int:
     ap.add_argument("--quality-python", required=True)
     ap.add_argument("--quality-repo", required=True)
     ap.add_argument("--limit", type=int, default=0, help="cap KMZ processed (smoke)")
+    # continuity-aware split (ORB+RANSAC overlap). On by default; --no-overlap-split
+    # falls back to the legacy quality-only split.
+    ap.add_argument("--overlap-split", dest="overlap_split", action="store_true", default=True)
+    ap.add_argument("--no-overlap-split", dest="overlap_split", action="store_false")
+    ap.add_argument("--min-inlier-ratio", type=float, default=0.15,
+                    help="below this RANSAC inlier ratio between adjacent KEEP frames = a cut")
+    ap.add_argument("--bridge-max-gap", type=int, default=8,
+                    help="max bad-frame dropout (frames) to bridge inside one sub-video")
+    ap.add_argument("--min-scene-len", type=int, default=6, help="drop sub-videos shorter than this")
+    ap.add_argument("--orb-features", type=int, default=1200)
+    ap.add_argument("--overlap-downscale", type=int, default=2, help="downscale frames for ORB speed")
+    ap.add_argument("--ransac-thr", type=float, default=4.0)
     args = ap.parse_args(argv)
+
+    overlap = {
+        "enable": args.overlap_split,
+        "min_inlier_ratio": args.min_inlier_ratio,
+        "bridge_max_gap": args.bridge_max_gap,
+        "min_scene_len": args.min_scene_len,
+        "orb_features": args.orb_features,
+        "downscale": args.overlap_downscale,
+        "ransac_thr": args.ransac_thr,
+    }
 
     gt = gt_index(Path(args.gt_flat).expanduser())
     out_dir = Path(args.out_dir).expanduser(); out_dir.mkdir(parents=True, exist_ok=True)
@@ -198,7 +352,7 @@ def main(argv=None) -> int:
         for i, kurl in enumerate(kmz_keys):
             if args.limit and i >= args.limit:
                 break
-            rec = process_kmz(kurl, gt, args.quality_python, q_repo, td, log)
+            rec = process_kmz(kurl, gt, args.quality_python, q_repo, td, log, overlap)
             nsv = sum(len(v.get("sub_videos", [])) for v in rec["videos"])
             ngf = sum(len(s["gt_frames"]) for v in rec["videos"] for s in v.get("sub_videos", []))
             name = f"{rec['city']}_{rec['version']}.json"
