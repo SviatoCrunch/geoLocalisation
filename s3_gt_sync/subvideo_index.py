@@ -332,9 +332,10 @@ def main(argv=None) -> int:
     ap.add_argument("--orb-features", type=int, default=1200)
     ap.add_argument("--overlap-downscale", type=int, default=2, help="downscale frames for ORB speed")
     ap.add_argument("--ransac-thr", type=float, default=4.0)
-    ap.add_argument("--min-ncc", type=float, default=0.9,
-                    help="drop GT-still->frame matches below this NCC (wrong-frame matches "
-                         "that produce impossible interpolation speeds)")
+    ap.add_argument("--min-ncc", type=float, default=0.0,
+                    help="OFF by default (0.0 = keep every match; do NOT drop stills). "
+                         "Mis-associated stills are re-homed by relocate_gt, not discarded. "
+                         "Set >0 only if you explicitly want to drop low-NCC matches.")
     args = ap.parse_args(argv)
 
     overlap = {
