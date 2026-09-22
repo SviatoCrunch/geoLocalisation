@@ -163,38 +163,52 @@ def overlap_ratio(desc_a, kp_a, desc_b, kp_b, matcher, ransac_thr: float) -> flo
 
 
 def link_runs(keep_indices, ratio_of, *, bridge_max_gap: int, min_inlier_ratio: float,
-              min_scene_len: int) -> list[tuple[int, int]]:
-    """Group KEEP frames into continuous-scene runs (pure, testable).
+              min_scene_len: int) -> list[dict]:
+    """Group KEEP frames into continuous-scene runs, recording WHY each run started.
 
-    A boundary is inserted between consecutive KEEP frames when the overlap
-    (``ratio_of(prev, cur)``) drops below ``min_inlier_ratio`` OR the bad-frame gap
-    between them exceeds ``bridge_max_gap`` (a long dropout -> do not bridge). Short
-    bad gaps with sufficient overlap are BRIDGED into one sub-video. Runs shorter
-    than ``min_scene_len`` frames are dropped."""
-    runs: list[tuple[int, int]] = []
+    Each run is a dict: {start, end, boundary, gap_before, overlap_before} where
+      boundary       'first' | 'overlap_cut' | 'long_dropout'
+      gap_before     bad-frame gap before this run (None for the first run)
+      overlap_before inlier ratio at the cut (only for 'overlap_cut')
+
+    A boundary is inserted between consecutive KEEP frames when the bad-frame gap
+    exceeds ``bridge_max_gap`` (long dropout -> not bridged) OR the overlap
+    (``ratio_of``) drops below ``min_inlier_ratio`` (scene cut). Short bad gaps with
+    enough overlap are bridged. Runs shorter than ``min_scene_len`` are dropped."""
+    runs: list[dict] = []
     start = prev = None
+    b_kind, b_gap, b_ov = "first", None, None
     for idx in keep_indices:
         if prev is None:
-            start = idx
+            start, b_kind, b_gap, b_ov = idx, "first", None, None
         else:
             bad_between = idx - prev - 1
-            cont = (bad_between <= bridge_max_gap) and (ratio_of(prev, idx) >= min_inlier_ratio)
-            if not cont:
-                runs.append((start, prev)); start = idx
+            if bad_between > bridge_max_gap:
+                runs.append({"start": start, "end": prev, "boundary": b_kind,
+                             "gap_before": b_gap, "overlap_before": b_ov})
+                start, b_kind, b_gap, b_ov = idx, "long_dropout", bad_between, None
+            else:
+                r = ratio_of(prev, idx)
+                if r < min_inlier_ratio:
+                    runs.append({"start": start, "end": prev, "boundary": b_kind,
+                                 "gap_before": b_gap, "overlap_before": b_ov})
+                    start, b_kind, b_gap, b_ov = idx, "overlap_cut", bad_between, round(r, 3)
+                # else: same continuous run
         prev = idx
     if start is not None:
-        runs.append((start, prev))
-    return [(a, b) for a, b in runs if b - a + 1 >= min_scene_len]
+        runs.append({"start": start, "end": prev, "boundary": b_kind,
+                     "gap_before": b_gap, "overlap_before": b_ov})
+    return [r for r in runs if r["end"] - r["start"] + 1 >= min_scene_len]
 
 
 def split_by_quality_and_overlap(chunk_path, grades: list[str], *, orb_features=1200,
         downscale=2, ransac_thr=4.0, min_inlier_ratio=0.15, bridge_max_gap=8,
-        min_scene_len=6, log=None) -> list[tuple[int, int]]:
+        min_scene_len=6, log=None) -> list[dict]:
     """Sub-videos = continuous-scene runs of KEEP frames.
 
     Cuts a good run at splices (inlier ratio collapses) and bridges short bad-frame
-    dropouts (overlap survives). CPU ORB is cheap at this scale. Returns inclusive
-    (start_frame, end_frame) runs, indexed in the chunk."""
+    dropouts (overlap survives). CPU ORB is cheap at this scale. Returns run dicts
+    {start, end, boundary, gap_before, overlap_before} (see link_runs)."""
     keep = [i for i, g in enumerate(grades) if g in KEEP]
     if not keep:
         return []
@@ -261,8 +275,9 @@ def process_kmz(kmz_url: str, gt: dict, q_python: str, q_repo: Path, td: Path, l
             rec["videos"].append({"video": vurl, "error": str(e)[:300]})
             local.unlink(missing_ok=True)                       # never leave the chunk behind
             continue
-        if overlap and overlap.get("enable", True):
-            subs = split_by_quality_and_overlap(
+        use_overlap = bool(overlap and overlap.get("enable", True))
+        if use_overlap:
+            runs = split_by_quality_and_overlap(
                 local, grades, log=log,
                 orb_features=overlap.get("orb_features", 1200),
                 downscale=overlap.get("downscale", 2),
@@ -271,7 +286,9 @@ def process_kmz(kmz_url: str, gt: dict, q_python: str, q_repo: Path, td: Path, l
                 bridge_max_gap=overlap.get("bridge_max_gap", 8),
                 min_scene_len=overlap.get("min_scene_len", 6))
         else:
-            subs = split_subvideos(grades)
+            runs = [{"start": a, "end": b, "boundary": "bad_frame",
+                     "gap_before": None, "overlap_before": None}
+                    for (a, b) in split_subvideos(grades)]
         # match each GT still -> abs frame index, then locate its sub-video
         matched = {}
         low_ncc = []
@@ -286,13 +303,28 @@ def process_kmz(kmz_url: str, gt: dict, q_python: str, q_repo: Path, td: Path, l
                 continue
             matched[pm.n] = (idx, t_s, ncc, pm)
         vrec = {"video": vurl, "fps": round(fps, 3), "n_frames": len(grades),
-                "bad_frames": bad_frame_ranges(grades),   # index ranges, video untouched
-                "grades_rle": rle_grades(grades),         # full quality structure
+                # how this video was split (BOTH axes recorded, self-describing)
+                "split": {
+                    "method": "quality+overlap" if use_overlap else "quality_only",
+                    "quality_axis": "quality-cls good/usable vs bad",
+                    "continuity_axis": "ORB+RANSAC homography inlier-ratio" if use_overlap else None,
+                    "min_inlier_ratio": overlap.get("min_inlier_ratio", 0.15) if use_overlap else None,
+                    "bridge_max_gap": overlap.get("bridge_max_gap", 8) if use_overlap else None,
+                    "min_scene_len": overlap.get("min_scene_len", 6) if use_overlap else None,
+                },
+                "bad_frames": bad_frame_ranges(grades),   # QUALITY axis: bad index ranges
+                "grades_rle": rle_grades(grades),         # QUALITY axis: full timeline
                 "sub_videos": []}
-        for si, (a, b) in enumerate(subs):
+        for si, r in enumerate(runs):
+            a, b = r["start"], r["end"]
             sv = {"sub_index": si, "start_frame": a, "end_frame": b,
                   "start_s": round(a / fps, 3) if fps else None,
-                  "end_s": round(b / fps, 3) if fps else None, "gt_frames": []}
+                  "end_s": round(b / fps, 3) if fps else None,
+                  # CONTINUITY axis: why this sub-video starts here
+                  "boundary": r["boundary"],            # first|overlap_cut|long_dropout|bad_frame
+                  "gap_before": r["gap_before"],        # bad-frame gap before it
+                  "overlap_before": r["overlap_before"],  # inlier ratio at a scene cut
+                  "gt_frames": []}
             for n, (idx, t_s, ncc, pm) in matched.items():
                 if a <= idx <= b:
                     sv["gt_frames"].append({

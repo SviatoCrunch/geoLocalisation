@@ -25,43 +25,44 @@ def test_bad_frame_ranges():
 
 # ---------------- run linking (the core decision) ----------------
 
+def _se(runs):
+    return [(r["start"], r["end"]) for r in runs]
+
+
 def test_continuous_single_run():
-    keep = [0, 1, 2, 3]
-    runs = link_runs(keep, lambda a, b: 1.0, bridge_max_gap=8,
+    runs = link_runs([0, 1, 2, 3], lambda a, b: 1.0, bridge_max_gap=8,
                      min_inlier_ratio=0.15, min_scene_len=1)
-    assert runs == [(0, 3)]
+    assert _se(runs) == [(0, 3)]
+    assert runs[0]["boundary"] == "first"
 
 
 def test_cut_splits_two_runs():
-    keep = [0, 1, 2, 3]
-    # overlap collapses between frame 1 and 2 (a splice)
-    ratio = {(0, 1): 0.9, (1, 2): 0.02, (2, 3): 0.9}
-    runs = link_runs(keep, lambda a, b: ratio[(a, b)], bridge_max_gap=8,
+    ratio = {(0, 1): 0.9, (1, 2): 0.02, (2, 3): 0.9}         # splice between 1 and 2
+    runs = link_runs([0, 1, 2, 3], lambda a, b: ratio[(a, b)], bridge_max_gap=8,
                      min_inlier_ratio=0.15, min_scene_len=1)
-    assert runs == [(0, 1), (2, 3)]
+    assert _se(runs) == [(0, 1), (2, 3)]
+    assert runs[1]["boundary"] == "overlap_cut" and runs[1]["overlap_before"] == 0.02
+    assert runs[1]["gap_before"] == 0                         # adjacent frames, hard cut
 
 
 def test_bridge_short_bad_gap():
-    # frames 2,3,4 are bad -> keep jumps 1 -> 5; high overlap bridges it
-    keep = [0, 1, 5, 6]
-    runs = link_runs(keep, lambda a, b: 0.8, bridge_max_gap=8,
+    runs = link_runs([0, 1, 5, 6], lambda a, b: 0.8, bridge_max_gap=8,
                      min_inlier_ratio=0.15, min_scene_len=1)
-    assert runs == [(0, 6)]
+    assert _se(runs) == [(0, 6)]                              # bad 2,3,4 bridged
 
 
 def test_long_dropout_not_bridged():
-    keep = [0, 1, 20, 21]  # 18 bad frames between -> exceeds bridge_max_gap
-    runs = link_runs(keep, lambda a, b: 0.9, bridge_max_gap=8,
+    runs = link_runs([0, 1, 20, 21], lambda a, b: 0.9, bridge_max_gap=8,
                      min_inlier_ratio=0.15, min_scene_len=1)
-    assert runs == [(0, 1), (20, 21)]
+    assert _se(runs) == [(0, 1), (20, 21)]
+    assert runs[1]["boundary"] == "long_dropout" and runs[1]["gap_before"] == 18
 
 
 def test_min_scene_len_drops_short():
-    keep = [0, 10, 11, 12]
-    ratio = {(0, 10): 0.02, (10, 11): 0.9, (11, 12): 0.9}  # 0 isolated, 10..12 continuous
-    runs = link_runs(keep, lambda a, b: ratio[(a, b)], bridge_max_gap=100,
+    ratio = {(0, 10): 0.02, (10, 11): 0.9, (11, 12): 0.9}    # 0 isolated, 10..12 continuous
+    runs = link_runs([0, 10, 11, 12], lambda a, b: ratio[(a, b)], bridge_max_gap=100,
                      min_inlier_ratio=0.15, min_scene_len=2)
-    assert runs == [(10, 12)]                                 # (0,0) dropped
+    assert _se(runs) == [(10, 12)]                            # (0,0) dropped
 
 
 # ---------------- overlap_ratio smoke ----------------
