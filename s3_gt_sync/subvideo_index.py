@@ -239,7 +239,7 @@ def _city_ver(kmz_url: str) -> tuple[str, str]:
 
 
 def process_kmz(kmz_url: str, gt: dict, q_python: str, q_repo: Path, td: Path, log,
-                overlap: dict | None = None) -> dict:
+                overlap: dict | None = None, min_ncc: float = 0.0) -> dict:
     city, ver = _city_ver(kmz_url)
     pms = parse_placemarks(extract_kml_bytes(_aws_bytes(kmz_url)))
     by_video: dict = {}
@@ -274,12 +274,16 @@ def process_kmz(kmz_url: str, gt: dict, q_python: str, q_repo: Path, td: Path, l
             subs = split_subvideos(grades)
         # match each GT still -> abs frame index, then locate its sub-video
         matched = {}
+        low_ncc = []
         fps = 30.0
         for pm in pmlist:
             m = match_still(gt[pm.n], local)
             if m is None:
                 continue
             idx, fps, t_s, ncc, _frame, _nfr = m
+            if ncc < min_ncc:                      # wrong-frame match -> do not place it
+                low_ncc.append({"n": pm.n, "ncc": round(ncc, 4), "frame_index_in_chunk": idx})
+                continue
             matched[pm.n] = (idx, t_s, ncc, pm)
         vrec = {"video": vurl, "fps": round(fps, 3), "n_frames": len(grades),
                 "bad_frames": bad_frame_ranges(grades),   # index ranges, video untouched
@@ -301,6 +305,8 @@ def process_kmz(kmz_url: str, gt: dict, q_python: str, q_repo: Path, td: Path, l
         drop = [n for n in matched if n not in in_sub]
         if drop:
             vrec["gt_on_bad_frames"] = sorted(drop)
+        if low_ncc:
+            vrec["gt_low_ncc"] = sorted(low_ncc, key=lambda d: d["n"])
         rec["videos"].append(vrec)
         local.unlink(missing_ok=True)
     return rec
@@ -326,6 +332,9 @@ def main(argv=None) -> int:
     ap.add_argument("--orb-features", type=int, default=1200)
     ap.add_argument("--overlap-downscale", type=int, default=2, help="downscale frames for ORB speed")
     ap.add_argument("--ransac-thr", type=float, default=4.0)
+    ap.add_argument("--min-ncc", type=float, default=0.9,
+                    help="drop GT-still->frame matches below this NCC (wrong-frame matches "
+                         "that produce impossible interpolation speeds)")
     args = ap.parse_args(argv)
 
     overlap = {
@@ -352,7 +361,7 @@ def main(argv=None) -> int:
         for i, kurl in enumerate(kmz_keys):
             if args.limit and i >= args.limit:
                 break
-            rec = process_kmz(kurl, gt, args.quality_python, q_repo, td, log, overlap)
+            rec = process_kmz(kurl, gt, args.quality_python, q_repo, td, log, overlap, args.min_ncc)
             nsv = sum(len(v.get("sub_videos", [])) for v in rec["videos"])
             ngf = sum(len(s["gt_frames"]) for v in rec["videos"] for s in v.get("sub_videos", []))
             name = f"{rec['city']}_{rec['version']}.json"
