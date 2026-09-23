@@ -58,11 +58,19 @@ def test_long_dropout_not_bridged():
     assert runs[1]["boundary"] == "long_dropout" and runs[1]["gap_before"] == 18
 
 
-def test_min_scene_len_drops_short():
+def test_min_scene_len_flags_short_not_dropped():
     ratio = {(0, 10): 0.02, (10, 11): 0.9, (11, 12): 0.9}    # 0 isolated, 10..12 continuous
     runs = link_runs([0, 10, 11, 12], lambda a, b: ratio[(a, b)], bridge_max_gap=100,
                      min_inlier_ratio=0.15, min_scene_len=2)
-    assert _se(runs) == [(10, 12)]                            # (0,0) dropped
+    assert _se(runs) == [(0, 0), (10, 12)]                    # (0,0) KEPT, not dropped
+    assert runs[0]["too_short"] is True                      # 1 frame < min_scene_len 2
+    assert runs[1]["too_short"] is False                     # 3 frames >= 2
+
+
+def test_too_short_flag_all_false_when_min_scene_len_1():
+    runs = link_runs([0, 1, 2, 3], lambda a, b: 1.0, bridge_max_gap=8,
+                     min_inlier_ratio=0.15, min_scene_len=1)
+    assert all(r["too_short"] is False for r in runs)
 
 
 # ---------------- overlap_ratio smoke ----------------

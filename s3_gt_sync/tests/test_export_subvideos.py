@@ -14,6 +14,12 @@ def test_clip_name_missing_boundary_and_pads_index():
         "v__sub00_f0-5_na.mp4"
 
 
+def test_clip_name_flags_too_short():
+    sv = {"sub_index": 2, "start_frame": 40, "end_frame": 42, "boundary": "overlap_cut",
+          "too_short": True}
+    assert clip_name("v", sv) == "v__sub02_f40-42_overlap_cut_short.mp4"
+
+
 def test_build_plan_sorted_by_start():
     rec = {"sub_videos": [
         {"sub_index": 1, "start_frame": 130, "end_frame": 260, "boundary": "overlap_cut"},

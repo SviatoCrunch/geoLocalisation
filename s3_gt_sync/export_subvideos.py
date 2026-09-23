@@ -43,11 +43,13 @@ def _safe(s: str) -> str:
 def clip_name(stem: str, sv: dict) -> str:
     """Sub-video clip filename that MATCHES its parent chunk stem.
 
-    ``<stem>__sub{NN}_f{start}-{end}_{boundary}.mp4`` — shares the chunk stem prefix so
-    clip and full video sort together; frame range/boundary come straight from the JSON."""
+    ``<stem>__sub{NN}_f{start}-{end}_{boundary}[_short].mp4`` — shares the chunk stem
+    prefix so clip and full video sort together; frame range/boundary come straight from
+    the JSON, and ``_short`` is appended for sub-videos flagged ``too_short``."""
+    short = "_short" if sv.get("too_short") else ""
     return (f"{stem}__sub{int(sv['sub_index']):02d}"
             f"_f{sv['start_frame']}-{sv['end_frame']}"
-            f"_{_safe(sv.get('boundary', 'na'))}.mp4")
+            f"_{_safe(sv.get('boundary', 'na'))}{short}.mp4")
 
 
 def build_plan(video_rec: dict, stem: str) -> list[dict]:
