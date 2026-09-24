@@ -89,15 +89,17 @@ def _decode_to_frames(video, frames_dir: Path) -> tuple[int, float, int, int]:
 
 def _run_esrgan(py, repo, in_dir: Path, out_dir: Path, model: str, outscale: int,
                 tile: int, fp32: bool) -> None:
-    cmd = [py, "inference_realesrgan.py", "-n", model, "-i", str(in_dir),
+    cmd = [py, "-u", "inference_realesrgan.py", "-n", model, "-i", str(in_dir),
            "-o", str(out_dir), "--outscale", str(outscale)]
     if tile:
         cmd += ["--tile", str(tile)]
     if fp32:
         cmd += ["--fp32"]
-    p = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True)
+    # stream Real-ESRGAN's own per-frame progress live (do NOT capture) so a long
+    # video isn't a silent black box; -u keeps its stdout unbuffered.
+    p = subprocess.run(cmd, cwd=str(repo))
     if p.returncode != 0:
-        raise RuntimeError(f"Real-ESRGAN failed: {p.stderr[-1500:]}")
+        raise RuntimeError(f"Real-ESRGAN exited {p.returncode} (see output above)")
 
 
 def _encode(frames_dir: Path, dst: Path, fps: float, fourcc: str) -> int:
@@ -121,6 +123,7 @@ def upscale_one(video: Path, root: Path, out_root: Path, py, repo, model, outsca
     if dst.exists():
         log(f"  skip (exists) {rel}")
         return {"video": str(rel), "skipped": True}
+    log(f"  >> {rel}: decoding ...")
     with tempfile.TemporaryDirectory() as _td:
         td = Path(_td)
         fin, fout = td / "in", td / "out"
@@ -131,8 +134,11 @@ def upscale_one(video: Path, root: Path, out_root: Path, py, repo, model, outsca
             log(f"  empty {rel}")
             return {"video": str(rel), "error": "no frames"}
         t1 = time.perf_counter()
+        log(f"     decoded {n} frames {w}x{h} in {round(t1 - t0, 1)}s "
+            f"({fps_of(n, t1 - t0)} fps); Real-ESRGAN x{outscale} ...")
         _run_esrgan(py, repo, fin, fout, model, outscale, tile, fp32)
         t2 = time.perf_counter()
+        log(f"     esrgan done in {round(t2 - t1, 1)}s ({fps_of(n, t2 - t1)} fps); encoding ...")
         nw = _encode(fout, dst, fps, fourcc)
         t3 = time.perf_counter()
     total_s = round(t3 - t0, 2)
@@ -180,8 +186,12 @@ def main(argv=None) -> int:
     ap.add_argument("--fourcc", default="mp4v")
     args = ap.parse_args(argv)
 
+    def log(m):
+        print(m, flush=True)
+
     rep = run(args.root, args.out_root, args.resrgan_python, args.resrgan_repo,
-              args.which, args.model, args.outscale, args.tile, args.fp32, args.fourcc)
+              args.which, args.model, args.outscale, args.tile, args.fp32, args.fourcc,
+              log=log)
     done = [r for r in rep if r.get("written")]
     tot_frames = sum(r["frames"] for r in done)
     tot_esr = sum(r["esrgan_s"] for r in done)
