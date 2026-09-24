@@ -1,0 +1,5 @@
+# Vendored SegProp reference (github.com/vlicaret/segprop, NO upstream license →
+# not redistributed). Fetched locally by fetch.py for parity tests only.
+*.py
+!__init__.py
+!fetch.py
