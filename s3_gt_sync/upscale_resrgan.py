@@ -155,10 +155,12 @@ def upscale_one(video: Path, root: Path, out_root: Path, py, repo, model, outsca
 
 
 def run(root, out_root, py, repo, which="full", model="RealESRGAN_x4plus", outscale=4,
-        tile=0, fp32=False, fourcc="mp4v", log=print) -> list[dict]:
+        tile=0, fp32=False, fourcc="mp4v", limit=0, log=print) -> list[dict]:
     root, out_root = Path(root), Path(out_root)
     repo = Path(repo)
     vids = list_videos(root, which)
+    if limit:
+        vids = vids[:limit]                              # measure on a few clips first
     log(f"[esrgan] {len(vids)} videos ({which}) under {root} -> {out_root}")
     rep = []
     for v in vids:
@@ -184,6 +186,8 @@ def main(argv=None) -> int:
     ap.add_argument("--tile", type=int, default=0, help="tile size to bound VRAM (0=off)")
     ap.add_argument("--fp32", action="store_true", help="full precision (default fp16)")
     ap.add_argument("--fourcc", default="mp4v")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="process only the first N videos (0=all) - for speed measurement")
     args = ap.parse_args(argv)
 
     def log(m):
@@ -191,7 +195,7 @@ def main(argv=None) -> int:
 
     rep = run(args.root, args.out_root, args.resrgan_python, args.resrgan_repo,
               args.which, args.model, args.outscale, args.tile, args.fp32, args.fourcc,
-              log=log)
+              limit=args.limit, log=log)
     done = [r for r in rep if r.get("written")]
     tot_frames = sum(r["frames"] for r in done)
     tot_esr = sum(r["esrgan_s"] for r in done)
