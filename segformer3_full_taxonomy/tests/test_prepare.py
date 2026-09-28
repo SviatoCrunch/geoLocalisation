@@ -6,10 +6,10 @@ from pathlib import Path
 from segformer3_full_taxonomy.tools.prepare_skyscenes import prepare_town
 
 
-def _tar_bytes(members: dict[str, bytes]) -> bytes:
+def _tar_bytes(members: dict[str, bytes], fmt=tarfile.PAX_FORMAT) -> bytes:
     """Build an in-memory tar from {arcname: content}."""
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tf:
+    with tarfile.open(fileobj=buf, mode="w", format=fmt) as tf:
         for name, data in members.items():
             info = tarfile.TarInfo(name)
             info.size = len(data)
@@ -35,6 +35,20 @@ def test_double_tar_flattened(tmp_path):
     assert got == ["007761_clrnoon.png", "007771_clrnoon.png"]
     assert (out / "007761_clrnoon.png").read_bytes() == b"PNGDATA-1"
     assert not (out / "Town01.tar.gz").exists()             # nested tar.gz skipped
+
+
+def test_double_tar_gnu_longlink(tmp_path):
+    # real SkyScenes inner tars use GNU @LongLink for deep (>100 char) paths — the case that
+    # broke the streaming open. File-based open must handle it.
+    deep = "srv/hoffman-lab/flash9/datasets/depth_data/HF_anisha/SkyScenes/Images/H_35_P_0/ClearNoon/Town01"
+    assert len(f"{deep}/007761_clrnoon.png") > 100   # >100 char member name -> GNU @LongLink
+    inner = _tar_bytes({f"{deep}/007761_clrnoon.png": b"REAL", f"{deep}/Town01.tar.gz": b"NESTED"},
+                       fmt=tarfile.GNU_FORMAT)
+    outer = tmp_path / "Town01.tar.gz"
+    outer.write_bytes(_tar_bytes({"007751_clrnoon.png": inner}))
+    n = prepare_town(outer, tmp_path / "out")
+    assert n == 1
+    assert (tmp_path / "out" / "007761_clrnoon.png").read_bytes() == b"REAL"
 
 
 def test_empty_outer_returns_zero(tmp_path):

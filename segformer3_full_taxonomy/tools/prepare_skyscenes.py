@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import tarfile
+import tempfile
 from pathlib import Path
 
 
@@ -36,16 +37,20 @@ def prepare_town(town_targz: Path, out_dir: Path) -> int:
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     n = 0
-    with tarfile.open(town_targz) as outer:
+    with tarfile.open(town_targz) as outer, tempfile.TemporaryDirectory() as td:
         inner_m = _first_png_member(outer)
         if inner_m is None:
             return 0
-        with tarfile.open(fileobj=outer.extractfile(inner_m)) as inner:
+        # Extract the nested tar to a real file first — tarfile reads GNU @LongLink members
+        # (deep long paths) reliably from a seekable file, but not from an extractfile() stream.
+        outer.extract(inner_m, td, filter="data")
+        inner_path = Path(td) / inner_m.name
+        with tarfile.open(inner_path) as inner:
             for m in inner.getmembers():
                 if not (m.isfile() and m.name.endswith(".png")):
                     continue  # skips the nested *.tar.gz
-                data = inner.extractfile(m).read()
-                (out_dir / Path(m.name).name).write_bytes(data)
+                with inner.extractfile(m) as f:
+                    (out_dir / Path(m.name).name).write_bytes(f.read())
                 n += 1
     return n
 
