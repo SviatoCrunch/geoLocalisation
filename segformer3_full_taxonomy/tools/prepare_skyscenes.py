@@ -1,12 +1,13 @@
-"""Un-nest SkyScenes' double-tar into flat per-town dirs (stdlib tarfile, streaming).
+"""Un-nest SkyScenes' double-tar into flat per-town dirs (via system ``tar``).
 
 Each downloaded ``<Town>.tar.gz`` is a *plain* tar whose members are themselves tars, one per
 frame; every nested tar holds the WHOLE town's real PNGs under a deep
-``srv/.../<Town>/<id>.png`` path (plus a redundant nested ``<Town>.tar.gz`` we ignore). So we
-open the outer tar, take ONE nested tar, and write its real PNGs flat to
-``<out>/<kind>/<Town>/<id>.png`` — without materialising the ~2 GB of duplicate nested tars.
+``srv/.../<Town>/<id>.png`` path (plus a redundant nested ``<Town>.tar.gz`` we ignore). Python's
+``tarfile`` cannot read these nested GNU-``@LongLink`` archives, but the system ``tar`` reads
+them fine — so we shell out to ``tar`` for both levels and flatten the real PNGs to
+``<out>/<kind>/<Town>/<id>.png``.
 
-Run ON THE SERVER::
+Run ON THE SERVER (needs ``tar`` on PATH)::
 
     python3 -m segformer3_full_taxonomy.tools.prepare_skyscenes \
         --download-root /home/ubuntu/work/datasets/SkyScenes \
@@ -16,42 +17,37 @@ Run ON THE SERVER::
 from __future__ import annotations
 
 import argparse
-import tarfile
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
-
-
-def _first_png_member(tf: tarfile.TarFile):
-    """The first nested-tar member (a ``<id>.png`` that is really a tar) in an outer town tar."""
-    for m in tf.getmembers():
-        if m.isfile() and m.name.endswith(".png"):
-            return m
-    return None
 
 
 def prepare_town(town_targz: Path, out_dir: Path) -> int:
     """Extract the real PNGs from one SkyScenes double-tar into ``out_dir`` (flat).
 
-    Returns the number of PNGs written. Members ending ``.tar.gz`` (the redundant nested town
-    tar) are skipped; every other ``*.png`` is a real image/mask and is written by basename.
+    Returns the number of PNGs written. Uses ``tar`` twice (outer -> one nested tar -> real
+    PNGs) and flattens; the redundant nested ``<Town>.tar.gz`` is never a ``*.png`` so it is
+    naturally skipped.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    n = 0
-    with tarfile.open(town_targz) as outer, tempfile.TemporaryDirectory() as td:
-        inner_m = _first_png_member(outer)
-        if inner_m is None:
+    listing = subprocess.run(["tar", "tf", str(town_targz)], capture_output=True, text=True).stdout
+    inner_name = next((ln.strip() for ln in listing.splitlines() if ln.strip().endswith(".png")), None)
+    if not inner_name:
+        return 0
+    with tempfile.TemporaryDirectory() as _td:
+        td = Path(_td)
+        subprocess.run(["tar", "xf", str(town_targz), "-C", str(td), inner_name], check=True)
+        inner_path = next(td.rglob("*.png"), None)   # the nested tar (named <id>.png)
+        if inner_path is None:
             return 0
-        # Extract the nested tar to a real file first — tarfile reads GNU @LongLink members
-        # (deep long paths) reliably from a seekable file, but not from an extractfile() stream.
-        outer.extract(inner_m, td, filter="data")
-        inner_path = Path(td) / inner_m.name
-        with tarfile.open(inner_path) as inner:
-            for m in inner.getmembers():
-                if not (m.isfile() and m.name.endswith(".png")):
-                    continue  # skips the nested *.tar.gz
-                with inner.extractfile(m) as f:
-                    (out_dir / Path(m.name).name).write_bytes(f.read())
-                n += 1
+        ext = td / "ext"
+        ext.mkdir()
+        subprocess.run(["tar", "xf", str(inner_path), "-C", str(ext)], check=True)
+        n = 0
+        for p in ext.rglob("*.png"):                 # real PNGs at a deep srv/.../<Town>/ path
+            shutil.move(str(p), str(out_dir / p.name))
+            n += 1
     return n
 
 
