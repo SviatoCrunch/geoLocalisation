@@ -43,16 +43,23 @@ histogram + median-frequency class weights for balanced loss).
 
 ## Training (Stage 2)
 
-Deps (torch env): `torch transformers albumentations opencv-python numpy pillow tqdm`.
+Runs via `uv` overlays (this repo's uv project is CPU-only — torch is added per-run). The
+server driver is CUDA 12.4, so pin a **cu121** wheel; transformers>=5 needs **torch>=2.5**
+and loads via **safetensors** (avoids the torch.load CVE block). Verified working recipe:
 
 ```bash
-# from ~/work/geoLocalisation, in a GPU torch env
-python -m segformer_seg.train \
+# from ~/work/geoLocalisation — TRAIN (GPU)
+uv run --extra-index-url https://download.pytorch.org/whl/cu121 \
+  --with "torch==2.5.1+cu121" --with transformers --with albumentations \
+  python -m segformer_seg.train \
   --manifests /home/ubuntu/work/geoLocalisation/segformer_seg/manifests \
   --out       /home/ubuntu/work/geoLocalisation/segformer_seg/runs/b3_v1 \
   --epochs 120 --batch 8 --lr 6e-5
-# eval the best checkpoint on the test split (+ optional colorized panels)
-python -m segformer_seg.evaluate \
+
+# EVAL best checkpoint on test (+ optional colorized pred|gt panels)
+uv run --extra-index-url https://download.pytorch.org/whl/cu121 \
+  --with "torch==2.5.1+cu121" --with transformers --with albumentations \
+  python -m segformer_seg.evaluate \
   --ckpt      /home/ubuntu/work/geoLocalisation/segformer_seg/runs/b3_v1/best \
   --manifests /home/ubuntu/work/geoLocalisation/segformer_seg/manifests \
   --split test --save-vis /home/ubuntu/work/geoLocalisation/segformer_seg/runs/b3_v1/vis_test
