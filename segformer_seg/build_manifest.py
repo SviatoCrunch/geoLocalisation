@@ -145,9 +145,24 @@ def compose_label(entry: dict) -> np.ndarray:
     return compose_from_coco(anns, cats, size)
 
 
+def _progress(seq, desc: str):
+    """tqdm progress if available; else a dependency-free \\r counter."""
+    seq = list(seq)
+    try:
+        from tqdm import tqdm
+        yield from tqdm(seq, desc=desc, unit="img")
+        return
+    except Exception:
+        n = len(seq)
+        for i, x in enumerate(seq, 1):
+            if i % 20 == 0 or i == n:
+                print(f"\r  {desc}: {i}/{n}", end=("" if i < n else "\n"), flush=True)
+            yield x
+
+
 def pixel_histogram(entries: list[dict]) -> np.ndarray:
     hist = np.zeros(NUM_CLASSES, dtype=np.int64)
-    for e in entries:
+    for e in _progress(entries, "hist"):
         hist += np.bincount(compose_label(e).ravel(), minlength=NUM_CLASSES)
     return hist
 
