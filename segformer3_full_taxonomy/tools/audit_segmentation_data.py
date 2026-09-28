@@ -64,9 +64,9 @@ def _mask_stats(mask_path: Path, fmt: str, hist: Counter, res: Counter) -> None:
     im = Image.open(mask_path)
     res[im.size] += 1  # (W, H)
     if fmt == "rgb":
-        a = np.asarray(im.convert("RGB")).reshape(-1, 3)
-        # pack RGB into one int for fast counting
-        packed = (a[:, 0].astype(np.int64) << 16) | (a[:, 1] << 8) | a[:, 2]
+        a = np.asarray(im.convert("RGB")).reshape(-1, 3).astype(np.int64)
+        # pack RGB into one int for fast counting (int64 so <<8/<<16 don't overflow uint8)
+        packed = (a[:, 0] << 16) | (a[:, 1] << 8) | a[:, 2]
         vals, cnts = np.unique(packed, return_counts=True)
         for v, c in zip(vals.tolist(), cnts.tolist()):
             hist[(v >> 16 & 255, v >> 8 & 255, v & 255)] += c
