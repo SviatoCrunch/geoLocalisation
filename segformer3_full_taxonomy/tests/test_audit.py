@@ -44,7 +44,21 @@ def test_unmatched_image_recorded(tmp_path):
     _save(np.zeros((4, 4), np.uint8), mkd / "other.png")
     rep = audit_single(sorted(imgd.glob("*.png")), sorted(mkd.glob("*.png")), "index", do_hist=True)
     assert rep["unmatched_images"]["count"] == 1
-    assert "lonely.png" in rep["unmatched_images"]["sample"]
+    assert "lonely" in rep["unmatched_images"]["sample"]   # keys are stems
+
+
+def test_pair_key_matches_skyscenes_style_ids(tmp_path):
+    # image 008261_clrnoon.png  <->  mask 008261_semsegCarla_clrnoon.png  via (\d+)
+    imgd, mkd = tmp_path / "Images", tmp_path / "Segment"
+    imgd.mkdir(); mkd.mkdir()
+    for i in ("008261", "008271"):
+        _save((np.random.rand(6, 6, 3) * 255).astype(np.uint8), imgd / f"{i}_clrnoon.png")
+        m = np.full((6, 6), 7, np.uint8); m[:2] = 24     # ids 7 and 24 (e.g. road/rail)
+        _save(m, mkd / f"{i}_semsegCarla_clrnoon.png")
+    rep = audit_single(sorted(imgd.glob("*.png")), sorted(mkd.glob("*.png")), "auto",
+                       do_hist=True, pair_key=r"(\d+)")
+    assert rep["paired"] == 2 and rep["unmatched_images"]["count"] == 0
+    assert set(rep["class_pixel_counts"]) == {"7", "24"}
 
 
 def test_per_class_binary_latlon_keying(tmp_path):

@@ -13,16 +13,18 @@ sources:
       root: /home/ubuntu/work/gt_cramatorsc/GT_flat_mask   # <lat>_<lon>__<Class>.png
     key: latlon
 
-  # ---- SkyScenes (fill after download; verify mask format is index vs rgb) ----
-  - name: skyscenes
+  # ---- SkyScenes H_35_P_0/ClearNoon (after `tar xf` into extracted/) ----
+  # image 008261_clrnoon.png  <->  mask 008261_semsegCarla_clrnoon.png  → pair by (\d+)
+  - name: skyscenes_H35_P0_ClearNoon
     mode: single
     images:
-      root: /home/ubuntu/work/datasets/SkyScenes/Images
+      root: /home/ubuntu/work/datasets/SkyScenes/extracted/Images
       glob: "**/*.png"
     masks:
-      root: /home/ubuntu/work/datasets/SkyScenes/Segment
+      root: /home/ubuntu/work/datasets/SkyScenes/extracted/Segment
       glob: "**/*.png"
-      format: auto        # auto-detect index (grayscale IDs) vs rgb (palette)
-    limit: 200            # sample for a fast first pass; set 0 for full audit
+      format: auto          # auto-detect index (grayscale IDs) vs rgb (palette)
+      pair_key: '(\d+)'     # shared numeric frame id
+    limit: 0
 
   # ---- FlyAwareV2 / Mid-Air: add analogous blocks once downloaded ----

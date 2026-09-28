@@ -79,32 +79,39 @@ def _mask_stats(mask_path: Path, fmt: str, hist: Counter, res: Counter) -> None:
 
 # ------------------------------- source audits -------------------------------
 
-def audit_single(images: list[Path], masks: list[Path], fmt: str, do_hist: bool) -> dict:
-    """One label mask per image, paired by filename stem."""
-    from PIL import Image  # noqa: F401 (import guarded so tests import cleanly)
+def _pair_key(p: Path, pair_key: str | None) -> str:
+    """Pairing key for an image/mask file. ``pair_key`` = regex whose group 1 is the shared id
+    (e.g. ``(\\d+)`` pairs SkyScenes ``008261_clrnoon.png`` with ``008261_semsegCarla…png``).
+    None -> the filename stem."""
+    if pair_key:
+        m = re.search(pair_key, p.name)
+        return m.group(1) if m else p.stem
+    return p.stem
 
-    by_stem = {m.stem: m for m in masks}
-    hist: Counter = Counter()
-    res: Counter = Counter()
-    matched, corrupt, empty, unmatched_img = 0, [], [], []
+
+def audit_single(images: list[Path], masks: list[Path], fmt: str, do_hist: bool,
+                 pair_key: str | None = None) -> dict:
+    """One label mask per image. The palette histogram is scanned over ALL masks (independent
+    of pairing); pairing (image<->mask) is a separate set match on ``pair_key``."""
     if fmt == "auto" and masks:
         fmt = _detect_format(masks[0])
-    for img in images:
-        m = by_stem.get(img.stem)
-        if m is None:
-            unmatched_img.append(img.name); continue
-        try:
-            if do_hist:
+    hist: Counter = Counter()
+    res: Counter = Counter()
+    corrupt, empty = [], []
+    if do_hist:
+        for m in masks:
+            try:
                 before = sum(hist.values())
                 _mask_stats(m, fmt, hist, res)
                 if sum(hist.values()) == before:
                     empty.append(m.name)
-            matched += 1
-        except Exception as e:  # noqa: BLE001 — a corrupt file must be recorded, not fatal
-            corrupt.append({"file": m.name, "error": str(e)[:200]})
-    unmatched_mask = sorted(set(by_stem) - {i.stem for i in images})
+            except Exception as e:  # noqa: BLE001 — record corrupt, keep going
+                corrupt.append({"file": m.name, "error": str(e)[:200]})
+    img_keys = {_pair_key(i, pair_key) for i in images}
+    msk_keys = {_pair_key(m, pair_key) for m in masks}
+    matched = len(img_keys & msk_keys)
     return _summ("single", fmt, images, masks, matched, hist, res,
-                 unmatched_img, unmatched_mask, corrupt, empty)
+                 sorted(img_keys - msk_keys), sorted(msk_keys - img_keys), corrupt, empty)
 
 
 def audit_per_class_binary(images: list[Path], mask_root: str, key: str, do_hist: bool) -> dict:
@@ -188,7 +195,8 @@ def run_source(cfg: dict, do_hist: bool) -> dict:
         rec["sha256_images"] = _sha256_of_names(images, cfg["images"]["root"])
     else:
         masks = _find(cfg["masks"]["root"], cfg["masks"].get("glob", "*"))
-        rec = audit_single(images, masks, cfg["masks"].get("format", "auto"), do_hist)
+        rec = audit_single(images, masks, cfg["masks"].get("format", "auto"), do_hist,
+                           pair_key=cfg["masks"].get("pair_key"))
         rec["sha256_images"] = _sha256_of_names(images, cfg["images"]["root"])
         rec["sha256_masks"] = _sha256_of_names(masks, cfg["masks"]["root"])
     rec["name"] = name
