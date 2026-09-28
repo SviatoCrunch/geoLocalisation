@@ -1,0 +1,29 @@
+# SkyScenes / CARLA semantic palette — 23 classes.
+# Order (id) = SkyScenes.py `_CATEGORIES` (verified from the downloaded loader script).
+# RGB = CARLA/CityScapes standard palette; to be CROSS-CHECKED against the audit's real mask
+# colours before the master taxonomy is locked (do not trust the RGB blindly).
+# Targets for external validation: road(7), railtrack(16), water(21). sky(13) = ignored there.
+classes:
+  - {id: 0,  name: unlabeled,    rgb: [0, 0, 0]}
+  - {id: 1,  name: building,     rgb: [70, 70, 70]}
+  - {id: 2,  name: fence,        rgb: [100, 40, 40]}
+  - {id: 3,  name: other,        rgb: [55, 90, 80]}
+  - {id: 4,  name: pedestrian,   rgb: [220, 20, 60]}
+  - {id: 5,  name: pole,         rgb: [153, 153, 153]}
+  - {id: 6,  name: roadline,     rgb: [157, 234, 50]}
+  - {id: 7,  name: road,         rgb: [128, 64, 128]}
+  - {id: 8,  name: sidewalk,     rgb: [244, 35, 232]}
+  - {id: 9,  name: vegetation,   rgb: [107, 142, 35]}
+  - {id: 10, name: vehicles,     rgb: [0, 0, 142]}
+  - {id: 11, name: wall,         rgb: [102, 102, 156]}
+  - {id: 12, name: trafficsign,  rgb: [220, 220, 0]}
+  - {id: 13, name: sky,          rgb: [70, 130, 180]}
+  - {id: 14, name: ground,       rgb: [81, 0, 81]}
+  - {id: 15, name: bridge,       rgb: [150, 100, 100]}
+  - {id: 16, name: railtrack,    rgb: [230, 150, 140]}
+  - {id: 17, name: guardrail,    rgb: [180, 165, 180]}
+  - {id: 18, name: trafficlight, rgb: [250, 170, 30]}
+  - {id: 19, name: static,       rgb: [110, 190, 160]}
+  - {id: 20, name: dynamic,      rgb: [170, 120, 50]}
+  - {id: 21, name: water,        rgb: [45, 60, 150]}
+  - {id: 22, name: terrain,      rgb: [145, 170, 100]}

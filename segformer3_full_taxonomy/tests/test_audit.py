@@ -47,6 +47,22 @@ def test_unmatched_image_recorded(tmp_path):
     assert "lonely" in rep["unmatched_images"]["sample"]   # keys are stems
 
 
+def test_rgb_palette_maps_colors_to_class_names(tmp_path):
+    mkd = tmp_path / "m"; imgd = tmp_path / "i"
+    mkd.mkdir(); imgd.mkdir()
+    _save((np.random.rand(4, 4, 3) * 255).astype(np.uint8), imgd / "1_x.png")
+    rgb = np.zeros((4, 4, 3), np.uint8)
+    rgb[:2] = (128, 64, 128)    # road
+    rgb[2:] = (45, 60, 150)     # water
+    _save(rgb, mkd / "1_semseg.png")
+    palette = {(128, 64, 128): "road", (45, 60, 150): "water"}
+    rep = audit_single(sorted(imgd.glob("*.png")), sorted(mkd.glob("*.png")), "rgb",
+                       do_hist=True, pair_key=r"(\d+)", palette=palette)
+    assert set(rep["class_pixel_counts"]) == {"road", "water"}
+    assert rep["class_pixel_counts"]["road"] == 8
+    assert "unknown_colors" not in rep or not rep["unknown_colors"]
+
+
 def test_pair_key_matches_skyscenes_style_ids(tmp_path):
     # image 008261_clrnoon.png  <->  mask 008261_semsegCarla_clrnoon.png  via (\d+)
     imgd, mkd = tmp_path / "Images", tmp_path / "Segment"

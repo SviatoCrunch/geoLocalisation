@@ -90,9 +90,10 @@ def _pair_key(p: Path, pair_key: str | None) -> str:
 
 
 def audit_single(images: list[Path], masks: list[Path], fmt: str, do_hist: bool,
-                 pair_key: str | None = None) -> dict:
+                 pair_key: str | None = None, palette: dict | None = None) -> dict:
     """One label mask per image. The palette histogram is scanned over ALL masks (independent
-    of pairing); pairing (image<->mask) is a separate set match on ``pair_key``."""
+    of pairing); pairing (image<->mask) is a separate set match on ``pair_key``. If ``palette``
+    ({(r,g,b): name}) is given for an rgb mask, pixel counts are reported per class name."""
     if fmt == "auto" and masks:
         fmt = _detect_format(masks[0])
     hist: Counter = Counter()
@@ -111,7 +112,8 @@ def audit_single(images: list[Path], masks: list[Path], fmt: str, do_hist: bool,
     msk_keys = {_pair_key(m, pair_key) for m in masks}
     matched = len(img_keys & msk_keys)
     return _summ("single", fmt, images, masks, matched, hist, res,
-                 sorted(img_keys - msk_keys), sorted(msk_keys - img_keys), corrupt, empty)
+                 sorted(img_keys - msk_keys), sorted(msk_keys - img_keys), corrupt, empty,
+                 palette=palette)
 
 
 def audit_per_class_binary(images: list[Path], mask_root: str, key: str, do_hist: bool) -> dict:
@@ -166,8 +168,23 @@ def audit_per_class_binary(images: list[Path], mask_root: str, key: str, do_hist
     }
 
 
-def _summ(mode, fmt, images, masks, matched, hist, res, un_img, un_mask, corrupt, empty) -> dict:
-    if all(isinstance(k, tuple) for k in hist):     # rgb
+def _summ(mode, fmt, images, masks, matched, hist, res, un_img, un_mask, corrupt, empty,
+          palette=None) -> dict:
+    is_rgb = bool(hist) and all(isinstance(k, tuple) for k in hist)
+    extra: dict = {}
+    if is_rgb and palette:                          # map RGB colours -> class names
+        by_name: Counter = Counter()
+        unknown: dict = {}
+        for color, px in hist.items():
+            name = palette.get(color)
+            if name:
+                by_name[name] += px
+            else:
+                unknown[f"rgb{color}"] = px
+        classes = dict(by_name.most_common())
+        if unknown:
+            extra["unknown_colors"] = dict(sorted(unknown.items(), key=lambda kv: -kv[1])[:20])
+    elif is_rgb:
         classes = {f"rgb{k}": n for k, n in hist.most_common()}
     else:
         classes = {str(k): n for k, n in sorted(hist.items())}
@@ -178,11 +195,25 @@ def _summ(mode, fmt, images, masks, matched, hist, res, un_img, un_mask, corrupt
         "resolutions": {f"{w}x{h}": n for (w, h), n in res.most_common()},
         "unmatched_images": {"count": len(un_img), "sample": un_img[:20]},
         "unmatched_masks": {"count": len(un_mask), "sample": list(un_mask)[:20]},
-        "corrupt": corrupt, "empty_masks": empty[:50],
+        "corrupt": corrupt, "empty_masks": empty[:50], **extra,
     }
 
 
 # ------------------------------- runner -------------------------------
+
+def _load_palette(spec) -> dict | None:
+    """Palette spec -> {(r,g,b): name}. ``spec`` = path to a YAML/JSON with
+    ``classes: [{name, rgb:[r,g,b]}, ...]`` (or an inline list of the same)."""
+    if not spec:
+        return None
+    if isinstance(spec, str):
+        text = Path(spec).expanduser().read_text(encoding="utf-8")
+        data = json.loads(text) if spec.endswith(".json") else __import__("yaml").safe_load(text)
+    else:
+        data = spec
+    classes = data["classes"] if isinstance(data, dict) else data
+    return {tuple(c["rgb"]): c["name"] for c in classes}
+
 
 def run_source(cfg: dict, do_hist: bool) -> dict:
     name = cfg["name"]
@@ -196,7 +227,8 @@ def run_source(cfg: dict, do_hist: bool) -> dict:
     else:
         masks = _find(cfg["masks"]["root"], cfg["masks"].get("glob", "*"))
         rec = audit_single(images, masks, cfg["masks"].get("format", "auto"), do_hist,
-                           pair_key=cfg["masks"].get("pair_key"))
+                           pair_key=cfg["masks"].get("pair_key"),
+                           palette=_load_palette(cfg["masks"].get("palette")))
         rec["sha256_images"] = _sha256_of_names(images, cfg["images"]["root"])
         rec["sha256_masks"] = _sha256_of_names(masks, cfg["masks"]["root"])
     rec["name"] = name

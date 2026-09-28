@@ -13,18 +13,20 @@ sources:
       root: /home/ubuntu/work/gt_cramatorsc/GT_flat_mask   # <lat>_<lon>__<Class>.png
     key: latlon
 
-  # ---- SkyScenes H_35_P_0/ClearNoon (after `tar xf` into extracted/) ----
+  # ---- SkyScenes H_35_P_0/ClearNoon (after prepare_skyscenes -> prepared/.../{Images,Segment}) ----
   # image 008261_clrnoon.png  <->  mask 008261_semsegCarla_clrnoon.png  → pair by (\d+)
+  # masks are RGB(A) CARLA-palette colour maps → palette maps colour -> class name
   - name: skyscenes_H35_P0_ClearNoon
     mode: single
     images:
-      root: /home/ubuntu/work/datasets/SkyScenes/extracted/Images
+      root: /home/ubuntu/work/datasets/SkyScenes/prepared/H_35_P_0_ClearNoon/Images
       glob: "**/*.png"
     masks:
-      root: /home/ubuntu/work/datasets/SkyScenes/extracted/Segment
+      root: /home/ubuntu/work/datasets/SkyScenes/prepared/H_35_P_0_ClearNoon/Segment
       glob: "**/*.png"
-      format: auto          # auto-detect index (grayscale IDs) vs rgb (palette)
-      pair_key: '(\d+)'     # shared numeric frame id
+      format: rgb
+      pair_key: '(\d+)'
+      palette: segformer3_full_taxonomy/configs/full_taxonomy/carla_palette.yaml
     limit: 0
 
   # ---- FlyAwareV2 / Mid-Air: add analogous blocks once downloaded ----
