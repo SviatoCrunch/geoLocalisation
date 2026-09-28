@@ -36,9 +36,12 @@ def build_model(model_name: str):
     from transformers import SegformerForSemanticSegmentation
 
     id2label = {i: c for i, c in enumerate(CLASSES)}
+    # use_safetensors: load model.safetensors, not pytorch_model.bin — avoids torch.load,
+    # which transformers>=5 blocks under torch<2.6 (CVE-2025-32434).
     return SegformerForSemanticSegmentation.from_pretrained(
         model_name, num_labels=NUM_CLASSES, id2label=id2label,
-        label2id={c: i for i, c in enumerate(CLASSES)}, ignore_mismatched_sizes=True)
+        label2id={c: i for i, c in enumerate(CLASSES)}, ignore_mismatched_sizes=True,
+        use_safetensors=True)
 
 
 def _logits_to_label(logits: torch.Tensor, size) -> torch.Tensor:
