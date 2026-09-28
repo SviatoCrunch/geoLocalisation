@@ -41,11 +41,36 @@ python3 -m segformer_seg.build_manifest \
 Outputs: `manifest_{train,val,test}.jsonl`, `build_report.json` (incl. train pixel
 histogram + median-frequency class weights for balanced loss).
 
+## Training (Stage 2)
+
+Deps (torch env): `torch transformers albumentations opencv-python numpy pillow tqdm`.
+
+```bash
+# from ~/work/geoLocalisation, in a GPU torch env
+python -m segformer_seg.train \
+  --manifests /home/ubuntu/work/geoLocalisation/segformer_seg/manifests \
+  --out       /home/ubuntu/work/geoLocalisation/segformer_seg/runs/b3_v1 \
+  --epochs 120 --batch 8 --lr 6e-5
+# eval the best checkpoint on the test split (+ optional colorized panels)
+python -m segformer_seg.evaluate \
+  --ckpt      /home/ubuntu/work/geoLocalisation/segformer_seg/runs/b3_v1/best \
+  --manifests /home/ubuntu/work/geoLocalisation/segformer_seg/manifests \
+  --split test --save-vis /home/ubuntu/work/geoLocalisation/segformer_seg/runs/b3_v1/vis_test
+```
+
+Balance handling (all knobs on `train.py`): median-freq **weighted-CE + Dice** loss
+(`--weight-scheme`, `--weight-clip`, `--dice-w`), **rare-class oversampling**
+(`--rare-boost`, boosts frames with bridge/tower/water/railway), 512² multi-scale crops,
+AMP, poly LR. `--background-mode ignore` drops the background class from supervision.
+
 ## Status
-- **Stage 1 (this):** taxonomy/config, label-map composition (`label_maps.py`), manifest
-  builder, unit tests. Run `build_manifest` on the server and check `build_report.json`.
-- **Stage 2 (next):** `dataset.py` (on-the-fly label compose + augmentation), `class_weights.py`,
-  `train.py` (HF `SegformerForSemanticSegmentation`, `nvidia/mit-b3`), `evaluate.py` (mIoU).
+- **Stage 1:** taxonomy/config, label-map composition, manifest builder — DONE, verified on
+  server (367 imgs: 301 server + 66 COCO; train/val/test = 293/37/37; pixel hist in
+  `build_report.json`). Severe imbalance: bg 76% … tower 0.04%.
+- **Stage 2:** `dataset.py` (compose + augment), `class_weights.py`, `losses.py` (CE+Dice),
+  `metrics.py` (mIoU), `train.py` (`nvidia/mit-b3`), `evaluate.py` — code + unit/smoke tests
+  GREEN locally. Model forward not smoke-tested on this dev box (transformers import blocked
+  by a local DLL policy); runs on the server torch env.
 
 ## Tests
 ```bash
