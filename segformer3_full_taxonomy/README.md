@@ -11,9 +11,18 @@ keeps Kramatorsk `GT_flat_mask` as an **external validation set only**.
   - `SkyScenes` (MIT, HF `hoffman-lab/SkyScenes`) — E1, has railtrack/bridge/water/road/building.
   - `FlyAwareV2` (open, SynDrone/CARLA lineage) — E2. Synthetic part is ~290 GB → subset.
   - `Mid-Air` (open, 14-class rural forward-view, has "Train Track") — E4 partial-label only.
-- **External validation:** `gt_cramatorsc/GT_flat_mask` (per-class binary PNGs, keyed by
-  `<lat>_<lon>`). NEVER used for train / aug / split / class-weights / pseudo-labels. Scored
-  only on **railway, road, water**; a target class absent from all of GT → N/A, not IoU 0.
+- **Data roles (LOCKED by user):**
+  - **train** = downloaded source datasets (train split).
+  - **validation** (checkpoint selection / early-stop) = downloaded source datasets, held-out
+    **town/scene** split. GT_flat_mask is NOT used for validation/early-stopping.
+  - **test / external** = `gt_cramatorsc/GT_flat_mask` **ONLY** (per-class binary PNGs keyed by
+    `<lat>_<lon>`). NEVER used for train / aug / split / class-weights / pseudo-labels; scored
+    ONCE at the end, only on **railway, road, water** (absent target class → N/A, not IoU 0).
+  - **NOT USED at all** (user's newly-added data): `gt_cramatorsc/new_coco/`
+    (`segment_additional_data.v1i.coco`) and `covered_gt.csv`.
+- **External-test audit (verified):** 311 image+mask pairs @640×480; targets present —
+  Road 215 / Water 50 / Railways 42 imgs (all three → no N/A); `building` absent → N/A;
+  12 stills without mask + 113 orphan uuid masks excluded (logged).
 - **Hardware:** Tesla T4 15 GB, CUDA 12.4 driver. SegFormer-B3 @512² batch 8 AMP fits.
 
 ## Blocking now
