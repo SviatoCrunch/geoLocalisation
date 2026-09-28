@@ -25,6 +25,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .dataset import SkyScenesDataset, town_split
+from .external import evaluate_external, external_pairs
 from .losses import CombinedLoss
 from .metrics import ConfusionMatrix
 from .taxonomy import CLASSES, NUM_CLASSES
@@ -67,6 +68,9 @@ def main(argv=None) -> int:
     ap.add_argument("--warmup-frac", type=float, default=0.05)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--dice-w", type=float, default=1.0)
+    ap.add_argument("--external-root", default=None,
+                    help="gt_cramatorsc root -> monitor road/railtrack/water on GT_flat_mask "
+                         "each epoch (NOT used for checkpoint selection)")
     ap.add_argument("--max-train-samples", type=int, default=0, help="cap train set (smoke/tiny)")
     ap.add_argument("--overfit", action="store_true", help="validate on the (tiny) train set")
     ap.add_argument("--resume", default=None, help="path to last.pt to resume")
@@ -83,7 +87,9 @@ def main(argv=None) -> int:
         tr_pairs = tr_pairs[:args.max_train_samples]
     if args.overfit:
         va_pairs = tr_pairs
-    print(f"[data] train {len(tr_pairs)} | val {len(va_pairs)} | val_towns {args.val_towns}", flush=True)
+    ext_pairs = external_pairs(args.external_root) if args.external_root else []
+    print(f"[data] train {len(tr_pairs)} | val {len(va_pairs)} | val_towns {args.val_towns}"
+          f" | external {len(ext_pairs)}", flush=True)
 
     tr = DataLoader(SkyScenesDataset(tr_pairs, True, args.crop), batch_size=args.batch, shuffle=True,
                     num_workers=args.workers, pin_memory=True, drop_last=len(tr_pairs) > args.batch)
@@ -126,9 +132,15 @@ def main(argv=None) -> int:
             run += loss.item() * args.grad_accum
         m = evaluate(model, va, device)
         row = {"epoch": ep, "train_loss": run / max(1, len(tr)), "lr": sched.get_last_lr()[0], **m}
+        ext_str = ""
+        if ext_pairs:
+            ext = evaluate_external(model, ext_pairs, device, args.crop)
+            row["external"] = ext
+            ext_str = (" | EXT[road:{road} rail:{railtrack} water:{water} macro:{macro_target}]"
+                       .format(**{k: ("—" if v is None else f"{v:.3f}") for k, v in ext.items()}))
         hist.append(row)
         top = ", ".join(f"{k}:{v:.2f}" for k, v in m["per_class_iou"].items() if v is not None and v > 0.05)
-        print(f"[ep {ep:3d}] loss {row['train_loss']:.4f} | val mIoU {m['mIoU']:.4f} | {top}", flush=True)
+        print(f"[ep {ep:3d}] loss {row['train_loss']:.4f} | val mIoU {m['mIoU']:.4f} | {top}{ext_str}", flush=True)
         torch.save({"model": model.state_dict(), "optim": optim.state_dict(), "sched": sched.state_dict(),
                     "scaler": scaler.state_dict(), "epoch": ep, "best_miou": best_miou}, out / "last.pt")
         if m["mIoU"] > best_miou:
