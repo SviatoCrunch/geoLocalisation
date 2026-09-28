@@ -118,7 +118,8 @@ def main(argv=None) -> int:
         return max(0.0, (1 - (it - warmup) / max(1, total_iters - warmup)))
 
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_at)
-    scaler = torch.cuda.amp.GradScaler(enabled=not args.no_amp and device == "cuda")
+    amp_on = (not args.no_amp) and device == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_on)
 
     best_miou, hist = -1.0, []
     it = 0
@@ -129,7 +130,7 @@ def main(argv=None) -> int:
             pv = batch["pixel_values"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
             optim.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=not args.no_amp and device == "cuda"):
+            with torch.amp.autocast("cuda", enabled=amp_on):
                 logits = _logits_to_label(model(pixel_values=pv).logits, labels.shape[-2:])
                 loss = criterion(logits, labels)
             scaler.scale(loss).backward()
