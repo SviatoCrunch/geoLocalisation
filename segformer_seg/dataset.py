@@ -23,7 +23,7 @@ from .config import IGNORE_INDEX
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-RARE_CLASSES = {"bridge", "tower", "water", "railway"}  # for the oversampling sampler
+RARE_CLASSES = {"bridge", "water", "railway"}  # for the oversampling sampler
 
 
 def read_manifest(path: str | Path) -> list[dict]:

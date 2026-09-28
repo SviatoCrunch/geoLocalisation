@@ -14,8 +14,10 @@ them.
 """
 from __future__ import annotations
 
-# canonical id order — index == class id used in every label map
-CLASSES: list[str] = ["background", "bridge", "railway", "road", "sky", "tower", "water"]
+# canonical id order — index == class id used in every label map.
+# ``tower`` was dropped: at ~0.038% of pixels (34k) its val IoU stayed ~0.06 and only
+# dragged mIoU down — its pixels now fall to background.
+CLASSES: list[str] = ["background", "bridge", "railway", "road", "sky", "water"]
 CLASS_TO_ID: dict[str, int] = {c: i for i, c in enumerate(CLASSES)}
 NUM_CLASSES = len(CLASSES)
 BACKGROUND_ID = 0
@@ -31,7 +33,7 @@ NAME_ALIASES: dict[str, str | None] = {
     "sky": "sky",
     "water": "water",
     "bridge": "bridge",
-    "tower": "tower",
+    "tower": None,      # dropped — too rare (~0.04% px, IoU stuck ~0.06)
     "building": None,   # server LS only — dropped
     "target": None,     # server LS only — dropped
 }
@@ -39,7 +41,7 @@ NAME_ALIASES: dict[str, str | None] = {
 # Paint order for overlap resolution: painted low -> high, so classes LATER in this list
 # win where two masks cover the same pixel. Thin/structural classes (railway, bridge,
 # tower) sit on top of large area classes (sky, water, road); background is the base.
-PAINT_ORDER: list[str] = ["sky", "water", "road", "railway", "bridge", "tower"]
+PAINT_ORDER: list[str] = ["sky", "water", "road", "railway", "bridge"]
 
 # RGB palette for QC visualisations (index == class id).
 PALETTE: list[tuple[int, int, int]] = [
@@ -48,7 +50,6 @@ PALETTE: list[tuple[int, int, int]] = [
     (128, 0, 128),    # railway
     (128, 64, 0),     # road
     (135, 206, 235),  # sky
-    (255, 0, 0),      # tower
     (0, 0, 255),      # water
 ]
 

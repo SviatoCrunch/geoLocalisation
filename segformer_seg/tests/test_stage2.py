@@ -9,17 +9,18 @@ from segformer_seg.metrics import ConfusionMatrix
 
 
 def test_median_freq_weights_lift_rare_and_clip():
-    # background huge, tower tiny -> tower weight high, background low, clipped at 15
-    counts = [68_000_000, 56_000, 1_130_000, 2_920_000, 17_000_000, 34_000, 320_000]
+    # background huge, bridge tiny -> bridge weight high, background low, clipped at 15
+    # order: background, bridge, railway, road, sky, water
+    counts = [68_000_000, 56_000, 1_130_000, 2_920_000, 17_000_000, 320_000]
     w = compute_weights(counts, scheme="median", clip=15.0)
     assert w[CLASSES.index("background")] < 0.1
-    assert w[CLASSES.index("tower")] == 15.0            # clipped
+    assert w[CLASSES.index("bridge")] == 15.0           # clipped (rarest)
     assert w[CLASSES.index("water")] > w[CLASSES.index("road")]
     assert len(w) == NUM_CLASSES
 
 
 def test_weights_ignore_background():
-    counts = [10, 1, 1, 1, 1, 1, 1]
+    counts = [10] + [1] * (NUM_CLASSES - 1)
     w = compute_weights(counts, ignore_background=True)
     assert w[0] == 0.0
 
