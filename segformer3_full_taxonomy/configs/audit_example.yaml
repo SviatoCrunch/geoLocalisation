@@ -1,0 +1,28 @@
+# Audit config — paths are PLACEHOLDERS. Fill real dirs after download; do NOT invent them.
+# Run: python3 -m segformer3_full_taxonomy.tools.audit_segmentation_data --config <this file>
+out_dir: /home/ubuntu/work/out/segformer3_full_taxonomy/audit
+
+sources:
+  # ---- external validation (already on server) — can be audited NOW ----
+  - name: external_val_kramatorsk
+    mode: per_class_binary
+    images:
+      root: /home/ubuntu/work/gt_cramatorsc/GT_flat
+      glob: "*.jpg"
+    masks:
+      root: /home/ubuntu/work/gt_cramatorsc/GT_flat_mask   # <lat>_<lon>__<Class>.png
+    key: latlon
+
+  # ---- SkyScenes (fill after download; verify mask format is index vs rgb) ----
+  - name: skyscenes
+    mode: single
+    images:
+      root: /home/ubuntu/work/datasets/SkyScenes/Images
+      glob: "**/*.png"
+    masks:
+      root: /home/ubuntu/work/datasets/SkyScenes/Segment
+      glob: "**/*.png"
+      format: auto        # auto-detect index (grayscale IDs) vs rgb (palette)
+    limit: 200            # sample for a fast first pass; set 0 for full audit
+
+  # ---- FlyAwareV2 / Mid-Air: add analogous blocks once downloaded ----
