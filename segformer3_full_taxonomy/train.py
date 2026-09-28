@@ -70,7 +70,9 @@ def main(argv=None) -> int:
     ap.add_argument("--dice-w", type=float, default=1.0)
     ap.add_argument("--external-root", default=None,
                     help="gt_cramatorsc root -> monitor road/railtrack/water on GT_flat_mask "
-                         "each epoch (NOT used for checkpoint selection)")
+                         "(NOT used for checkpoint selection)")
+    ap.add_argument("--external-every", type=int, default=1,
+                    help="run the external monitor every N epochs (and on the last) to cut overhead")
     ap.add_argument("--max-train-samples", type=int, default=0, help="cap train set (smoke/tiny)")
     ap.add_argument("--overfit", action="store_true", help="validate on the (tiny) train set")
     ap.add_argument("--resume", default=None, help="path to last.pt to resume")
@@ -133,7 +135,7 @@ def main(argv=None) -> int:
         m = evaluate(model, va, device)
         row = {"epoch": ep, "train_loss": run / max(1, len(tr)), "lr": sched.get_last_lr()[0], **m}
         ext_str = ""
-        if ext_pairs:
+        if ext_pairs and (ep % args.external_every == 0 or ep == args.epochs - 1):
             ext = evaluate_external(model, ext_pairs, device, args.crop)
             row["external"] = ext
             ext_str = (" | EXT[road:{road} rail:{railtrack} water:{water} macro:{macro_target}]"
