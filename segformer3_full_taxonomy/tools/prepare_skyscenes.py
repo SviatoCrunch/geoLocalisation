@@ -1,11 +1,9 @@
-"""Un-nest SkyScenes' double-tar into flat per-town dirs (via system ``tar``).
+"""Flatten SkyScenes per-town tarballs into clean ``<out>/<kind>/<Town>/<id>.png`` dirs.
 
-Each downloaded ``<Town>.tar.gz`` is a *plain* tar whose members are themselves tars, one per
-frame; every nested tar holds the WHOLE town's real PNGs under a deep
-``srv/.../<Town>/<id>.png`` path (plus a redundant nested ``<Town>.tar.gz`` we ignore). Python's
-``tarfile`` cannot read these nested GNU-``@LongLink`` archives, but the system ``tar`` reads
-them fine — so we shell out to ``tar`` for both levels and flatten the real PNGs to
-``<out>/<kind>/<Town>/<id>.png``.
+Each downloaded ``<Town>.tar.gz`` is a *plain* tar (mislabelled .gz) holding the town's ~69
+real PNGs (2160x1440 RGBA) **directly**, plus ONE extra file that has a ``.png`` name but is
+actually a redundant nested tar of the whole town. We extract the tar and keep only the files
+whose bytes are real PNGs (magic ``\\x89PNG``), dropping the tar-masquerading-as-png.
 
 Run ON THE SERVER (needs ``tar`` on PATH)::
 
@@ -22,32 +20,25 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _is_png(path: Path) -> bool:
+    with open(path, "rb") as f:
+        return f.read(8) == _PNG_MAGIC
+
 
 def prepare_town(town_targz: Path, out_dir: Path) -> int:
-    """Extract the real PNGs from one SkyScenes double-tar into ``out_dir`` (flat).
-
-    Returns the number of PNGs written. Uses ``tar`` twice (outer -> one nested tar -> real
-    PNGs) and flattens; the redundant nested ``<Town>.tar.gz`` is never a ``*.png`` so it is
-    naturally skipped.
-    """
+    """Extract one town tar and keep only the REAL PNGs (flat). Returns count kept."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    listing = subprocess.run(["tar", "tf", str(town_targz)], capture_output=True, text=True).stdout
-    inner_name = next((ln.strip() for ln in listing.splitlines() if ln.strip().endswith(".png")), None)
-    if not inner_name:
-        return 0
+    n = 0
     with tempfile.TemporaryDirectory() as _td:
         td = Path(_td)
-        subprocess.run(["tar", "xf", str(town_targz), "-C", str(td), inner_name], check=True)
-        inner_path = next(td.rglob("*.png"), None)   # the nested tar (named <id>.png)
-        if inner_path is None:
-            return 0
-        ext = td / "ext"
-        ext.mkdir()
-        subprocess.run(["tar", "xf", str(inner_path), "-C", str(ext)], check=True)
-        n = 0
-        for p in ext.rglob("*.png"):                 # real PNGs at a deep srv/.../<Town>/ path
-            shutil.move(str(p), str(out_dir / p.name))
-            n += 1
+        subprocess.run(["tar", "xf", str(town_targz), "-C", str(td)], check=True)
+        for p in td.rglob("*.png"):
+            if _is_png(p):                       # real image; the fake tar-.png fails magic
+                shutil.move(str(p), str(out_dir / p.name))
+                n += 1
     return n
 
 

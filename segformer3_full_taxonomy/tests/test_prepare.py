@@ -1,15 +1,15 @@
-"""prepare_skyscenes: un-nest the double-tar and flatten real PNGs (nested tar.gz ignored)."""
+"""prepare_skyscenes: extract a town tar and keep only REAL PNGs (drop the fake tar-.png)."""
 import io
 import tarfile
-from pathlib import Path
 
 from segformer3_full_taxonomy.tools.prepare_skyscenes import prepare_town
 
+_PNG = b"\x89PNG\r\n\x1a\n"
 
-def _tar_bytes(members: dict[str, bytes], fmt=tarfile.PAX_FORMAT) -> bytes:
-    """Build an in-memory tar from {arcname: content}."""
+
+def _tar_bytes(members: dict[str, bytes]) -> bytes:
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w", format=fmt) as tf:
+    with tarfile.open(fileobj=buf, mode="w") as tf:
         for name, data in members.items():
             info = tarfile.TarInfo(name)
             info.size = len(data)
@@ -17,41 +17,22 @@ def _tar_bytes(members: dict[str, bytes], fmt=tarfile.PAX_FORMAT) -> bytes:
     return buf.getvalue()
 
 
-def test_double_tar_flattened(tmp_path):
-    deep = "srv/hoffman-lab/x/y/z/HF/SkyScenes/Images/H_35_P_0/ClearNoon/Town01"
-    inner = _tar_bytes({
-        f"{deep}/007761_clrnoon.png": b"PNGDATA-1",
-        f"{deep}/007771_clrnoon.png": b"PNGDATA-2",
-        f"{deep}/Town01.tar.gz": b"REDUNDANT-NESTED-TAR",   # must be ignored
-    })
-    # outer town tar: members are nested tars named <id>.png
+def test_keeps_real_pngs_drops_fake_tar(tmp_path):
+    fake_tar = _tar_bytes({"junk.txt": b"redundant nested tar"})   # a tar, but named *.png below
     outer = tmp_path / "Town01.tar.gz"
-    outer.write_bytes(_tar_bytes({"007751_clrnoon.png": inner,
-                                  "007752_clrnoon.png": inner}))
-    out = tmp_path / "out"
-    n = prepare_town(outer, out)
-    assert n == 2                                            # only the 2 real pngs
-    got = sorted(p.name for p in out.glob("*.png"))
-    assert got == ["007761_clrnoon.png", "007771_clrnoon.png"]
-    assert (out / "007761_clrnoon.png").read_bytes() == b"PNGDATA-1"
-    assert not (out / "Town01.tar.gz").exists()             # nested tar.gz skipped
-
-
-def test_double_tar_gnu_longlink(tmp_path):
-    # real SkyScenes inner tars use GNU @LongLink for deep (>100 char) paths — the case that
-    # broke the streaming open. File-based open must handle it.
-    deep = "srv/hoffman-lab/flash9/datasets/depth_data/HF_anisha/SkyScenes/Images/H_35_P_0/ClearNoon/Town01"
-    assert len(f"{deep}/007761_clrnoon.png") > 100   # >100 char member name -> GNU @LongLink
-    inner = _tar_bytes({f"{deep}/007761_clrnoon.png": b"REAL", f"{deep}/Town01.tar.gz": b"NESTED"},
-                       fmt=tarfile.GNU_FORMAT)
-    outer = tmp_path / "Town01.tar.gz"
-    outer.write_bytes(_tar_bytes({"007751_clrnoon.png": inner}))
+    outer.write_bytes(_tar_bytes({
+        "007761_clrnoon.png": _PNG + b"realimg1",
+        "007771_clrnoon.png": _PNG + b"realimg2",
+        "007781_clrnoon.png": fake_tar,                            # png-named tar -> dropped
+    }))
     n = prepare_town(outer, tmp_path / "out")
-    assert n == 1
-    assert (tmp_path / "out" / "007761_clrnoon.png").read_bytes() == b"REAL"
+    assert n == 2
+    got = sorted(p.name for p in (tmp_path / "out").glob("*.png"))
+    assert got == ["007761_clrnoon.png", "007771_clrnoon.png"]
+    assert (tmp_path / "out" / "007761_clrnoon.png").read_bytes() == _PNG + b"realimg1"
 
 
-def test_empty_outer_returns_zero(tmp_path):
+def test_empty_returns_zero(tmp_path):
     outer = tmp_path / "Empty.tar.gz"
-    outer.write_bytes(_tar_bytes({"readme.txt": b"no pngs here"}))
+    outer.write_bytes(_tar_bytes({"readme.txt": b"no pngs"}))
     assert prepare_town(outer, tmp_path / "o") == 0
