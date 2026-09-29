@@ -105,6 +105,28 @@ def matched_coords_batch(q_feat: torch.Tensor, r_feats: torch.Tensor, q_xy: np.n
     return out
 
 
+def matched_coords_batch_gpu(q_feat: torch.Tensor, r_feats: torch.Tensor, q_xy, r_xy, device):
+    """Like :func:`matched_coords_batch` but returns the matched coordinates as float64 tensors ON
+    ``device`` (no ``.cpu().numpy()`` round-trip) so a GPU verifier can consume them directly. Returns
+    a list of P ``(qm (M,2), rm (M,2), n_mutual)`` with qm/rm CUDA tensors. Selection is bit-identical
+    to :func:`matched_coords_batch`; only the host transfer is dropped."""
+    q = F.normalize(q_feat.float(), dim=1)                    # (Nq, D)
+    r = F.normalize(r_feats.float(), dim=2)                   # (P, Nr, D)
+    sims = torch.matmul(q, r.transpose(1, 2))                 # (P, Nq, Nr)
+    q2r = sims.argmax(dim=2)                                  # (P, Nq)
+    r2q = sims.argmax(dim=1)                                  # (P, Nr)
+    back = torch.gather(r2q, 1, q2r)                          # (P, Nq)
+    mutual = back == torch.arange(q.shape[0], device=q.device)   # (P, Nq)
+    qxy_t = torch.as_tensor(np.asarray(q_xy, np.float64), device=device)
+    rxy_t = torch.as_tensor(np.asarray(r_xy, np.float64), device=device)
+    out = []
+    for p in range(mutual.shape[0]):
+        qidx = mutual[p].nonzero(as_tuple=True)[0]
+        ridx = q2r[p][qidx]
+        out.append((qxy_t[qidx], rxy_t[ridx], int(qidx.numel())))
+    return out
+
+
 def _cv2_method(estimator: str):
     import cv2
     return {"ransac": cv2.RANSAC, "magsac": getattr(cv2, "USAC_MAGSAC", cv2.RANSAC),
