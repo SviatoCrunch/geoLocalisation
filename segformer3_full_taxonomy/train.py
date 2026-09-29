@@ -67,6 +67,11 @@ def main(argv=None) -> int:
     ap.add_argument("--crop", type=int, default=512)
     ap.add_argument("--warmup-frac", type=float, default=0.05)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--aug", default="standard", choices=["standard", "analog"],
+                    help="train augmentation: 'analog' = heavy analog-FPV domain randomization")
+    ap.add_argument("--save-best-ext", action="store_true",
+                    help="also save best_ext/ by external macro (exploratory; contaminates the "
+                         "test if used to pick the final model — keep best/ as the official one)")
     ap.add_argument("--dice-w", type=float, default=1.0)
     ap.add_argument("--external-root", default=None,
                     help="gt_cramatorsc root -> monitor road/railtrack/water on GT_flat_mask "
@@ -93,7 +98,7 @@ def main(argv=None) -> int:
     print(f"[data] train {len(tr_pairs)} | val {len(va_pairs)} | val_towns {args.val_towns}"
           f" | external {len(ext_pairs)}", flush=True)
 
-    tr = DataLoader(SkyScenesDataset(tr_pairs, True, args.crop), batch_size=args.batch, shuffle=True,
+    tr = DataLoader(SkyScenesDataset(tr_pairs, True, args.crop, aug=args.aug), batch_size=args.batch, shuffle=True,
                     num_workers=args.workers, pin_memory=True, drop_last=len(tr_pairs) > args.batch)
     va = DataLoader(SkyScenesDataset(va_pairs, False, args.crop), batch_size=args.batch,
                     shuffle=False, num_workers=args.workers, pin_memory=True)
@@ -112,7 +117,7 @@ def main(argv=None) -> int:
     amp_on = (not args.no_amp) and device == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=amp_on)
 
-    start_ep, best_miou, hist = 0, -1.0, []
+    start_ep, best_miou, best_ext, hist = 0, -1.0, -1.0, []
     if args.resume and Path(args.resume).exists():
         ck = torch.load(args.resume, map_location=device)
         model.load_state_dict(ck["model"]); optim.load_state_dict(ck["optim"])
@@ -140,6 +145,9 @@ def main(argv=None) -> int:
             row["external"] = ext
             ext_str = (" | EXT[road:{road} rail:{railtrack} water:{water} macro:{macro_target}]"
                        .format(**{k: ("—" if v is None else f"{v:.3f}") for k, v in ext.items()}))
+            if args.save_best_ext and (ext["macro_target"] or -1) > best_ext:
+                best_ext = ext["macro_target"]; model.save_pretrained(out / "best_ext")
+                (out / "best_ext_metrics.json").write_text(json.dumps(row, indent=2), encoding="utf-8")
         hist.append(row)
         top = ", ".join(f"{k}:{v:.2f}" for k, v in m["per_class_iou"].items() if v is not None and v > 0.05)
         print(f"[ep {ep:3d}] loss {row['train_loss']:.4f} | val mIoU {m['mIoU']:.4f} | {top}{ext_str}", flush=True)

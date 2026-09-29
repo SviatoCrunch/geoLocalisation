@@ -55,33 +55,37 @@ def rgb_to_trainid(mask_rgb: np.ndarray, color2id: dict) -> np.ndarray:
     return lut[inv].reshape(packed.shape)
 
 
-def build_transforms(train: bool, crop: int = 512):
+def build_transforms(train: bool, crop: int = 512, aug: str = "standard"):
+    """train aug: ``standard`` (light photometric) | ``analog`` (heavy analog-FPV domain rand)."""
     import albumentations as A
     import cv2
     from albumentations.pytorch import ToTensorV2
 
-    if train:
-        return A.Compose([
-            A.RandomResizedCrop(size=(crop, crop), scale=(0.2, 1.0), ratio=(0.75, 1.33),
-                                interpolation=cv2.INTER_LINEAR, mask_interpolation=cv2.INTER_NEAREST),
-            A.HorizontalFlip(p=0.5),                                 # NO vertical flip (sky/road)
+    if not train:
+        return A.Compose([A.Resize(crop, crop), A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD), ToTensorV2()])
+
+    geom = [
+        A.RandomResizedCrop(size=(crop, crop), scale=(0.2, 1.0), ratio=(0.75, 1.33),
+                            interpolation=cv2.INTER_LINEAR, mask_interpolation=cv2.INTER_NEAREST),
+        A.HorizontalFlip(p=0.5),                                     # NO vertical flip (sky/road)
+    ]
+    if aug == "analog":
+        from .aug import analog_fpv_photometric
+        photo = analog_fpv_photometric()
+    else:
+        photo = [
             A.RandomBrightnessContrast(p=0.5),
             A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=15, val_shift_limit=8, p=0.3),
             A.GaussianBlur(blur_limit=(3, 5), p=0.2),
-            A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-            ToTensorV2(),
-        ])
-    return A.Compose([
-        A.Resize(crop, crop),
-        A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ToTensorV2(),
-    ])
+        ]
+    return A.Compose(geom + photo + [A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD), ToTensorV2()])
 
 
 class SkyScenesDataset(Dataset):
-    def __init__(self, pairs: list[dict], train: bool, crop: int = 512, palette_path=None):
+    def __init__(self, pairs: list[dict], train: bool, crop: int = 512, palette_path=None,
+                 aug: str = "standard"):
         self.pairs = pairs
-        self.tf = build_transforms(train, crop)
+        self.tf = build_transforms(train, crop, aug)
         self.color2id = color_to_trainid(palette_path) if palette_path else color_to_trainid()
 
     def __len__(self) -> int:
