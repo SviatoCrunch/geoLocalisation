@@ -1,18 +1,18 @@
-"""Streaming confusion matrix -> per-class IoU + mIoU (ignore_index aware)."""
+"""Streaming confusion matrix -> per-class IoU + mIoU (ignore_index aware, active taxonomy)."""
 from __future__ import annotations
 
 import numpy as np
 
-from .taxonomy import CLASSES, IGNORE_INDEX, NUM_CLASSES
+from . import taxonomy as tx
 
 
 class ConfusionMatrix:
-    def __init__(self, num_classes: int = NUM_CLASSES, ignore_index: int = IGNORE_INDEX,
+    def __init__(self, num_classes: int | None = None, ignore_index: int | None = None,
                  names: list[str] | None = None):
-        self.n = num_classes
-        self.ignore = ignore_index
-        self.names = names or CLASSES
-        self.mat = np.zeros((num_classes, num_classes), dtype=np.int64)
+        self.n = tx.NUM_CLASSES if num_classes is None else num_classes
+        self.ignore = tx.IGNORE_INDEX if ignore_index is None else ignore_index
+        self.names = names or list(tx.CLASSES)
+        self.mat = np.zeros((self.n, self.n), dtype=np.int64)
 
     def update(self, pred, target) -> None:
         pred = np.asarray(pred).ravel()

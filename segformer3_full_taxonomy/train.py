@@ -24,18 +24,18 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from . import taxonomy as tx
 from .dataset import SkyScenesDataset, town_split
 from .external import evaluate_external, external_pairs
 from .losses import CombinedLoss
 from .metrics import ConfusionMatrix
-from .taxonomy import CLASSES, NUM_CLASSES
 
 
 def build_model(model_name: str):
     from transformers import SegformerForSemanticSegmentation
     return SegformerForSemanticSegmentation.from_pretrained(
-        model_name, num_labels=NUM_CLASSES, id2label={i: c for i, c in enumerate(CLASSES)},
-        label2id={c: i for i, c in enumerate(CLASSES)}, ignore_mismatched_sizes=True,
+        model_name, num_labels=tx.NUM_CLASSES, id2label={i: c for i, c in enumerate(tx.CLASSES)},
+        label2id={c: i for i, c in enumerate(tx.CLASSES)}, ignore_mismatched_sizes=True,
         use_safetensors=True)
 
 
@@ -58,6 +58,8 @@ def main(argv=None) -> int:
     ap.add_argument("--prepared-root", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--val-towns", nargs="+", default=["Town07", "Town10HD"])
+    ap.add_argument("--classes", default="full22", choices=["full22", "targets5"],
+                    help="taxonomy: full22 (all SkyScenes) or targets5 (other/road/railtrack/water/sky)")
     ap.add_argument("--model", default="nvidia/mit-b3")
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--batch", type=int, default=8)
@@ -85,6 +87,7 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
 
+    tx.set_preset(args.classes)
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
@@ -95,8 +98,8 @@ def main(argv=None) -> int:
     if args.overfit:
         va_pairs = tr_pairs
     ext_pairs = external_pairs(args.external_root) if args.external_root else []
-    print(f"[data] train {len(tr_pairs)} | val {len(va_pairs)} | val_towns {args.val_towns}"
-          f" | external {len(ext_pairs)}", flush=True)
+    print(f"[data] classes={args.classes}({tx.NUM_CLASSES}) {tx.CLASSES} | train {len(tr_pairs)} "
+          f"| val {len(va_pairs)} | val_towns {args.val_towns} | external {len(ext_pairs)}", flush=True)
 
     tr = DataLoader(SkyScenesDataset(tr_pairs, True, args.crop, aug=args.aug), batch_size=args.batch, shuffle=True,
                     num_workers=args.workers, pin_memory=True, drop_last=len(tr_pairs) > args.batch)

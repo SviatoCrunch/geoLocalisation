@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .taxonomy import IGNORE_INDEX, color_to_trainid
+from . import taxonomy as tx
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -51,7 +51,7 @@ def rgb_to_trainid(mask_rgb: np.ndarray, color2id: dict) -> np.ndarray:
     uniq, inv = np.unique(packed, return_inverse=True)
     lut = np.empty(len(uniq), np.uint8)
     for i, u in enumerate(uniq.tolist()):
-        lut[i] = color2id.get(((u >> 16) & 255, (u >> 8) & 255, u & 255), IGNORE_INDEX)
+        lut[i] = color2id.get(((u >> 16) & 255, (u >> 8) & 255, u & 255), tx.IGNORE_INDEX)
     return lut[inv].reshape(packed.shape)
 
 
@@ -86,7 +86,7 @@ class SkyScenesDataset(Dataset):
                  aug: str = "standard"):
         self.pairs = pairs
         self.tf = build_transforms(train, crop, aug)
-        self.color2id = color_to_trainid(palette_path) if palette_path else color_to_trainid()
+        self.color2id = tx.color_to_trainid(palette_path) if palette_path else tx.color_to_trainid()
 
     def __len__(self) -> int:
         return len(self.pairs)

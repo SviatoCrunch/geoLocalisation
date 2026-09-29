@@ -17,8 +17,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import taxonomy as tx
 from .dataset import IMAGENET_MEAN, IMAGENET_STD
-from .taxonomy import CLASS_TO_ID, GT_FLAT_MASK_MAP
 
 _STILL = re.compile(r"^\d+_([0-9.]+)_([0-9.]+)\.jpg$", re.I)
 _TARGET_RAW = {"Road": "road", "Railways": "railtrack", "Water": "water"}
@@ -77,7 +77,7 @@ def evaluate_external(model, pairs: list[dict], device, crop: int = 512) -> dict
             if raw not in e["masks"]:
                 continue
             gt = _load_bin(e["masks"][raw], h, w) & valid
-            pr = (pred == CLASS_TO_ID[name]) & valid
+            pr = (pred == tx.CLASS_TO_ID[name]) & valid
             stat[name]["tp"] += int((gt & pr).sum())
             stat[name]["fp"] += int((~gt & pr).sum())
             stat[name]["fn"] += int((gt & ~pr).sum())

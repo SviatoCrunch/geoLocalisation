@@ -18,6 +18,23 @@ def test_taxonomy_22_classes_void_ignored():
     assert tx.CLASS_TO_ID["railtrack"] < 22 and tx.CLASS_TO_ID["water"] < 22
 
 
+def test_targets5_preset_collapses_classes():
+    prev = tx.PRESET or "full22"
+    try:
+        tx.set_preset("targets5")
+        assert tx.NUM_CLASSES == 5
+        assert tx.CLASSES == ["other", "road", "railtrack", "water", "sky"]
+        c2i = tx.color_to_trainid()
+        assert c2i[(128, 64, 128)] == tx.CLASS_TO_ID["road"]        # road kept
+        assert c2i[(45, 60, 150)] == tx.CLASS_TO_ID["water"]        # water kept
+        assert c2i[(230, 150, 140)] == tx.CLASS_TO_ID["railtrack"]  # railtrack kept
+        assert c2i[(70, 70, 70)] == tx.CLASS_TO_ID["other"]         # building -> other
+        assert c2i[(107, 142, 35)] == tx.CLASS_TO_ID["other"]       # vegetation -> other
+        assert c2i[(0, 0, 0)] == tx.IGNORE_INDEX                    # unlabeled -> ignore
+    finally:
+        tx.set_preset(prev)
+
+
 def test_rgb_to_trainid_unknown_to_ignore():
     m = np.zeros((3, 3, 3), np.uint8)
     m[0] = (128, 64, 128)     # road
