@@ -33,9 +33,15 @@ class CellData:
 class CellStoreS3:
     def __init__(self, index_uri: str, cache_dir: str = "/tmp/cellcache", cache_cap: int = 256,
                  s3_client=None):
-        from s3_gt_sync.core import make_s3_client, parse_s3_uri
-        self.bucket, key = parse_s3_uri(index_uri)            # index_uri = s3://…/<city>/_index.json
-        self.s3 = s3_client if s3_client is not None else make_s3_client()
+        # inline S3 helpers (avoid importing s3_gt_sync.__init__, which drags PIL via masks.py)
+        if not index_uri.startswith("s3://"):
+            raise ValueError(f"index_uri must be s3://…, got {index_uri!r}")
+        self.bucket, _, key = index_uri[5:].partition("/")    # s3://<bucket>/<key>
+        if s3_client is not None:
+            self.s3 = s3_client
+        else:
+            import boto3
+            self.s3 = boto3.client("s3")
         body = self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()
         self.index = json.loads(body)
         self.cells = self.index["cells"]                      # cell_id -> {key, lat, lon, …}

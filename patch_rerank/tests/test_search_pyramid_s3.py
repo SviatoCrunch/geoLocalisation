@@ -103,7 +103,7 @@ def test_search_end_to_end(tmp_path, monkeypatch):
                 "cells": {"kup:0_lvl0": {"key": "cells/a.h5", "lat": 49.70, "lon": 37.66},
                           "kup:100_lvl0": {"key": "cells/b.h5", "lat": 49.71, "lon": 37.67}}}
     s3 = _FakeS3(json.dumps(manifest).encode(), {"cells/a.h5": str(a), "cells/b.h5": str(b)})
-    monkeypatch.setattr("s3_gt_sync.core.make_s3_client", lambda: s3)
+    monkeypatch.setattr("boto3.client", lambda svc, *a, **k: s3)
     # stub the GPU scorer: cell a strong (best pyramid #1), cell b weak
     monkeypatch.setattr(sps, "_score_cell",
                         lambda cd, qfeat, qxy, n_q, args, dev:
