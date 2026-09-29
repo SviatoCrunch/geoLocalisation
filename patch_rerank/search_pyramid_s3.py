@@ -26,6 +26,7 @@ Run::
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import math
 import time
@@ -43,13 +44,11 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(min(1.0, math.sqrt(a)))
 
 
-def _score_cell(cd, qfeat, qxy, n_q, args, device):
-    """→ (pyramid_score[n_pos], best_level[n_pos]). All grids share the token layout (output_px/patch),
-    so the whole cell is one batched mutual-NN + one batched homography verify."""
+def _load_cell(cd, device):
+    """Read every (position, level) grid of a cell to ``device`` ONCE → (grids (Ncrops,N,D), keys, kp).
+    Reused across all queries in cell-major so a cell's tokens are loaded a single time."""
     import torch
-    from .matcher import _MIN_MATCHES, grid_keypoints, matched_coords_batch_gpu
-    from .gpu_verify import ransac_homography_batch
-
+    from .matcher import grid_keypoints
     keys, grids, kp = [], [], None
     for i in range(cd.n_pos):
         for L in cd.levels:
@@ -58,21 +57,38 @@ def _score_cell(cd, qfeat, qxy, n_q, args, device):
             if kp is None:
                 kp = grid_keypoints(h, w)
             grids.append(g.reshape(h * w, D).to(device)); keys.append((i, L))
-    pairs = matched_coords_batch_gpu(qfeat, torch.stack(grids), qxy, kp, device)
-    inls = ransac_homography_batch([(qm, rm) for (qm, rm, _) in pairs], reproj_thresh=args.reproj_thresh,
-                                   n_hyp=args.gpu_n_hyp, score_type=args.gpu_score_type,
-                                   refine=args.gpu_refine_iter > 0, refine_iter=args.gpu_refine_iter,
-                                   device=device, seed=args.gpu_seed)
+    return torch.stack(grids), keys, kp
+
+
+def _score_loaded(grids, keys, kp, cd, qfeat, qxy, n_q, args, device):
+    """Score a cell's pre-loaded grids against one query → (pyramid_score[n_pos], best_level[n_pos]).
+    Grids are matched/verified in --grid-chunk sub-batches to bound VRAM at high output_px (60×60)."""
+    from .matcher import _MIN_MATCHES, matched_coords_batch_gpu
+    from .gpu_verify import ransac_homography_batch
     sc = {}
-    for idx, (i, L) in enumerate(keys):
-        n_mut = pairs[idx][2]
-        sc[(i, L)] = (inls[idx].shape[0] / n_q) if (n_q and n_mut >= _MIN_MATCHES["homography"]) else 0.0
+    ch = max(1, args.grid_chunk)
+    for s in range(0, len(keys), ch):
+        gsub, ksub = grids[s:s + ch], keys[s:s + ch]
+        pairs = matched_coords_batch_gpu(qfeat, gsub, qxy, kp, device)
+        inls = ransac_homography_batch([(qm, rm) for (qm, rm, _) in pairs], reproj_thresh=args.reproj_thresh,
+                                       n_hyp=args.gpu_n_hyp, score_type=args.gpu_score_type,
+                                       refine=args.gpu_refine_iter > 0, refine_iter=args.gpu_refine_iter,
+                                       device=device, seed=args.gpu_seed)
+        for j, (i, L) in enumerate(ksub):
+            n_mut = pairs[j][2]
+            sc[(i, L)] = (inls[j].shape[0] / n_q) if (n_q and n_mut >= _MIN_MATCHES["homography"]) else 0.0
     pyr, blv = [], []
     for i in range(cd.n_pos):
         per = {L: sc[(i, L)] for L in cd.levels}
         bL = max(per, key=per.get)
         pyr.append(per[bL]); blv.append(int(bL))
     return pyr, blv
+
+
+def _score_cell(cd, qfeat, qxy, n_q, args, device):
+    """query-major convenience: load a cell's grids then score them for one query."""
+    grids, keys, kp = _load_cell(cd, device)
+    return _score_loaded(grids, keys, kp, cd, qfeat, qxy, n_q, args, device)
 
 
 def _aggregate(pyr, blv, cd, cell_agg):
@@ -144,6 +160,12 @@ def main(argv=None) -> int:
     ap.add_argument("--topk", type=int, default=5)
     ap.add_argument("--cell-agg", choices=["mean", "min", "max"], default="mean",
                     help="cell score over its pyramids (spec: mean)")
+    ap.add_argument("--execution-order", choices=["query-major", "cell-major"], default="query-major",
+                    help="query-major (default): per query fetch all its cells. cell-major: fetch each "
+                         "UNIQUE cell ONCE, score vs every query needing it, then evict — same result, "
+                         "peak local disk ~= cache_cap cells (use a SMALL --cache-cap), no re-download.")
+    ap.add_argument("--grid-chunk", type=int, default=64,
+                    help="crops per batched mutual-NN+verify (lower if GPU OOM at high output_px)")
     ap.add_argument("--reproj-thresh", type=float, default=2.0)
     ap.add_argument("--gpu-n-hyp", type=int, default=256)
     ap.add_argument("--gpu-score-type", choices=["msac", "ransac"], default="msac")
@@ -172,6 +194,7 @@ def main(argv=None) -> int:
     dev = args.device
 
     out = {"meta": {"k_coarse": args.k_coarse, "topk": args.topk, "cell_agg": args.cell_agg,
+                    "execution_order": args.execution_order,
                     "index_uri": args.index_uri, "store_config": store.config,
                     "gpu": {"n_hyp": args.gpu_n_hyp, "score_type": args.gpu_score_type,
                             "refine_iter": args.gpu_refine_iter}},
@@ -179,46 +202,76 @@ def main(argv=None) -> int:
     per_query, d_fine, d_ftop, t_fetch_all, t_score_all = {}, [], [], 0.0, 0.0
     dumped = {} if args.dump_scores else None
 
-    for q, entry in tqdm(list(sj["shortlist"].items()), desc="search", unit="q"):
+    def _rec(cid, pyr, blv, cd):
+        cs, bi, blat, blon, bL = _aggregate(pyr, blv, cd, args.cell_agg)
+        return {"cell_id": cid, "cell_score": cs, "lat": blat, "lon": blon, "level_m": bL,
+                "best_score": float(max(pyr)), "mean_score": float(np.mean(pyr))}
+
+    # build per-query plans (query features on device + its candidate cells)
+    plans = {}
+    for q, entry in sj["shortlist"].items():
         if args.only_city and q.split(":", 1)[0] != args.only_city:
             continue
         if args.day_only and "_night" in q:
             continue
         if not qstore.has(q):
             continue
-        if args.max_queries and len(per_query) >= args.max_queries:
+        if args.max_queries and len(plans) >= args.max_queries:
             break
         qfeat, qxy, qlat, qlon = qstore.get(q)
-        qfeat = qfeat.to(dev); n_q = int(qfeat.shape[0])
         cands = [c for c in entry["cells"][:args.k_coarse] if store.has(c)]
-        recs, tf, ts = [], 0.0, 0.0
-        for cid in tqdm(cands, desc=f"  {q[:26]} cells", unit="cell", leave=False):
-            t0 = time.perf_counter(); cd = store.cell(cid); tf += time.perf_counter() - t0
-            t1 = time.perf_counter(); pyr, blv = _score_cell(cd, qfeat, qxy, n_q, args, dev)
-            ts += time.perf_counter() - t1
-            cs, bi, blat, blon, bL = _aggregate(pyr, blv, cd, args.cell_agg)
-            recs.append({"cell_id": cid, "cell_score": cs, "lat": blat, "lon": blon, "level_m": bL,
-                         "best_score": float(max(pyr)), "mean_score": float(np.mean(pyr))})
+        plans[q] = {"qfeat": qfeat.to(dev), "qxy": qxy, "qlat": qlat, "qlon": qlon,
+                    "n_q": int(qfeat.shape[0]), "cands": cands}
+    qcell = {q: {} for q in plans}                            # q -> {cell_id: rec}
+    tscore = {q: 0.0 for q in plans}
+
+    if args.execution_order == "cell-major":                  # fetch each unique cell ONCE, score all q
+        inv = collections.defaultdict(list)
+        for q, p in plans.items():
+            for cid in p["cands"]:
+                inv[cid].append(q)
+        for cid in tqdm(sorted(inv), desc="cells", unit="cell"):
+            t0 = time.perf_counter(); cd = store.cell(cid); t_fetch_all += time.perf_counter() - t0
+            grids, keys, kp = _load_cell(cd, dev)
+            for q in inv[cid]:
+                p = plans[q]
+                t1 = time.perf_counter()
+                pyr, blv = _score_loaded(grids, keys, kp, cd, p["qfeat"], p["qxy"], p["n_q"], args, dev)
+                dt = time.perf_counter() - t1; t_score_all += dt; tscore[q] += dt
+                qcell[q][cid] = _rec(cid, pyr, blv, cd)
+            del grids
+            if str(dev).startswith("cuda"):
+                torch.cuda.empty_cache()
+    else:                                                     # query-major (default)
+        for q, p in tqdm(plans.items(), desc="search", unit="q"):
+            for cid in tqdm(p["cands"], desc=f"  {q[:26]} cells", unit="cell", leave=False):
+                t0 = time.perf_counter(); cd = store.cell(cid); t_fetch_all += time.perf_counter() - t0
+                t1 = time.perf_counter()
+                pyr, blv = _score_cell(cd, p["qfeat"], p["qxy"], p["n_q"], args, dev)
+                dt = time.perf_counter() - t1; t_score_all += dt; tscore[q] += dt
+                qcell[q][cid] = _rec(cid, pyr, blv, cd)
+            if str(dev).startswith("cuda"):
+                torch.cuda.empty_cache()
+
+    for q, p in plans.items():                                # shared aggregation → per-query top-k
+        recs = list(qcell[q].values())
         ranked = sorted(recs, key=lambda r: r["cell_score"], reverse=True)[:args.topk]
-        has_gt = math.isfinite(qlat) and math.isfinite(qlon)
+        has_gt = math.isfinite(p["qlat"]) and math.isfinite(p["qlon"])
         for i, r in enumerate(ranked):
             r["rank"] = i + 1
-            r["dist_m"] = _haversine_m(qlat, qlon, r["lat"], r["lon"]) if has_gt else None
+            r["dist_m"] = _haversine_m(p["qlat"], p["qlon"], r["lat"], r["lon"]) if has_gt else None
         df = ranked[0]["dist_m"] if (ranked and has_gt) else None
         dft = min((r["dist_m"] for r in ranked), default=None) if has_gt else None
-        rec = {"gt": [qlat, qlon] if has_gt else None, "fine_dist_m": df,
-               "fine_dist_topk_m": dft, "n_candidates": len(cands), "topk": ranked,
-               "timings": {"fetch_s": tf, "score_s": ts, "downloads": store.n_downloads}}
+        rec = {"gt": [p["qlat"], p["qlon"]] if has_gt else None, "fine_dist_m": df,
+               "fine_dist_topk_m": dft, "n_candidates": len(p["cands"]), "topk": ranked,
+               "timings": {"score_s": tscore[q]}}
         per_query[q] = rec; out["per_query"][q] = rec
         if dumped is not None:
             dumped[q] = {r["cell_id"]: {"mean": r["mean_score"], "best": r["best_score"],
                                         "lat": r["lat"], "lon": r["lon"], "level_m": r["level_m"]}
                          for r in recs}
-        t_fetch_all += tf; t_score_all += ts
         if has_gt:
             d_fine.append(df); d_ftop.append(dft)
-        if str(dev).startswith("cuda"):
-            torch.cuda.empty_cache()
 
     if d_fine:
         out["summary"] = {"fine_top1": _report("fine", d_fine),

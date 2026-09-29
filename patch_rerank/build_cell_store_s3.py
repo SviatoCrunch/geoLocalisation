@@ -40,6 +40,27 @@ from .map_rerank import cell_window_centres
 from .map_dino3 import DEFAULT_MODEL, build_dinov3_extractor, extract_grids_v3
 
 
+def _build_extractor(args):
+    """→ ext dict {kind, patch, D, n_prefix, model_id, …}. dinov3: transformers sat/web model;
+    dinov2: torch.hub backbone matched to --ref-h5's projection (e.g. vitg14 d1024)."""
+    if args.backbone_kind == "dinov2":
+        from .map_dino import build_matched_extractor
+        if not args.ref_h5:
+            raise SystemExit("--backbone-kind dinov2 needs --ref-h5 (a query/gallery H5 of this backbone)")
+        e, proj, patch, backbone, D = build_matched_extractor(args.ref_h5, args.device, 0)
+        return {"kind": "dinov2", "ext": e, "proj": proj, "patch": int(patch), "D": int(D),
+                "n_prefix": 0, "model_id": str(backbone)}
+    ext = build_dinov3_extractor(args.model, args.device); ext["kind"] = "dinov3"
+    return ext
+
+
+def _extract_grids(images, ext, output_px, device, amp):
+    if ext["kind"] == "dinov2":
+        from .map_dino import extract_grids
+        return extract_grids(images, ext["ext"], ext["proj"], ext["patch"], device, amp=amp)
+    return extract_grids_v3(images, ext, output_px, device, amp=amp)
+
+
 def _safe(cell_id: str) -> str:
     """cell_id → filesystem/S3-safe stem (kup:996_lvl0 → kup_996_lvl0)."""
     return cell_id.replace(":", "_").replace("/", "_")
@@ -103,7 +124,7 @@ def _build_cell_h5(out_path: Path, cell_id: str, clat: float, clon: float, ext, 
     def _flush():
         if not buf_imgs:
             return
-        grids = extract_grids_v3(buf_imgs, ext, args.output_px, args.device, amp=args.amp)
+        grids = _extract_grids(buf_imgs, ext, args.output_px, args.device, args.amp)
         for (pi, L), g in zip(buf_meta, grids):
             fout.create_dataset(f"p{pi}/l{int(L)}", data=g.numpy().astype(np.float16), chunks=True)
         buf_imgs.clear(); buf_meta.clear()
@@ -124,7 +145,10 @@ def main(argv=None) -> int:
     ap.add_argument("--cell-index", required=True, help="tiles index with tile_id/city/lat/lon (cells)")
     ap.add_argument("--city", required=True)
     ap.add_argument("--map", required=True, help="city GeoTIFF read for the pyramid crops")
-    ap.add_argument("--model", default=DEFAULT_MODEL, help="DINOv3 HF repo (satellite variant)")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="DINOv3 HF repo (satellite/web variant)")
+    ap.add_argument("--backbone-kind", choices=["dinov3", "dinov2"], default="dinov3",
+                    help="dinov3: transformers model (--model). dinov2: torch.hub backbone matched to --ref-h5")
+    ap.add_argument("--ref-h5", default=None, help="dinov2 only: query/gallery H5 whose backbone+projection to match")
     ap.add_argument("--cells-from-shortlist", default=None,
                     help="restrict to the union of cells referenced by this shortlist json (minimal build)")
     ap.add_argument("--step-m", type=float, default=250.0)
@@ -161,9 +185,9 @@ def main(argv=None) -> int:
     s3 = make_s3_client()
     stage = Path(args.stage_dir).expanduser(); stage.mkdir(parents=True, exist_ok=True)
 
-    ext = build_dinov3_extractor(args.model, args.device)
-    print(f"[dino3] {ext['model_id']} patch={ext['patch']} D={ext['D']} n_prefix={ext['n_prefix']}",
-          flush=True)
+    ext = _build_extractor(args)
+    print(f"[{ext['kind']}] {ext['model_id']} patch={ext['patch']} D={ext['D']} "
+          f"n_prefix={ext['n_prefix']}", flush=True)
     src = open_src(args.map)
 
     manifest, built, skipped, bytes_up = {}, 0, 0, 0

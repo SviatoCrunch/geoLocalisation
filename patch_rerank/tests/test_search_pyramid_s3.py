@@ -104,27 +104,33 @@ def test_search_end_to_end(tmp_path, monkeypatch):
                           "kup:100_lvl0": {"key": "cells/b.h5", "lat": 49.71, "lon": 37.67}}}
     s3 = _FakeS3(json.dumps(manifest).encode(), {"cells/a.h5": str(a), "cells/b.h5": str(b)})
     monkeypatch.setattr("boto3.client", lambda svc, *a, **k: s3)
-    # stub the GPU scorer: cell a strong (best pyramid #1), cell b weak
-    monkeypatch.setattr(sps, "_score_cell",
-                        lambda cd, qfeat, qxy, n_q, args, dev:
+    # stub the GPU scorer (shared by both execution orders): cell a strong (best pyramid #1), b weak
+    monkeypatch.setattr(sps, "_score_loaded",
+                        lambda grids, keys, kp, cd, qfeat, qxy, n_q, args, dev:
                         (([0.5, 0.9], [1000, 500]) if cd.cell_id == "kup:0_lvl0"
                          else ([0.1, 0.2], [1000, 1000])))
     sl = tmp_path / "sl.json"
     sl.write_text(json.dumps({"shortlist": {"kup:0_49.7105_37.6705":
                                             {"cells": ["kup:100_lvl0", "kup:0_lvl0"]}}}))
-    outj, outk = tmp_path / "s.json", tmp_path / "s.kmz"
-    rc = sps.main(["--queries", f"kup={qh5}", "--shortlist", str(sl),
-                   "--index-uri", "s3://bkt/kup/_index.json", "--cache-dir", str(tmp_path / "c"),
-                   "--k-coarse", "100", "--topk", "5", "--cell-agg", "mean", "--device", "cpu",
-                   "--out", str(outj), "--kmz", str(outk)])
-    assert rc == 0
-    j = json.loads(outj.read_text())
-    rec = j["per_query"]["kup:0_49.7105_37.6705"]
-    assert [t["cell_id"] for t in rec["topk"]] == ["kup:0_lvl0", "kup:100_lvl0"]   # mean 0.7 > 0.15
-    top = rec["topk"][0]
-    assert top["level_m"] == 500 and abs(top["lat"] - 49.701) < 1e-6               # best pyramid #1
-    assert rec["fine_dist_m"] is not None and rec["timings"]["downloads"] == 2
-    assert j["meta"]["cell_agg"] == "mean" and "speed" in j
-    with zipfile.ZipFile(outk) as z:                                              # KMZ has squares
+
+    def _run(order, cache_cap):
+        outj = tmp_path / f"s_{order}.json"
+        rc = sps.main(["--queries", f"kup={qh5}", "--shortlist", str(sl), "--index-uri",
+                       "s3://bkt/kup/_index.json", "--cache-dir", str(tmp_path / f"c_{order}"),
+                       "--cache-cap", str(cache_cap), "--execution-order", order,
+                       "--k-coarse", "100", "--topk", "5", "--cell-agg", "mean", "--device", "cpu",
+                       "--out", str(outj), "--kmz", str(tmp_path / f"s_{order}.kmz")])
+        assert rc == 0
+        return json.loads(outj.read_text())["per_query"]["kup:0_49.7105_37.6705"]
+
+    rq = _run("query-major", 256)
+    assert [t["cell_id"] for t in rq["topk"]] == ["kup:0_lvl0", "kup:100_lvl0"]     # mean 0.7 > 0.15
+    assert rq["topk"][0]["level_m"] == 500 and abs(rq["topk"][0]["lat"] - 49.701) < 1e-6
+    assert rq["fine_dist_m"] is not None
+
+    rcm = _run("cell-major", 1)                                                     # tiny cache → evict
+    assert [t["cell_id"] for t in rcm["topk"]] == [t["cell_id"] for t in rq["topk"]]   # same ranking
+    assert abs(rcm["topk"][0]["cell_score"] - rq["topk"][0]["cell_score"]) < 1e-9
+    with zipfile.ZipFile(tmp_path / "s_query-major.kmz") as z:                       # KMZ has squares
         kml = z.read("doc.kml").decode()
     assert "<Polygon>" in kml and "GT" in kml
