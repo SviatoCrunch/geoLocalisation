@@ -155,6 +155,9 @@ def main(argv=None) -> int:
     ap.add_argument("--max-queries", type=int, default=0)
     ap.add_argument("--out", required=True)
     ap.add_argument("--kmz", default=None)
+    ap.add_argument("--dump-scores", default=None,
+                    help="also write per-query per-candidate {cell_id: {mean,best,lat,lon,level_m}} to "
+                         "this JSON — for offline aggregation/GT-rank diagnosis (ALL candidates, not top-k)")
     args = ap.parse_args(argv)
 
     import torch
@@ -174,6 +177,7 @@ def main(argv=None) -> int:
                             "refine_iter": args.gpu_refine_iter}},
            "per_query": {}}
     per_query, d_fine, d_ftop, t_fetch_all, t_score_all = {}, [], [], 0.0, 0.0
+    dumped = {} if args.dump_scores else None
 
     for q, entry in tqdm(list(sj["shortlist"].items()), desc="search", unit="q"):
         if args.only_city and q.split(":", 1)[0] != args.only_city:
@@ -193,7 +197,8 @@ def main(argv=None) -> int:
             t1 = time.perf_counter(); pyr, blv = _score_cell(cd, qfeat, qxy, n_q, args, dev)
             ts += time.perf_counter() - t1
             cs, bi, blat, blon, bL = _aggregate(pyr, blv, cd, args.cell_agg)
-            recs.append({"cell_id": cid, "cell_score": cs, "lat": blat, "lon": blon, "level_m": bL})
+            recs.append({"cell_id": cid, "cell_score": cs, "lat": blat, "lon": blon, "level_m": bL,
+                         "best_score": float(max(pyr)), "mean_score": float(np.mean(pyr))})
         ranked = sorted(recs, key=lambda r: r["cell_score"], reverse=True)[:args.topk]
         has_gt = math.isfinite(qlat) and math.isfinite(qlon)
         for i, r in enumerate(ranked):
@@ -205,6 +210,10 @@ def main(argv=None) -> int:
                "fine_dist_topk_m": dft, "n_candidates": len(cands), "topk": ranked,
                "timings": {"fetch_s": tf, "score_s": ts, "downloads": store.n_downloads}}
         per_query[q] = rec; out["per_query"][q] = rec
+        if dumped is not None:
+            dumped[q] = {r["cell_id"]: {"mean": r["mean_score"], "best": r["best_score"],
+                                        "lat": r["lat"], "lon": r["lon"], "level_m": r["level_m"]}
+                         for r in recs}
         t_fetch_all += tf; t_score_all += ts
         if has_gt:
             d_fine.append(df); d_ftop.append(dft)
@@ -222,6 +231,9 @@ def main(argv=None) -> int:
           f"downloads={store.n_downloads}", flush=True)
     Path(args.out).expanduser().write_text(json.dumps(out), encoding="utf-8")
     print(f"[ok] -> {args.out}", flush=True)
+    if dumped is not None:
+        Path(args.dump_scores).expanduser().write_text(json.dumps(dumped), encoding="utf-8")
+        print(f"[ok] cell scores -> {args.dump_scores}", flush=True)
     if args.kmz:
         _write_kmz(args.kmz, per_query)
         print(f"[ok] kmz -> {args.kmz}", flush=True)
