@@ -46,15 +46,29 @@ def _safe(cell_id: str) -> str:
 
 
 def _read_cells(cell_index: str, city: str):
-    """→ list of (cell_id, lat, lon) for the city, from a tiles index (tile_id/city/lat/lon)."""
+    """→ list of (cell_id, lat, lon) for the city. Accepts EITHER a flat tiles index
+    (tile_id/city/lat/lon datasets) OR a map_extract H5 (per-tile groups with lat/lon[/tile_index]
+    attrs, e.g. kup_prodaction.h5) — auto-detected. For map_extract, cell_id = ``<city>:<tile_index>_lvl0``
+    (falls back to the group key) so it matches the dense/checker id style."""
     import h5py
     with h5py.File(Path(cell_index).expanduser(), "r") as f:
-        if "tile_id" not in f:
-            raise SystemExit(f"{cell_index} has no 'tile_id' dataset (keys={list(f.keys())})")
-        ids = [x.decode() if isinstance(x, bytes) else str(x) for x in f["tile_id"][:]]
-        cc = [x.decode() if isinstance(x, bytes) else str(x) for x in f["city"][:]]
-        lat = np.asarray(f["lat"][:], float); lon = np.asarray(f["lon"][:], float)
-    return [(ids[i], float(lat[i]), float(lon[i])) for i in range(len(ids)) if cc[i] == city]
+        if "tile_id" in f:                                   # flat tiles index
+            ids = [x.decode() if isinstance(x, bytes) else str(x) for x in f["tile_id"][:]]
+            cc = [x.decode() if isinstance(x, bytes) else str(x) for x in f["city"][:]]
+            lat = np.asarray(f["lat"][:], float); lon = np.asarray(f["lon"][:], float)
+            return [(ids[i], float(lat[i]), float(lon[i])) for i in range(len(ids)) if cc[i] == city]
+        cells = []                                           # map_extract H5 (per-tile groups)
+        for k in f.keys():
+            g = f[k]
+            if not (hasattr(g, "attrs") and "lat" in g.attrs and "lon" in g.attrs):
+                continue
+            ti = g.attrs.get("tile_index", None)
+            cid = f"{city}:{int(ti)}_lvl0" if ti is not None else f"{city}:{k}"
+            cells.append((cid, float(g.attrs["lat"]), float(g.attrs["lon"])))
+        if not cells:
+            raise SystemExit(f"{cell_index}: not a tiles-index (no 'tile_id') and no map_extract "
+                             f"groups with lat/lon attrs (keys={list(f.keys())[:5]}…)")
+        return cells
 
 
 def _shortlist_union(path: str) -> set:

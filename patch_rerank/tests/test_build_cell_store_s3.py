@@ -52,6 +52,21 @@ def test_extract_grids_v3_rejects_bad_output_px():
 
 # --- build pipeline (mocked model / map / S3) ----------------------------------------------------
 
+def test_read_cells_from_mapextract_h5(tmp_path):
+    """kup_prodaction-style map_extract H5 (per-tile groups with lat/lon/tile_index attrs)."""
+    import h5py
+    p = tmp_path / "prod.h5"
+    with h5py.File(p, "w") as f:
+        for ti, (la, lo) in [(0, (49.61, 37.56)), (100, (49.70, 37.66))]:
+            g = f.create_group(f"{ti}_lvl0")
+            g.create_dataset("ift_dino", data=np.zeros((8, 4), np.float32))
+            g.attrs["lat"] = la; g.attrs["lon"] = lo; g.attrs["tile_index"] = float(ti)
+    cells = bcs._read_cells(str(p), "kup")
+    assert sorted(c[0] for c in cells) == ["kup:0_lvl0", "kup:100_lvl0"]
+    d = {c[0]: (c[1], c[2]) for c in cells}
+    assert d["kup:100_lvl0"] == (49.70, 37.66)
+
+
 class _FakeS3:
     def __init__(self):
         self.objects, self.uploads, self.puts = {}, [], {}
