@@ -25,7 +25,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from . import taxonomy as tx
-from .dataset import SkyScenesDataset, town_split
+from .dataset import SkyScenesDataset, multicond_split, town_split
 from .external import evaluate_external, external_pairs
 from .losses import CombinedLoss
 from .metrics import ConfusionMatrix
@@ -55,7 +55,11 @@ def evaluate(model, loader, device) -> dict:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--prepared-root", required=True)
+    ap.add_argument("--prepared-root", default=None, help="single-condition dir (has Images/ Segment/)")
+    ap.add_argument("--prepared-dir", default=None, help="parent of multiple condition dirs (with --conditions)")
+    ap.add_argument("--conditions", nargs="+", default=None,
+                    help="condition dir names under --prepared-dir, e.g. H_35_P_0_ClearNoon "
+                         "H_35_P_45_ClearNoon H_35_P_0_ClearSunset (weather imgs pair to ClearNoon masks)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--val-towns", nargs="+", default=["Town07", "Town10HD"])
     ap.add_argument("--classes", default="full22", choices=["full22", "targets5"],
@@ -92,7 +96,10 @@ def main(argv=None) -> int:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
 
-    tr_pairs, va_pairs = town_split(args.prepared_root, args.val_towns)
+    if args.conditions:
+        tr_pairs, va_pairs = multicond_split(args.prepared_dir, args.conditions, args.val_towns)
+    else:
+        tr_pairs, va_pairs = town_split(args.prepared_root, args.val_towns)
     if args.max_train_samples:
         tr_pairs = tr_pairs[:args.max_train_samples]
     if args.overfit:

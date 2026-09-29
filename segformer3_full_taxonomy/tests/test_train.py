@@ -60,6 +60,30 @@ def test_town_split_no_leakage(tmp_path):
     assert len(tr) == 4 and len(va) == 2
 
 
+def test_multicond_weather_pairs_to_clearnoon_masks(tmp_path):
+    from segformer3_full_taxonomy.dataset import condition_pairs, multicond_split
+
+    def _put(cond, kind, town, n):
+        d = tmp_path / cond / kind / town; d.mkdir(parents=True, exist_ok=True)
+        suff = "_clrnoon.png" if kind == "Images" else "_semsegCarla_clrnoon.png"
+        Image.fromarray(np.zeros((4, 4, 3), np.uint8)).save(d / f"{n:06d}{suff}")
+
+    for town in ("Town01", "Town02"):
+        for n in (1, 2):
+            _put("H_35_P_0_ClearNoon", "Images", town, n)
+            _put("H_35_P_0_ClearNoon", "Segment", town, n)     # ClearNoon has masks
+            _put("H_35_P_0_ClearSunset", "Images", town, n)    # weather: images only
+    # ClearSunset images must pair to ClearNoon masks
+    ps = condition_pairs(tmp_path, "H_35_P_0_ClearSunset", ["Town01"])
+    assert len(ps) == 2
+    assert all("ClearSunset/Images" in p["image"].replace("\\", "/") for p in ps)
+    assert all("ClearNoon/Segment" in p["mask"].replace("\\", "/") for p in ps)
+    # multicond split: hold out Town02
+    tr, va = multicond_split(tmp_path, ["H_35_P_0_ClearNoon", "H_35_P_0_ClearSunset"], ["Town02"])
+    assert {p["town"] for p in va} == {"Town02"} and "Town02" not in {p["town"] for p in tr}
+    assert len(tr) == 4 and len(va) == 4                       # 2 conds × 2 imgs each split
+
+
 def test_combined_loss_and_confusion():
     logits = torch.randn(2, tx.NUM_CLASSES, 8, 8, requires_grad=True)
     target = torch.randint(0, tx.NUM_CLASSES, (2, 8, 8))

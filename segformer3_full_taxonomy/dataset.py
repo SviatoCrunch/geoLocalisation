@@ -44,6 +44,37 @@ def town_split(prepared_root: str | Path, val_towns: list[str]) -> tuple[list[di
     return discover(prepared_root, train_towns), discover(prepared_root, val_towns)
 
 
+def condition_pairs(prepared_dir: str | Path, cond: str, towns: list[str]) -> list[dict]:
+    """Pairs for one condition dir ``<HP>_<Weather>``. Images come from the condition; masks
+    ALWAYS come from that HP's ClearNoon Segment (masks are weather-invariant), paired by
+    (town, frame-id)."""
+    prepared_dir = Path(prepared_dir)
+    hp, _weather = cond.rsplit("_", 1)
+    img_root = prepared_dir / cond / "Images"
+    seg_root = prepared_dir / f"{hp}_ClearNoon" / "Segment"
+    out = []
+    for t in towns:
+        imgs = {_ID.search(p.name).group(1): p for p in (img_root / t).glob("*.png")}
+        msks = {_ID.search(p.name).group(1): p for p in (seg_root / t).glob("*.png")}
+        for k in sorted(imgs.keys() & msks.keys()):
+            out.append({"image": str(imgs[k]), "mask": str(msks[k]), "town": t, "cond": cond})
+    return out
+
+
+def multicond_split(prepared_dir: str | Path, conditions: list[str],
+                    val_towns: list[str]) -> tuple[list[dict], list[dict]]:
+    """Combine several conditions; hold out ``val_towns`` entirely (leakage-free across all
+    conditions). Towns discovered from the first condition's Images dir."""
+    prepared_dir = Path(prepared_dir)
+    all_towns = sorted(p.name for p in (prepared_dir / conditions[0] / "Images").iterdir() if p.is_dir())
+    train_towns = [t for t in all_towns if t not in val_towns]
+    tr, va = [], []
+    for c in conditions:
+        tr += condition_pairs(prepared_dir, c, train_towns)
+        va += condition_pairs(prepared_dir, c, val_towns)
+    return tr, va
+
+
 def rgb_to_trainid(mask_rgb: np.ndarray, color2id: dict) -> np.ndarray:
     """HxWx3 RGB palette mask -> HxW uint8 train ids (unknown colour -> IGNORE_INDEX)."""
     a = mask_rgb.astype(np.int64)
