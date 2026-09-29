@@ -188,7 +188,7 @@ def main(argv=None) -> int:
         qfeat = qfeat.to(dev); n_q = int(qfeat.shape[0])
         cands = [c for c in entry["cells"][:args.k_coarse] if store.has(c)]
         recs, tf, ts = [], 0.0, 0.0
-        for cid in cands:
+        for cid in tqdm(cands, desc=f"  {q[:26]} cells", unit="cell", leave=False):
             t0 = time.perf_counter(); cd = store.cell(cid); tf += time.perf_counter() - t0
             t1 = time.perf_counter(); pyr, blv = _score_cell(cd, qfeat, qxy, n_q, args, dev)
             ts += time.perf_counter() - t1
