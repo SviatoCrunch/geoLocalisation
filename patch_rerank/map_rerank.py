@@ -505,7 +505,8 @@ def main(argv=None) -> int:
                         yield px, py, L, gd, h, w
                 return
             if store is not None:                            # serial precomputed grids
-                for (px, py) in need:
+                for (px, py) in tqdm(need, total=len(need), desc=f"  {q[:28]} store-read",
+                                     unit="pos", leave=False):
                     if not store.has(px, py):
                         prof["miss"] += 1
                         continue
@@ -530,7 +531,8 @@ def main(argv=None) -> int:
                     prof["crops"] += 1; prof["shapes"].add((h, w))
                     yield bx, by, bL, g.reshape(h * w, dd).to(dev), h, w
                 buf_imgs.clear(); buf_keys.clear()
-            for (px, py) in need:                            # one read/position; derive all levels
+            for (px, py) in tqdm(need, total=len(need), desc=f"  {q[:28]} map-crops",
+                                 unit="pos", leave=False):     # inner bar: map window positions/query
                 prof["pos"] += 1
                 pyr = read_pyramid_from_one(src, px, py, args.levels_m, need[(px, py)], args.output_px)
                 for L in args.levels_m:
