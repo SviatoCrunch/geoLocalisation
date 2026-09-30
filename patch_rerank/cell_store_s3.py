@@ -46,7 +46,11 @@ class CellStoreS3:
         self.index = json.loads(body)
         self.cells = self.index["cells"]                      # cell_id -> {key, lat, lon, …}
         self.config = self.index.get("config", {})
-        self.cache_dir = Path(cache_dir).expanduser()
+        # namespace the local cache PER STORE (bucket+prefix) — cell_id filenames collide across stores
+        # (e.g. sat 16×16 vs vitg14 32×32 both have kup_97_lvl0.h5), which would serve stale cells.
+        ns = (key[:-len("/_index.json")] if key.endswith("/_index.json") else key)
+        ns = (self.bucket + "_" + ns).replace("/", "_").replace(":", "_")
+        self.cache_dir = Path(cache_dir).expanduser() / ns
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_cap = int(cache_cap)
         self._lru: "collections.OrderedDict[str, Path]" = collections.OrderedDict()
