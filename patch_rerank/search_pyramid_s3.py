@@ -62,26 +62,50 @@ def _load_cell(cd, device):
 
 def _score_loaded(grids, keys, kp, cd, qfeat, qxy, n_q, args, device):
     """Score a cell's pre-loaded grids against one query → (pyramid_score[n_pos], best_level[n_pos]).
-    Grids are matched/verified in --grid-chunk sub-batches to bound VRAM at high output_px (60×60)."""
-    from .matcher import _MIN_MATCHES, matched_coords_batch_gpu
-    from .gpu_verify import ransac_homography_batch
+
+    ``--verify-backend`` picks the geometric verifier (gpu_batch MSAC / gpu_kornia RANSAC / cpu_magsac
+    cv2). ``--level-agg`` combines a position's per-level scores by max (best level) or sum (multi-scale
+    evidence, the old working rule). Grids matched/verified in --grid-chunk sub-batches (VRAM bound)."""
+    from .matcher import _MIN_MATCHES
+    _MIN = _MIN_MATCHES["homography"]
     sc = {}
     ch = max(1, args.grid_chunk)
     for s in range(0, len(keys), ch):
         gsub, ksub = grids[s:s + ch], keys[s:s + ch]
+        if args.verify_backend == "cpu_magsac":                      # cv2 MAGSAC on host (control/old path)
+            from .matcher import matched_coords_batch, verify_inliers
+            mc = matched_coords_batch(qfeat, gsub, qxy, kp)
+            for j, (i, L) in enumerate(ksub):
+                qm, rm, n_mut = mc[j]
+                if n_q and n_mut >= _MIN:
+                    inl = verify_inliers(qm, rm, model="homography", estimator="magsac",
+                                         reproj_thresh=args.reproj_thresh)
+                    sc[(i, L)] = inl.shape[0] / n_q
+                else:
+                    sc[(i, L)] = 0.0
+            continue
+        from .matcher import matched_coords_batch_gpu
         pairs = matched_coords_batch_gpu(qfeat, gsub, qxy, kp, device)
-        inls = ransac_homography_batch([(qm, rm) for (qm, rm, _) in pairs], reproj_thresh=args.reproj_thresh,
-                                       n_hyp=args.gpu_n_hyp, score_type=args.gpu_score_type,
-                                       refine=args.gpu_refine_iter > 0, refine_iter=args.gpu_refine_iter,
-                                       device=device, seed=args.gpu_seed)
+        if args.verify_backend == "gpu_kornia":
+            from .gpu_verify import verify_inliers_kornia
+            inls = [verify_inliers_kornia(qm, rm, reproj_thresh=args.reproj_thresh,
+                                          max_iter=args.gpu_max_iter, seed=args.gpu_seed, device=device)
+                    for (qm, rm, _) in pairs]
+        else:                                                        # gpu_batch (default)
+            from .gpu_verify import ransac_homography_batch
+            inls = ransac_homography_batch([(qm, rm) for (qm, rm, _) in pairs],
+                                           reproj_thresh=args.reproj_thresh, n_hyp=args.gpu_n_hyp,
+                                           score_type=args.gpu_score_type, refine=args.gpu_refine_iter > 0,
+                                           refine_iter=args.gpu_refine_iter, device=device, seed=args.gpu_seed)
         for j, (i, L) in enumerate(ksub):
             n_mut = pairs[j][2]
-            sc[(i, L)] = (inls[j].shape[0] / n_q) if (n_q and n_mut >= _MIN_MATCHES["homography"]) else 0.0
+            sc[(i, L)] = (inls[j].shape[0] / n_q) if (n_q and n_mut >= _MIN) else 0.0
     pyr, blv = [], []
     for i in range(cd.n_pos):
         per = {L: sc[(i, L)] for L in cd.levels}
-        bL = max(per, key=per.get)
-        pyr.append(per[bL]); blv.append(int(bL))
+        bL = max(per, key=per.get)                                   # reported level = best-scoring level
+        pyr.append(sum(per.values()) if args.level_agg == "sum" else per[bL])
+        blv.append(int(bL))
     return pyr, blv
 
 
@@ -167,6 +191,12 @@ def main(argv=None) -> int:
     ap.add_argument("--grid-chunk", type=int, default=64,
                     help="crops per batched mutual-NN+verify (lower if GPU OOM at high output_px)")
     ap.add_argument("--reproj-thresh", type=float, default=2.0)
+    ap.add_argument("--verify-backend", choices=["gpu_batch", "gpu_kornia", "cpu_magsac"],
+                    default="gpu_batch", help="geometric verifier: gpu_batch MSAC (default) / gpu_kornia "
+                                              "RANSAC / cpu_magsac cv2 (the old working path)")
+    ap.add_argument("--level-agg", choices=["max", "sum"], default="max",
+                    help="per-position level aggregation: max (best level) or sum (multi-scale, old rule)")
+    ap.add_argument("--gpu-max-iter", type=int, default=10, help="gpu_kornia RANSAC max_iter")
     ap.add_argument("--gpu-n-hyp", type=int, default=256)
     ap.add_argument("--gpu-score-type", choices=["msac", "ransac"], default="msac")
     ap.add_argument("--gpu-refine-iter", type=int, default=5)
@@ -194,6 +224,7 @@ def main(argv=None) -> int:
     dev = args.device
 
     out = {"meta": {"k_coarse": args.k_coarse, "topk": args.topk, "cell_agg": args.cell_agg,
+                    "level_agg": args.level_agg, "verify_backend": args.verify_backend,
                     "execution_order": args.execution_order,
                     "index_uri": args.index_uri, "store_config": store.config,
                     "gpu": {"n_hyp": args.gpu_n_hyp, "score_type": args.gpu_score_type,
