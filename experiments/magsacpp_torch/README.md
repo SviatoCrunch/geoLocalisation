@@ -97,12 +97,44 @@ mask, both image sizes, coord transforms, GT+metadata kept separate, and a finge
 arrays + matcher config. This cache is what both the Torch core and the cv2 baseline consume, so the
 comparison is apples-to-apples. (CLI stub prints the schema; wire it to `matched_coords` on the box.)
 
-### `evaluate` (server): quality vs cv2 baseline
-Run the Torch estimator over the cache, reproduce the rerank score `inliers / n_query_tokens`, the
-sub-tile lat/lon (`matcher.grid_to_latlon`) and distR@250m top1/top5 + median/p90/p95 geodesic error,
-and compare against `cv2.USAC_MAGSAC` on the **same** cache and ranker. Report per city / level / N /
-overlap, with paired outcomes and the Stage-A ceiling (if GT cell isn't shortlisted, Stage-B can't fix
-it).
+### `evaluate` (server): real-data A/B vs cv2 baseline — IMPLEMENTED (`magsacpp_torch/evaluate.py`)
+Runs the production patch_rerank two-stage ranker unchanged except the verifier, and compares
+`cpu_magsac` (cv2 USAC_MAGSAC) vs `torch_magsacpp` on the **same** mutual-NN pairs and the **same**
+Σ-levels/mean-cell aggregation, so the only difference is the inlier counter. It reuses `patch_rerank`
+verbatim (`CellStoreS3`, `QueryGridStore`, `matcher`, `search_pyramid_s3._aggregate/_haversine_m`)
+and fetches S3 cells **one-at-a-time with eviction** (`--cache-cap 2` ⇒ download→score→delete, peak
+disk ≈ 2 cells). Reports distR@250/500/1000 top1/top5 + median/p90/p95 and a paired
+`cpu_ok / torch_ok / torch_lost / torch_gained` (brief §10 acceptance: `torch_lost == 0`).
+
+Kramatorsk A/B, from `geoLocalisation/experiments/` (query is DINOv2 d1024; store is vitg14 32×32 =
+same backbone):
+
+```bash
+# 0) coarse shortlist over the kram20 gallery (ids = kram:{groupkey}, match the pyramid store)
+cd /home/ubuntu/work/geoLocalisation
+uv run --python 3.11 --with "torch==2.5.1" --with h5py --with numpy python -m geo_e2c_train.coarse_rank_gallery \
+    --gallery kram=/home/ubuntu/work/out/product_emb/kram20_prodaction.h5 \
+    --queries kram=/home/ubuntu/work/out/gallery_h5/geo_iso_noverlap/queries/query_kramatorsc_d1024.h5 \
+    --city kram --k 100 --out /home/ubuntu/work/out/shortlist_kram_k100.json
+    # NB also needs the coarse ckpt + k32.pt (run_supervlad_cell_w1_best.pt, dict/k32.pt); confirm
+    # flags with --help. You may ALREADY have a kram shortlist from the coarse-recall test (reuse it).
+
+# 1) A/B rerank (both verifiers, identical pairs). Start small, then full.
+cd experiments
+uv run --python 3.11 --with "torch==2.5.1" --with numpy --with h5py --with boto3 --with tqdm \
+    --with opencv-python-headless python -m magsacpp_torch.evaluate \
+    --queries kram=/home/ubuntu/work/out/gallery_h5/geo_iso_noverlap/queries/query_kramatorsc_d1024.h5 \
+    --shortlist /home/ubuntu/work/out/shortlist_kram_k100.json \
+    --index-uri s3://geo-reference/embeddings/kram/pyramid_dinov2vitg14_p448/kram/_index.json \
+    --k-coarse 30 --topk 5 --level-agg sum --cell-agg mean --cache-cap 2 \
+    --backends cpu_magsac torch_magsacpp --mpp-sigma-max 2.0 --device cuda \
+    --max-queries 20 --out /home/ubuntu/work/ab_kram_small.json
+```
+
+`--mpp-sigma-max` is the key torch knob (REPORT §4) — sweep {1,2,3} if torch underperforms. GT comes
+from the query H5 `lat/lon` attrs (same as the production ranker); `GT_flat` images aren't needed for
+distR. Stage-A ceiling: if the GT cell isn't in the shortlist, neither verifier can recover it —
+raise `--k-coarse`.
 
 ## Building the C++ oracle (server, for math parity)
 

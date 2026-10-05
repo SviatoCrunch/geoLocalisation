@@ -289,9 +289,14 @@ def cmd_cache(args):
 
 
 def cmd_evaluate(args):
-    print("[evaluate] runs the torch estimator over a correspondence cache, reproduces the rerank "
-          "score (inliers / n_query_tokens) + sub-tile lat/lon + distR@250m top1/top5, and compares "
-          "vs cv2 USAC_MAGSAC on the SAME cache. Requires a cache from `cache` (server). See README.")
+    print("[evaluate] real-data A/B (cv2 USAC_MAGSAC vs torch MAGSAC++) is a standalone entrypoint "
+          "with its own flags:\n"
+          "    python -m magsacpp_torch.evaluate --queries kram=… --shortlist … --index-uri s3://… \\\n"
+          "        --backends cpu_magsac torch_magsacpp --level-agg sum --cell-agg mean --cache-cap 2 \\\n"
+          "        --device cuda --out ab.json\n"
+          "It fetches S3 cells one-at-a-time and evicts them (peak disk ~= --cache-cap cells), runs "
+          "BOTH verifiers on the SAME mutual-NN pairs + the SAME aggregation, and reports distR@250m "
+          "top1/top5 + paired lost/gained. See README / evaluate.py docstring.")
     return 2
 
 
