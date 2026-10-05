@@ -19,7 +19,7 @@ import torch
 
 from .config import MagsacppConfig
 from .estimator import HomographyResult, _collinear_guard, _gamma_for
-from .solver import forward_sq_residual, solve_minimal_h, solve_weighted_h
+from .solver import forward_sq_residual, solve_minimal, solve_weighted_h
 
 
 @torch.inference_mode()
@@ -87,7 +87,7 @@ def estimate_homography_magsacpp_batch(
         p1s = P1[pair_local].gather(1, gath)            # (g*S, 4, 2)
         p2s = P2[pair_local].gather(1, gath)
         nondeg = _collinear_guard(p1s, cfg.collinearity_eps) & _collinear_guard(p2s, cfg.collinearity_eps)
-        Hs, ok = solve_minimal_h(p1s, p2s, cfg.min_singular_ratio)                # (g*S,3,3),(g*S,)
+        Hs, ok = solve_minimal(p1s, p2s, cfg.minimal_solver, cfg.min_singular_ratio)  # (g*S,3,3),(g*S,)
         ok = ok & nondeg
 
         # --- score every hypothesis against ALL its pair's points ---

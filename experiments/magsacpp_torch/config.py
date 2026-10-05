@@ -80,6 +80,9 @@ class MagsacppConfig:
     # denominators to +eps (sec.5): a negative w is a valid projection.
     min_abs_denominator: float = 1e-12
     min_singular_ratio: float = 1e-7   # near-singular minimal/refit model rejection (cond proxy)
+    # minimal 4-pt solver: "svd" (full-matrices nullspace) or "closed_form" (adjugate, no SVD -- the
+    # GPU-fast path; avoids thousands of tiny per-hypothesis SVDs). Math-equivalent up to scale/sign.
+    minimal_solver: str = "svd"
     collinearity_eps: float = 1e-8     # minimal-sample triplet-area degeneracy guard
 
     # --- precision / device / optimization ---

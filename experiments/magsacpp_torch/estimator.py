@@ -27,7 +27,7 @@ import torch
 
 from .config import MagsacppConfig
 from .gamma import GammaLUT, GammaMath
-from .solver import forward_sq_residual, solve_minimal_h, solve_weighted_h
+from .solver import forward_sq_residual, solve_minimal, solve_weighted_h
 
 ArrayLike = Union[torch.Tensor, "Sequence"]
 
@@ -116,7 +116,7 @@ def _estimate_one(p1: torch.Tensor, p2: torch.Tensor, valid: torch.Tensor,
     p1s = p1[samp]                                  # (S, 4, 2)
     p2s = p2[samp]
     nondeg = _collinear_guard(p1s, cfg.collinearity_eps) & _collinear_guard(p2s, cfg.collinearity_eps)
-    Hs, ok = solve_minimal_h(p1s, p2s, cfg.min_singular_ratio)       # (S,3,3), (S,)
+    Hs, ok = solve_minimal(p1s, p2s, cfg.minimal_solver, cfg.min_singular_ratio)   # (S,3,3), (S,)
     ok = ok & nondeg
     if not bool(ok.any()):
         return HomographyResult(nan_H, False, "degenerate", 0.0, float("inf"), empty_mask, 0,

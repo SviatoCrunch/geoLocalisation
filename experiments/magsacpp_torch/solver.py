@@ -120,6 +120,94 @@ def solve_minimal_h(p1: torch.Tensor, p2: torch.Tensor, min_singular_ratio: floa
     return H, ok
 
 
+def _adj3(M: torch.Tensor) -> torch.Tensor:
+    """Batched adjugate (classical adjoint) of 3x3 matrices: M @ adj(M) = det(M) I. Pure arithmetic."""
+    m00, m01, m02 = M[..., 0, 0], M[..., 0, 1], M[..., 0, 2]
+    m10, m11, m12 = M[..., 1, 0], M[..., 1, 1], M[..., 1, 2]
+    m20, m21, m22 = M[..., 2, 0], M[..., 2, 1], M[..., 2, 2]
+    r0 = torch.stack([m11 * m22 - m12 * m21, m02 * m21 - m01 * m22, m01 * m12 - m02 * m11], -1)
+    r1 = torch.stack([m12 * m20 - m10 * m22, m00 * m22 - m02 * m20, m02 * m10 - m00 * m12], -1)
+    r2 = torch.stack([m10 * m21 - m11 * m20, m01 * m20 - m00 * m21, m00 * m11 - m01 * m10], -1)
+    return torch.stack([r0, r1, r2], -2)
+
+
+def _det3(M: torch.Tensor) -> torch.Tensor:
+    m00, m01, m02 = M[..., 0, 0], M[..., 0, 1], M[..., 0, 2]
+    m10, m11, m12 = M[..., 1, 0], M[..., 1, 1], M[..., 1, 2]
+    m20, m21, m22 = M[..., 2, 0], M[..., 2, 1], M[..., 2, 2]
+    return (m00 * (m11 * m22 - m12 * m21) - m01 * (m10 * m22 - m12 * m20)
+            + m02 * (m10 * m21 - m11 * m20))
+
+
+def _inv_sim3(T: torch.Tensor) -> torch.Tensor:
+    """Analytic inverse of a Hartley normalization matrix [[a,0,b],[0,a,c],[0,0,1]] (no linalg kernel)."""
+    a = T[:, 0, 0]
+    b = T[:, 0, 2]
+    c = T[:, 1, 2]
+    inv = torch.zeros_like(T)
+    ia = 1.0 / a
+    inv[:, 0, 0] = ia
+    inv[:, 1, 1] = ia
+    inv[:, 0, 2] = -b * ia
+    inv[:, 1, 2] = -c * ia
+    inv[:, 2, 2] = 1.0
+    return inv
+
+
+def _closed_form_4pt(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
+    """Closed-form 4-point homography p1->p2 (B,4,2)->(B,3,3), up to scale, NO SVD / NO division.
+
+    Maps the canonical basis to each point set via A = [lambda_i x_i] with lambda = adj([x1 x2 x3]) x4,
+    then H = B' @ adj(A') (adjugate replaces inverse). Pure tensor arithmetic -> batches perfectly on
+    GPU, avoiding the tiny-matrix SVD that dominates the per-hypothesis cost.
+    (Refs: Radially-Distorted-Homographies-Revisited adjugate 4-pt; SKS/ACA decomposition.)
+    """
+    B = p1.shape[0]
+    one = torch.ones(B, 4, 1, dtype=p1.dtype, device=p1.device)
+    X = torch.cat([p1, one], -1)                      # (B,4,3) homogeneous
+    Y = torch.cat([p2, one], -1)
+
+    def basis(P):
+        M = P[:, :3, :].transpose(1, 2)               # (B,3,3): columns = first 3 points
+        x4 = P[:, 3, :]                                # (B,3)
+        lam = torch.einsum("bij,bj->bi", _adj3(M), x4)   # adj(M) x4  (no 1/det: overall scale)
+        return M * lam.unsqueeze(1)                    # scale column j by lam_j
+
+    return basis(Y) @ _adj3(basis(X))                 # B' @ adj(A') ~ B' A'^{-1}
+
+
+def solve_minimal_h_closed_form(p1: torch.Tensor, p2: torch.Tensor,
+                                ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Closed-form minimal 4-point homography (drop-in for :func:`solve_minimal_h`). p1,p2 (B,4,2).
+
+    Hartley-normalizes first (float32 conditioning), solves in closed form, denormalizes. Returns
+    (H (B,3,3) p1->p2, ok (B,)). Same contract/scale convention as the SVD solver; matches it up to
+    the usual scale/sign ambiguity on well-posed samples (tests/test_solver_closed_form.py)."""
+    B, M, _ = p1.shape
+    valid = torch.ones(B, M, dtype=torch.bool, device=p1.device)
+    p1n, T1 = normalize_points(p1, valid)
+    p2n, T2 = normalize_points(p2, valid)
+    Hn = _closed_form_4pt(p1n, p2n)
+    H = _inv_sim3(T2) @ Hn @ T1
+    h22 = H[:, 2, 2]
+    safe = h22.abs() > 1e-12
+    scale = torch.where(safe, 1.0 / torch.where(safe, h22, torch.ones_like(h22)),
+                        torch.ones_like(h22))
+    H = H * scale.view(B, 1, 1)
+    detH = _det3(H)
+    ok = torch.isfinite(H.reshape(B, -1)).all(1) & torch.isfinite(detH) & (detH.abs() > 1e-12)
+    return H, ok
+
+
+def solve_minimal(p1: torch.Tensor, p2: torch.Tensor, method: str = "svd",
+                  min_singular_ratio: float = 1e-7) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Minimal-solver dispatcher: ``svd`` (full-matrices nullspace) or ``closed_form`` (adjugate 4-pt,
+    no SVD -- the GPU-fast path). Both return (H p1->p2, ok)."""
+    if method == "closed_form":
+        return solve_minimal_h_closed_form(p1, p2)
+    return solve_minimal_h(p1, p2, min_singular_ratio)
+
+
 def solve_weighted_h(p1: torch.Tensor, p2: torch.Tensor, weights: torch.Tensor,
                      valid: torch.Tensor, min_singular_ratio: float = 1e-7,
                      ) -> Tuple[torch.Tensor, torch.Tensor]:
