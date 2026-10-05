@@ -378,7 +378,7 @@ def cmd_profile(args):
     timed(lambda: solve_minimal(p1s, p2s, "svd"), "minimal solve svd (BS x4)")
     timed(lambda: forward_sq_residual(Hs, P1, P2), "forward residual (BS x N)")
     timed(lambda: gm.total_loss(sq, valid, 1), "gamma total_loss (BS x N)")
-    timed(lambda: solve_weighted_h(wp1, wp2, w, wv), "weighted refit SVD (B x N)")
+    timed(lambda: solve_weighted_h(wp1, wp2, w, wv), "weighted refit eigh (B x N)")
     print("  (compare to verify wall ~112 s / q-set to see which stage dominates)")
     return 0
 

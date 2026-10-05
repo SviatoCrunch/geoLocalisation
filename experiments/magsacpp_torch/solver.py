@@ -93,6 +93,30 @@ def _nullspace_h(A: torch.Tensor, min_singular_ratio: float) -> Tuple[torch.Tens
     return H, well
 
 
+def _null_eigh(A: torch.Tensor, min_singular_ratio: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Right nullspace of A (B,R,9), R>=9, via normal equations + batched symmetric eigh.
+
+    G = A^T A is 9x9 SPD; its smallest-eigenvalue eigenvector is the sought h (same as A's smallest
+    right singular vector, since eigenvectors of A^T A == right singular vectors of A, eigenvalues =
+    singular values^2). Batched 9x9 eigh hits cuSOLVER syevjBatched (fast for n<=32), avoiding the
+    skinny-SVD of (R,9) that computed a wasteful R x R U. ``min_singular_ratio`` is applied on the
+    singular-value scale (sqrt of eigenvalues)."""
+    B = A.shape[0]
+    finite = torch.isfinite(A.reshape(B, -1)).all(1)
+    A_safe = torch.where(finite.view(B, 1, 1), A, torch.zeros_like(A))
+    G = A_safe.transpose(1, 2) @ A_safe                 # (B,9,9) symmetric PSD
+    G = 0.5 * (G + G.transpose(1, 2))                   # enforce symmetry (numerical)
+    lam, V = torch.linalg.eigh(G)                       # ascending eigenvalues; V columns eigenvectors
+    H = V[..., 0].reshape(B, 3, 3)                      # smallest-eigenvalue eigenvector
+    s_small = lam[:, 0].clamp_min(0).sqrt()
+    s_next = lam[:, 1].clamp_min(0).sqrt()
+    s_max = lam[:, -1].clamp_min(0).sqrt().clamp_min(1e-300)
+    well = finite & (s_next > min_singular_ratio * s_max) & (s_next >= s_small)
+    detH = _det3(H)
+    well = well & torch.isfinite(detH) & (detH.abs() > 1e-12)
+    return H, well
+
+
 def solve_minimal_h(p1: torch.Tensor, p2: torch.Tensor, min_singular_ratio: float = 1e-7,
                     ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Batched 4-point (or N>=4) homography DLT with Hartley normalization. p1,p2 (B, M, 2).
@@ -226,9 +250,11 @@ def solve_weighted_h(p1: torch.Tensor, p2: torch.Tensor, weights: torch.Tensor,
     p1n, T1 = normalize_points(p1, valid)
     p2n, T2 = normalize_points(p2, valid)
     A = _dlt_rows(p1n, p2n, w)
-    Hn, ok = _nullspace_h(A, min_singular_ratio)
-    T2inv = torch.linalg.inv(T2)
-    H = T2inv @ Hn @ T1
+    # normal equations (9x9) + batched eigh: smallest-eigenvalue eigenvector == smallest right
+    # singular vector of A, but via cuSOLVER syevjBatched (fast for 9x9) instead of a skinny SVD
+    # that wasted a (2N x 2N) U. This is the dominant-cost fix for the IRLS refit.
+    Hn, ok = _null_eigh(A, min_singular_ratio)
+    H = _inv_sim3(T2) @ Hn @ T1
     h22 = H[:, 2, 2]
     safe = h22.abs() > 1e-12
     scale = torch.where(safe, 1.0 / torch.where(safe, h22, torch.ones_like(h22)),
