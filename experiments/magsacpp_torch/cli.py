@@ -337,6 +337,52 @@ def cmd_benchmark(args):
 
 
 # ----------------------------------------------------------------------------- cache / evaluate (server)
+def cmd_profile(args):
+    """Per-stage GPU timing of the batched verify, to find the real bottleneck (no S3/data).
+    Shapes mimic one (cell,query): ``crops`` x ``hyps`` minimal solves, ``points`` matches each."""
+    dev = args.device
+    if dev == "cuda" and not torch.cuda.is_available():
+        print("[profile] no CUDA -> cpu"); dev = "cpu"
+    from .gamma import GammaMath
+    from .solver import forward_sq_residual, solve_minimal, solve_weighted_h
+    g = torch.Generator(device=dev).manual_seed(0)
+    B, S, N = args.crops, args.hyps, args.points
+    BS = B * S
+    dt = torch.float64 if args.dtype == "float64" else torch.float32
+    p1s = torch.rand(BS, 4, 2, generator=g, device=dev, dtype=dt) * 100
+    p2s = torch.rand(BS, 4, 2, generator=g, device=dev, dtype=dt) * 100
+    P1 = torch.rand(BS, N, 2, generator=g, device=dev, dtype=dt) * 100
+    P2 = torch.rand(BS, N, 2, generator=g, device=dev, dtype=dt) * 100
+    Hs = torch.eye(3, device=dev, dtype=dt).expand(BS, 3, 3).contiguous()
+    sq = torch.rand(BS, N, generator=g, device=dev, dtype=dt) * 50
+    valid = torch.ones(BS, N, dtype=torch.bool, device=dev)
+    gm = GammaMath(4, 3.64, 0.25, 2.0, dtype=dt)
+    wp1 = torch.rand(B, N, 2, generator=g, device=dev, dtype=dt) * 100
+    wp2 = torch.rand(B, N, 2, generator=g, device=dev, dtype=dt) * 100
+    w = torch.rand(B, N, generator=g, device=dev, dtype=dt)
+    wv = torch.ones(B, N, dtype=torch.bool, device=dev)
+
+    def timed(fn, name, iters=20):
+        fn()
+        if dev == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        if dev == "cuda":
+            torch.cuda.synchronize()
+        print(f"  {name:34s} {(time.perf_counter()-t0)/iters*1e3:8.2f} ms")
+
+    print(f"[profile] device={dev} dtype={args.dtype} crops={B} hyps={S} points={N} (BS={BS})")
+    timed(lambda: solve_minimal(p1s, p2s, "closed_form"), "minimal solve closed_form (BS x4)")
+    timed(lambda: solve_minimal(p1s, p2s, "svd"), "minimal solve svd (BS x4)")
+    timed(lambda: forward_sq_residual(Hs, P1, P2), "forward residual (BS x N)")
+    timed(lambda: gm.total_loss(sq, valid, 1), "gamma total_loss (BS x N)")
+    timed(lambda: solve_weighted_h(wp1, wp2, w, wv), "weighted refit SVD (B x N)")
+    print("  (compare to verify wall ~112 s / q-set to see which stage dominates)")
+    return 0
+
+
 def cmd_cache(args):
     print("[cache] builds the immutable correspondence cache from the reranker data via "
           "patch_rerank.matcher.matched_coords. This requires the real query H5 + token store + "
@@ -394,6 +440,11 @@ def build_parser():
     b.add_argument("--sigma-max", type=float, default=1.0, dest="sigma_max"); b.add_argument("--hyps", type=int, default=1000)
     b.add_argument("--reps", type=int, default=5); b.add_argument("--seed", type=int, default=0)
     b.set_defaults(func=cmd_benchmark)
+
+    pr = sub.add_parser("profile")
+    pr.add_argument("--device", default="cuda"); pr.add_argument("--dtype", default="float32", choices=["float64", "float32"])
+    pr.add_argument("--crops", type=int, default=200); pr.add_argument("--hyps", type=int, default=256)
+    pr.add_argument("--points", type=int, default=100); pr.set_defaults(func=cmd_profile)
 
     sub.add_parser("cache").set_defaults(func=cmd_cache)
     sub.add_parser("evaluate").set_defaults(func=cmd_evaluate)
