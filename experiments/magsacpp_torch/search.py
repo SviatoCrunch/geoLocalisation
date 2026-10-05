@@ -29,6 +29,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import torch.nn.functional as F                           # noqa: E402
+
+from .batch import estimate_homography_magsacpp_batch      # noqa: E402
 from .config import MagsacppConfig                        # noqa: E402
 from .evaluate import _torch_counts                       # batched torch inlier counts (reused)  # noqa: E402
 
@@ -37,9 +40,55 @@ def _pct(d, p):
     return float(np.percentile(np.asarray(d, float), p)) if len(d) else float("nan")
 
 
+def _mutual_nn_padded(q_feat, r_feats, q_xy, r_xy, device, match_budget: int = 50_000_000):
+    """Vectorized mutual-NN for ALL crops at once → padded matched coords, fully on GPU.
+
+    ``q_feat`` (Nq,D), ``r_feats`` (C,Nr,D). Returns (qm, rm, valid) with qm/rm (C,M_max,2) and
+    valid (C,M_max) bool — the matched query/ref coordinates per crop, padded to the per-cell max.
+    The cosine-sims tensor (chunk,Nq,Nr) is the memory hog, so crops are processed in chunks of
+    ``match_budget // (Nq*Nr)`` ("memory at a time"); only the small mutual-match triples are kept.
+    Same match SET as patch_rerank.matcher.matched_coords_batch, but no per-crop Python/numpy and no
+    host round-trip."""
+    q = F.normalize(q_feat.float(), dim=1)
+    R = F.normalize(r_feats.float(), dim=2)
+    C, Nr, _ = R.shape
+    Nq = q.shape[0]
+    qar = torch.arange(Nq, device=device)
+    cs, qis, ris = [], [], []
+    step = max(1, match_budget // max(1, Nq * Nr))
+    for lo in range(0, C, step):
+        hi = min(C, lo + step)
+        sims = torch.matmul(q, R[lo:hi].transpose(1, 2))      # (c, Nq, Nr)
+        q2r = sims.argmax(2)                                  # (c, Nq) best ref per query token
+        r2q = sims.argmax(1)                                  # (c, Nr) best query per ref token
+        mutual = torch.gather(r2q, 1, q2r) == qar             # (c, Nq)
+        nz = mutual.nonzero(as_tuple=False)                   # (K,2): [c_local, i] ascending
+        if nz.numel():
+            cl, ii = nz[:, 0], nz[:, 1]
+            cs.append(cl + lo); qis.append(ii); ris.append(q2r[cl, ii])
+        del sims
+    if not cs:
+        z = torch.zeros(C, 0, 2, dtype=torch.float64, device=device)
+        return z, z, torch.zeros(C, 0, dtype=torch.bool, device=device)
+    all_c = torch.cat(cs); all_qi = torch.cat(qis); all_ri = torch.cat(ris)
+    counts = torch.bincount(all_c, minlength=C)               # matches per crop
+    M_max = int(counts.max())
+    offs = torch.cumsum(counts, 0) - counts                   # crop start offset (all_c is non-decreasing)
+    slot = torch.arange(all_c.numel(), device=device) - offs[all_c]   # within-crop rank
+    qxy_t = torch.as_tensor(np.asarray(q_xy, np.float64), device=device)
+    rxy_t = torch.as_tensor(np.asarray(r_xy, np.float64), device=device)
+    qm = torch.zeros(C, M_max, 2, dtype=torch.float64, device=device)
+    rm = torch.zeros(C, M_max, 2, dtype=torch.float64, device=device)
+    valid = torch.zeros(C, M_max, dtype=torch.bool, device=device)
+    qm[all_c, slot] = qxy_t[all_qi]
+    rm[all_c, slot] = rxy_t[all_ri]
+    valid[all_c, slot] = True
+    return qm, rm, valid
+
+
 def search(queries: dict, shortlist: dict, store, *, config: MagsacppConfig, k_coarse: int = 30,
            topk: int = 5, level_agg: str = "sum", cell_agg: str = "mean", device: str = "cuda",
-           generator=None):
+           generator=None, flat: bool = True, match_budget: int = 50_000_000):
     """Localize a batch of query embeddings.
 
     ``queries``: ``{query_id: {"feat": (N,D) tensor, "xy": (N,2), "lat": float|nan, "lon": float|nan}}``
@@ -70,8 +119,35 @@ def search(queries: dict, shortlist: dict, store, *, config: MagsacppConfig, k_c
     for cid in tqdm(sorted(inv), desc="cells", unit="cell"):
         t0 = time.perf_counter(); cd = store.cell(cid); t_fetch += time.perf_counter() - t0
         grids, keys, kp = _load_cell(cd, device)
+        nlev = len(cd.levels)
         for q in inv[cid]:
             p = plans[q]
+            if flat:
+                # one flat GPU pass over all C = n_pos*n_levels crops: match -> MAGSAC++ counts ->
+                # score -> reshape (n_pos, n_levels) aggregation. No per-crop Python / host round-trip.
+                if str(device).startswith("cuda"):
+                    torch.cuda.synchronize()
+                tm = time.perf_counter()
+                qm, rm, valid = _mutual_nn_padded(p["feat"], grids, p["xy"], kp, device, match_budget)
+                if str(device).startswith("cuda"):
+                    torch.cuda.synchronize()
+                t_match += time.perf_counter() - tm
+                tv = time.perf_counter()
+                counts, _ = estimate_homography_magsacpp_batch(rm, qm, valid, config=config,
+                                                               generator=gen, return_counts=True)
+                if str(device).startswith("cuda"):
+                    torch.cuda.synchronize()
+                t_verify += time.perf_counter() - tv
+                score = counts.double() / p["n_q"] if p["n_q"] else counts.double()
+                s2d = score.view(cd.n_pos, nlev)                       # crops ordered pos-major
+                pyr = s2d.sum(1) if level_agg == "sum" else s2d.amax(1)   # (n_pos,)
+                bi = int(pyr.argmax())
+                lvl_i = int(s2d[bi].argmax())
+                cs = {"mean": float(pyr.mean()), "min": float(pyr.min()),
+                      "max": float(pyr.max())}[cell_agg]
+                qcell[q][cid] = {"cell_id": cid, "cell_score": cs, "lat": float(cd.lat[bi]),
+                                 "lon": float(cd.lon[bi]), "level_m": int(cd.levels[lvl_i])}
+                continue
             tm = time.perf_counter()
             mc = matched_coords_batch(p["feat"], grids, p["xy"], kp)
             t_match += time.perf_counter() - tm
@@ -142,6 +218,10 @@ def main(argv=None) -> int:
     ap.add_argument("--mpp-solver", choices=["svd", "closed_form"], default="closed_form", dest="mpp_solver")
     ap.add_argument("--mpp-seed", type=int, default=0, dest="mpp_seed")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--legacy-match", action="store_true", dest="legacy_match",
+                    help="use the per-crop match+count path instead of the flat GPU pass")
+    ap.add_argument("--match-budget", type=int, default=50_000_000, dest="match_budget",
+                    help="max elements of the (chunk,Nq,Nr) cosine-sims tensor per match chunk")
     ap.add_argument("--only-city", default=None)
     ap.add_argument("--max-queries", type=int, default=0)
     ap.add_argument("--out", required=True)
@@ -177,7 +257,8 @@ def main(argv=None) -> int:
 
     per_query, summary, speed = search(queries, sj, store, config=cfg, k_coarse=args.k_coarse,
                                        topk=args.topk, level_agg=args.level_agg,
-                                       cell_agg=args.cell_agg, device=device, generator=gen)
+                                       cell_agg=args.cell_agg, device=device, generator=gen,
+                                       flat=not args.legacy_match, match_budget=args.match_budget)
     out = {"meta": {"k_coarse": args.k_coarse, "topk": args.topk, "level_agg": args.level_agg,
                     "cell_agg": args.cell_agg, "index_uri": args.index_uri, "device": str(device),
                     "mpp": {"sigma_max": args.mpp_sigma_max, "hyps": args.mpp_hyps,

@@ -31,10 +31,15 @@ def estimate_homography_magsacpp_batch(
     config: Optional[MagsacppConfig] = None,
     generator: Optional[torch.Generator] = None,
     hypothesis_indices: Optional[torch.Tensor] = None,
-) -> List[HomographyResult]:
+    return_counts: bool = False,
+):
     """Vectorized batch estimate. ``points1``/``points2`` = (P, N, 2) padded tensors on one device,
     ``valid_mask`` = (P, N) bool. Returns a list of P :class:`HomographyResult` (trace is always None).
-    ``hypothesis_indices`` optional (P, S, 4) recorded schedule (replay/parity)."""
+    ``hypothesis_indices`` optional (P, S, 4) recorded schedule (replay/parity).
+
+    ``return_counts=True`` skips building the per-pair HomographyResult objects and returns
+    ``(inlier_counts (P,) long, success (P,) bool)`` as TENSORS — the hot path for the flat
+    search pass, avoiding a Python loop over P crops."""
     cfg = config or MagsacppConfig()
     if points1.dim() != 3 or points1.shape[-1] != 2 or points1.shape != points2.shape:
         raise ValueError("points1/points2 must be matching (P,N,2) tensors")
@@ -55,16 +60,19 @@ def estimate_homography_magsacpp_batch(
 
     nan_H = torch.full((3, 3), float("nan"), dtype=cfg.dtype, device=device)
     results: List[Optional[HomographyResult]] = [None] * P
+    counts = torch.zeros(P, dtype=torch.long, device=device)   # inlier count per pair (return_counts)
+    succ = torch.zeros(P, dtype=torch.bool, device=device)
     nvalid = valid.sum(1)
     todo = [i for i in range(P) if int(nvalid[i]) >= ms]
-    for i in range(P):
-        if i not in set(todo):
-            st = "all_invalid" if int(nvalid[i]) == 0 else "n_lt_4"
-            results[i] = HomographyResult(nan_H.clone(), False, st, 0.0, INF,
-                                          torch.zeros(N, dtype=torch.bool, device=device), 0, 0, 0,
-                                          cfg.sigma_max)
+    if not return_counts:
+        for i in range(P):
+            if i not in set(todo):
+                st = "all_invalid" if int(nvalid[i]) == 0 else "n_lt_4"
+                results[i] = HomographyResult(nan_H.clone(), False, st, 0.0, INF,
+                                              torch.zeros(N, dtype=torch.bool, device=device), 0, 0, 0,
+                                              cfg.sigma_max)
     if not todo:
-        return results  # type: ignore
+        return (counts, succ) if return_counts else results  # type: ignore
 
     # group pairs so the (g*S, N) work tensor stays within budget
     gP = max(1, cfg.points_budget // max(1, S * N))
@@ -117,6 +125,10 @@ def estimate_homography_magsacpp_batch(
         # --- explicit inlier mask (separate threshold) ---
         sqf = forward_sq_residual(bestH, P1, P2, cfg.min_abs_denominator)         # (g,N)
         inl = (sqf <= cfg.inlier_threshold ** 2) & V                             # (g,N)
+        counts[gidx] = torch.where(feasible, inl.sum(1), torch.zeros_like(feasible, dtype=torch.long))
+        succ[gidx] = feasible
+        if return_counts:                 # tensor hot path: no per-crop Python object build
+            continue
         for j in range(g):
             i = int(gidx[j])
             if not bool(feasible[j]):
@@ -129,4 +141,4 @@ def estimate_homography_magsacpp_batch(
                                           (1.0 / tl) if tl > 0 else INF, tl, inl[j].clone(),
                                           int(inl[j].sum()), int(okg[j].sum()), cfg.irls_iters,
                                           cfg.sigma_max)
-    return results  # type: ignore
+    return (counts, succ) if return_counts else results  # type: ignore
