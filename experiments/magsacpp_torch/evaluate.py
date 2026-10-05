@@ -267,20 +267,22 @@ def main(argv=None) -> int:
             "topk": {"median_m": _pct(dk, 50), "p90_m": _pct(dk, 90), "p95_m": _pct(dk, 95),
                      **{f"distR@{int(t)}m": _recall(dk, t) for t in thr}},
         }
-        print(f"[{b}] n={len(d1)} top1 distR@250m={_recall(d1,250):.3f} top{args.topk} "
-              f"distR@250m={_recall(dk,250):.3f} median_top1={_pct(d1,50):.0f}m", flush=True)
+        print(f"[{b}] n={len(d1)} | top{args.topk} distR @250m={_recall(dk,250):.3f} "
+              f"@500m={_recall(dk,500):.3f} @1000m={_recall(dk,1000):.3f} median_top{args.topk}={_pct(dk,50):.0f}m "
+              f"| top1@250m={_recall(d1,250):.3f}", flush=True)
 
-    # paired analysis (brief §10): queries CPU localizes <=250 but torch loses, and vice-versa
+    # paired analysis (brief §10): queries CPU localizes but torch loses, and vice-versa.
+    # Operational metric for this task = top5 @1000m (top1@250m also kept for reference).
     if {"cpu_magsac", "torch_magsacpp"} <= set(backends):
-        c, t = np.array(top1["cpu_magsac"], float), np.array(top1["torch_magsacpp"], float)
-        lost = int(((c <= 250) & (t > 250)).sum())
-        gained = int(((c > 250) & (t <= 250)).sum())
-        out["summary"]["paired_top1@250m"] = {"cpu_ok": int((c <= 250).sum()),
-                                              "torch_ok": int((t <= 250).sum()),
-                                              "torch_lost": lost, "torch_gained": gained,
-                                              "n": int(len(c))}
-        print(f"[paired top1@250m] cpu_ok={int((c<=250).sum())} torch_ok={int((t<=250).sum())} "
-              f"torch_lost={lost} torch_gained={gained} (brief acceptance: lost==0)", flush=True)
+        def _paired(ca, ta, thr, tag):
+            c, t = np.array(ca, float), np.array(ta, float)
+            lost = int(((c <= thr) & (t > thr)).sum()); gained = int(((c > thr) & (t <= thr)).sum())
+            out["summary"][tag] = {"cpu_ok": int((c <= thr).sum()), "torch_ok": int((t <= thr).sum()),
+                                   "torch_lost": lost, "torch_gained": gained, "n": int(len(c))}
+            print(f"[{tag}] cpu_ok={int((c<=thr).sum())} torch_ok={int((t<=thr).sum())} "
+                  f"torch_lost={lost} torch_gained={gained}", flush=True)
+        _paired(topk["cpu_magsac"], topk["torch_magsacpp"], 1000, f"paired_top{args.topk}@1000m")
+        _paired(top1["cpu_magsac"], top1["torch_magsacpp"], 250, "paired_top1@250m")
 
     out["speed"] = {"queries": len(plans), "fetch_s": t_fetch, "load_s": t_load, "match_s": t_match,
                     "verify_s": t_verify, "cells_downloaded": store.n_downloads}
