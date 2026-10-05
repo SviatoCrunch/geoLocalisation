@@ -94,7 +94,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--queries", nargs="+", required=True, help="city=query_d1024.h5")
     ap.add_argument("--shortlist", required=True, help="coarse top-N cells per query (store ids)")
-    ap.add_argument("--index-uri", required=True, help="s3://…/<city>/_index.json")
+    ap.add_argument("--index-uri", default=None, help="s3://…/<city>/_index.json (S3 store)")
+    ap.add_argument("--local-store", default=None, dest="local_store",
+                    help="local dir (aws s3 sync of the store prefix) — offline, no S3 at runtime")
     ap.add_argument("--cache-dir", default="/tmp/cellcache")
     ap.add_argument("--cache-cap", type=int, default=2, help="LRU cells kept on disk (download->evict)")
     ap.add_argument("--k-coarse", type=int, default=30)
@@ -139,7 +141,13 @@ def main(argv=None) -> int:
     gen = torch.Generator(device=device).manual_seed(args.mpp_seed)
 
     qstore = QueryGridStore(dict(a.split("=", 1) for a in args.queries))
-    store = CellStoreS3(args.index_uri, cache_dir=args.cache_dir, cache_cap=args.cache_cap)
+    if args.local_store:
+        from .local_store import LocalCellStore
+        store = LocalCellStore(args.local_store)
+    elif args.index_uri:
+        store = CellStoreS3(args.index_uri, cache_dir=args.cache_dir, cache_cap=args.cache_cap)
+    else:
+        print("[evaluate] need --local-store <dir> or --index-uri s3://…"); return 2
     sj = json.loads(Path(args.shortlist).expanduser().read_text())
 
     # --- per-query plan: query features on device + its candidate cells ---
@@ -216,15 +224,16 @@ def main(argv=None) -> int:
     # --- aggregate per backend -> ranking -> distances ---
     out = {"meta": {"backends": backends, "k_coarse": args.k_coarse, "topk": args.topk,
                     "level_agg": args.level_agg, "cell_agg": args.cell_agg,
-                    "reproj_thresh": args.reproj_thresh, "index_uri": args.index_uri,
+                    "reproj_thresh": args.reproj_thresh,
+                    "store": args.local_store or args.index_uri,
                     "store_config": store.config, "device": str(device),
                     "mpp": {"sigma_max": args.mpp_sigma_max, "hyps": args.mpp_hyps,
                             "irls": args.mpp_irls, "dtype": args.mpp_dtype,
                             "solver": args.mpp_solver, "batched": not args.mpp_per_pair,
                             "lut": args.mpp_lut},
                     "fingerprint": hashlib.sha1(
-                        (args.shortlist + "|" + args.index_uri + "|" + json.dumps(store.config, sort_keys=True)
-                         ).encode()).hexdigest()[:12]},
+                        (args.shortlist + "|" + str(args.local_store or args.index_uri) + "|"
+                         + json.dumps(store.config, sort_keys=True)).encode()).hexdigest()[:12]},
            "per_query": {}, "summary": {}, "speed": {}}
     top1 = {b: [] for b in backends}
     topk = {b: [] for b in backends}
