@@ -39,6 +39,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from .batch import estimate_homography_magsacpp_batch     # noqa: E402
 from .config import MagsacppConfig                       # noqa: E402
 from .estimator import estimate_homography_magsacpp       # noqa: E402
 
@@ -58,6 +59,35 @@ def _torch_inliers(qm, rm, cfg, device, gen):
     qm_t = torch.as_tensor(np.asarray(qm, np.float64), dtype=cfg.dtype, device=device)
     res = estimate_homography_magsacpp(rm_t, qm_t, config=cfg, generator=gen)
     return res.inlier_count if res.success else 0
+
+
+def _torch_counts(mc, n_q, cfg, device, gen, min_sample, batched):
+    """Inlier counts for ALL crops of a (cell,query). ``batched`` => one cross-pair call over all
+    crops (the GPU throughput path); else per-crop. Crops with <min_sample matches -> 0."""
+    counts = [0] * len(mc)
+    idxs = [j for j, (qm, rm, nm) in enumerate(mc) if n_q and nm >= min_sample]
+    if not idxs:
+        return counts
+    if not batched:
+        for j in idxs:
+            qm, rm, _ = mc[j]
+            counts[j] = _torch_inliers(qm, rm, cfg, device, gen)
+        return counts
+    Nmax = max(mc[j][1].shape[0] for j in idxs)
+    B = len(idxs)
+    p1 = torch.zeros(B, Nmax, 2, dtype=cfg.dtype, device=device)   # source = rm (map)
+    p2 = torch.zeros(B, Nmax, 2, dtype=cfg.dtype, device=device)   # dest   = qm (query)
+    valid = torch.zeros(B, Nmax, dtype=torch.bool, device=device)
+    for b, j in enumerate(idxs):
+        qm, rm, _ = mc[j]
+        m = rm.shape[0]
+        p1[b, :m] = torch.as_tensor(np.asarray(rm, np.float64), dtype=cfg.dtype, device=device)
+        p2[b, :m] = torch.as_tensor(np.asarray(qm, np.float64), dtype=cfg.dtype, device=device)
+        valid[b, :m] = True
+    res = estimate_homography_magsacpp_batch(p1, p2, valid, config=cfg, generator=gen)
+    for b, j in enumerate(idxs):
+        counts[j] = res[b].inlier_count
+    return counts
 
 
 def main(argv=None) -> int:
@@ -80,6 +110,8 @@ def main(argv=None) -> int:
     ap.add_argument("--mpp-irls", type=int, default=3, dest="mpp_irls")
     ap.add_argument("--mpp-dtype", choices=["float32", "float64"], default="float32", dest="mpp_dtype")
     ap.add_argument("--mpp-seed", type=int, default=0, dest="mpp_seed")
+    ap.add_argument("--mpp-per-pair", action="store_true", dest="mpp_per_pair",
+                    help="force the slow per-crop torch path (default: cross-pair batched)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--only-city", default=None)
     ap.add_argument("--max-queries", type=int, default=0)
@@ -140,21 +172,28 @@ def main(argv=None) -> int:
             tm = time.perf_counter()
             mc = matched_coords_batch(p["qfeat"], grids, p["qxy"], kp)   # identical pairs for both
             t_match += time.perf_counter() - tm
-            sc = {b: {} for b in backends}
-            for j, (i, L) in enumerate(keys):
-                qm, rm, n_mut = mc[j]
-                ok = p["n_q"] and n_mut >= _MIN
-                for b in backends:
-                    tv = time.perf_counter()
-                    if not ok:
-                        n_in = 0
-                    elif b == "cpu_magsac":
-                        n_in = verify_inliers(qm, rm, model="homography", estimator="magsac",
-                                              reproj_thresh=args.reproj_thresh).shape[0]
-                    else:
-                        n_in = _torch_inliers(qm, rm, cfg, device, gen)
-                    t_verify[b] += time.perf_counter() - tv
-                    sc[b][(i, L)] = n_in / p["n_q"] if p["n_q"] else 0.0
+            nq = p["n_q"]
+            sc = {}
+            if "cpu_magsac" in backends:
+                tv = time.perf_counter()
+                sc["cpu_magsac"] = {}
+                for j, (i, L) in enumerate(keys):
+                    qm, rm, n_mut = mc[j]
+                    n_in = (verify_inliers(qm, rm, model="homography", estimator="magsac",
+                                           reproj_thresh=args.reproj_thresh).shape[0]
+                            if (nq and n_mut >= _MIN) else 0)
+                    sc["cpu_magsac"][(i, L)] = n_in / nq if nq else 0.0
+                t_verify["cpu_magsac"] += time.perf_counter() - tv
+            if "torch_magsacpp" in backends:
+                if str(device).startswith("cuda"):
+                    torch.cuda.synchronize()
+                tv = time.perf_counter()
+                cnts = _torch_counts(mc, nq, cfg, device, gen, _MIN, not args.mpp_per_pair)
+                if str(device).startswith("cuda"):
+                    torch.cuda.synchronize()
+                t_verify["torch_magsacpp"] += time.perf_counter() - tv
+                sc["torch_magsacpp"] = {(i, L): (cnts[j] / nq if nq else 0.0)
+                                        for j, (i, L) in enumerate(keys)}
             for b in backends:
                 pyr, blv = [], []
                 for i in range(cd.n_pos):

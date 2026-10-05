@@ -155,6 +155,31 @@ patch-grid units, threshold ≈ 2), start `σ_max` near the threshold (≈1–2)
 6. **Opt-in integration** — add a `torch_magsacpp` choice next to `cpu_magsac`/`gpu_kornia`/`gpu_batch`
    in `patch_rerank` only after 1–4; keep the production default unchanged; make any fallback explicit.
 
+## 8. First real-data A/B — Kramatorsk (2026-10-05, Tesla T4)
+
+20 queries, k-coarse 30, vitg14 32×32 store, Σ-levels + mean-cell, reproj 2.0, σ_max 2.0, float32.
+Both verifiers on IDENTICAL mutual-NN pairs (`evaluate.py`).
+
+| | top1 distR@250m | top5 distR@250m | median top1 | median top5 |
+|---|---|---|---|---|
+| cpu_magsac (cv2) | 0.000 | 0.150 | 5390 m | 837 m |
+| torch_magsacpp | 0.000 | 0.150 | 4990 m | 1110 m |
+
+paired top1@250m: cpu_ok=0, torch_ok=0, **torch_lost=0**, torch_gained=0.
+
+Reading: **torch MAGSAC++ matches cv2 on quality** (ties on distR, torch_lost=0, slightly better on
+several queries) — the faithful port holds up, unlike the old `gpu_verify` MSAC which was 3× worse on
+the same domain. The LOW ABSOLUTE quality is NOT the verifier: per-query `cell_score` is ~0.045–0.060
+for every candidate (≈5 % inlier ratio everywhere), so ranking barely discriminates and the correct
+near cell (often <100 m) lands in top-5 but not top-1. That is the known FPV↔nadir low-inlier problem
+(matcher/backbone axis), out of scope for the verifier.
+
+Speed (verify-only, isolated): cv2 **102 s**, torch per-pair **1806 s** (17.7× slower) — because the
+per-pair path launches one tiny GPU job per crop. Fixed by the **cross-pair batched path**
+(`batch.py::estimate_homography_magsacpp_batch`, default in `evaluate.py`; `--mpp-per-pair` forces the
+slow path). Batch == per-pair bit-for-bit on a shared schedule (`tests/test_batch.py`). Re-benchmark
+the batched verify time on the server (REPORT §6.5).
+
 ## 7. Known limitations / not verified
 
 - Loss-form equivalence to danini's stored table is derivation-based (§2.2); bit-exact match is a
