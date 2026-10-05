@@ -114,6 +114,8 @@ def main(argv=None) -> int:
                     help="force the slow per-crop torch path (default: cross-pair batched)")
     ap.add_argument("--mpp-solver", choices=["svd", "closed_form"], default="svd", dest="mpp_solver",
                     help="minimal 4-pt solver: svd or closed_form (adjugate, no SVD -- GPU-fast)")
+    ap.add_argument("--mpp-lut", action="store_true", dest="mpp_lut",
+                    help="use the gamma LUT instead of torch.special (faster loss/weights on GPU)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--only-city", default=None)
     ap.add_argument("--max-queries", type=int, default=0)
@@ -132,7 +134,7 @@ def main(argv=None) -> int:
         print(f"[evaluate] CUDA unavailable -> device={device}", flush=True)
     cfg = MagsacppConfig(sigma_max=args.mpp_sigma_max, inlier_threshold=args.reproj_thresh,
                          max_hypotheses=args.mpp_hyps, irls_iters=args.mpp_irls,
-                         minimal_solver=args.mpp_solver,
+                         minimal_solver=args.mpp_solver, use_lut=args.mpp_lut,
                          dtype=torch.float64 if args.mpp_dtype == "float64" else torch.float32)
     gen = torch.Generator(device=device).manual_seed(args.mpp_seed)
 
@@ -218,7 +220,8 @@ def main(argv=None) -> int:
                     "store_config": store.config, "device": str(device),
                     "mpp": {"sigma_max": args.mpp_sigma_max, "hyps": args.mpp_hyps,
                             "irls": args.mpp_irls, "dtype": args.mpp_dtype,
-                            "solver": args.mpp_solver, "batched": not args.mpp_per_pair},
+                            "solver": args.mpp_solver, "batched": not args.mpp_per_pair,
+                            "lut": args.mpp_lut},
                     "fingerprint": hashlib.sha1(
                         (args.shortlist + "|" + args.index_uri + "|" + json.dumps(store.config, sort_keys=True)
                          ).encode()).hexdigest()[:12]},
