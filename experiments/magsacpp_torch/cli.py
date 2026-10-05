@@ -219,6 +219,51 @@ def cmd_parity_device(args):
     return 0 if ok else 1
 
 
+def cmd_parity_cv2minimal(args):
+    """Numerical parity of the MINIMAL 4-point solver: cv2 vs our SVD vs our closed-form.
+    For exactly 4 general-position points the homography is UNIQUE (up to scale), so all three MUST
+    agree -- a mismatch means a wrong matrix formulation, not a legitimate algorithm difference."""
+    try:
+        import cv2
+    except Exception:
+        print("[parity cv2minimal] opencv not installed -- run on the server with "
+              "--with opencv-python-headless.")
+        return 2
+    from .solver import solve_minimal_h, solve_minimal_h_closed_form
+    rng = np.random.default_rng(args.seed)
+
+    def proj(H, p):
+        h = np.c_[p, np.ones(len(p))] @ H.T
+        return h[:, :2] / h[:, 2:3]
+
+    worst = {"cv2_vs_svd": 0.0, "cv2_vs_closedform": 0.0, "svd_vs_closedform": 0.0}
+    fails = 0
+    for _ in range(args.trials):
+        H = _rand_h(rng)
+        src = rng.uniform(0, args.coord, size=(4, 2))
+        dst = _apply(H, src)
+        Hcv = cv2.findHomography(src, dst, 0)[0]                      # method=0 => exact 4-pt DLT, float64
+        if Hcv is None:
+            fails += 1
+            continue
+        src_t = torch.tensor(src, dtype=torch.float64).unsqueeze(0)
+        dst_t = torch.tensor(dst, dtype=torch.float64).unsqueeze(0)
+        Hsvd = solve_minimal_h(src_t, dst_t)[0][0].numpy()
+        Hcf = solve_minimal_h_closed_form(src_t, dst_t)[0][0].numpy()
+        pts = rng.uniform(0, args.coord, size=(12, 2))               # scale/sign-invariant compare
+        a, b, c = proj(Hcv, pts), proj(Hsvd, pts), proj(Hcf, pts)
+        worst["cv2_vs_svd"] = max(worst["cv2_vs_svd"], float(np.abs(a - b).max()))
+        worst["cv2_vs_closedform"] = max(worst["cv2_vs_closedform"], float(np.abs(a - c).max()))
+        worst["svd_vs_closedform"] = max(worst["svd_vs_closedform"], float(np.abs(b - c).max()))
+    print(f"[parity cv2minimal] trials={args.trials} coord=0..{args.coord}  (max reprojection diff, px)")
+    for k, v in worst.items():
+        print(f"  {k:20s} = {v:.3e}")
+    ok = fails == 0 and all(v < args.tol for v in worst.values())
+    print(f"  RESULT: {'PASS -- cv2 == ours (unique 4-pt homography)' if ok else 'FAIL -- formulation differs / check matrix setup'}"
+          f"  (tol {args.tol:.0e})")
+    return 0 if ok else 1
+
+
 def cmd_parity_oracle(args):
     from .oracle import compare_trace, load_records
     recs = load_records(args.records)
@@ -317,6 +362,10 @@ def build_parser():
     s.add_argument("--thresh", type=float, default=2.0); s.add_argument("--hyps", type=int, default=2000)
     s.add_argument("--seed", type=int, default=0); s.add_argument("--out", default=None)
     s.set_defaults(func=cmd_parity_synthetic)
+    cm = psub.add_parser("cv2minimal")   # cv2 vs our minimal 4-pt solver (unique => must match)
+    cm.add_argument("--trials", type=int, default=200); cm.add_argument("--coord", type=float, default=100.0)
+    cm.add_argument("--tol", type=float, default=1e-6); cm.add_argument("--seed", type=int, default=0)
+    cm.set_defaults(func=cmd_parity_cv2minimal)
     o = psub.add_parser("oracle"); o.add_argument("--records", required=True); o.set_defaults(func=cmd_parity_oracle)
     d = psub.add_parser("device")   # GPU==CPU
     d.add_argument("--dtype", default="float64", choices=["float64", "float32"])
