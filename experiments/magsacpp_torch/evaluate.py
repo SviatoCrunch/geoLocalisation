@@ -170,7 +170,7 @@ def main(argv=None) -> int:
     backends = list(args.backends)
     qcell = {b: {q: {} for q in plans} for b in backends}   # backend -> q -> {cid: rec}
     t_verify = {b: 0.0 for b in backends}
-    t_fetch = t_match = 0.0
+    t_fetch = t_match = t_load = 0.0
 
     inv = collections.defaultdict(list)                     # cell -> queries needing it
     for q, p in plans.items():
@@ -179,7 +179,10 @@ def main(argv=None) -> int:
 
     for cid in tqdm(sorted(inv), desc="cells", unit="cell"):
         t0 = time.perf_counter(); cd = store.cell(cid); t_fetch += time.perf_counter() - t0
-        grids, keys, kp = _load_cell(cd, device)
+        tl = time.perf_counter(); grids, keys, kp = _load_cell(cd, device)
+        if str(device).startswith("cuda"):
+            torch.cuda.synchronize()
+        t_load += time.perf_counter() - tl
         for q in inv[cid]:
             p = plans[q]
             tm = time.perf_counter()
@@ -279,9 +282,9 @@ def main(argv=None) -> int:
         print(f"[paired top1@250m] cpu_ok={int((c<=250).sum())} torch_ok={int((t<=250).sum())} "
               f"torch_lost={lost} torch_gained={gained} (brief acceptance: lost==0)", flush=True)
 
-    out["speed"] = {"queries": len(plans), "fetch_s": t_fetch, "match_s": t_match,
+    out["speed"] = {"queries": len(plans), "fetch_s": t_fetch, "load_s": t_load, "match_s": t_match,
                     "verify_s": t_verify, "cells_downloaded": store.n_downloads}
-    print(f"[speed] q={len(plans)} fetch={t_fetch:.1f}s match={t_match:.1f}s "
+    print(f"[speed] q={len(plans)} fetch={t_fetch:.1f}s load={t_load:.1f}s match={t_match:.1f}s "
           + " ".join(f"verify[{b}]={t_verify[b]:.1f}s" for b in backends)
           + f" downloads={store.n_downloads}", flush=True)
     Path(args.out).expanduser().write_text(json.dumps(out), encoding="utf-8")
