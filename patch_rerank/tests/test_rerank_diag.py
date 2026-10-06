@@ -452,6 +452,18 @@ def test_compare_gpu_perfect_and_divergent(tmp_path, fake_cv2):
     assert zero["per_call"]["mean_delta_inliers"] < 0 and zero["n_calls"] == res["n_calls"]
 
 
+def test_compare_fields(tmp_path, fake_cv2):
+    """Field-level cv2-vs-GPU: mask IoU, H reproj diff, Δinliers over the archived rm/qm (CPU)."""
+    from patch_rerank import compare_fields
+    dd = _archive_2q(tmp_path, fake_cv2)                      # qm==rm identical feats → identity H
+    r = compare_fields.compute(dd, device="cpu")
+    assert r["n_calls"] == 2 * 2 * 2 * 2                      # 2 q × 2 cells × 2 pos × 2 levels
+    # cv2 (fake) marks every-other inlier (8/16); magsacpp on identity finds all 16 → IoU≈0.5, Δ≈+8
+    assert 0.3 <= r["mask_iou"]["mean"] <= 0.7
+    assert r["delta_inliers"]["mean"] > 0
+    assert r["H_reproj_diff_px"]["median"] is not None and r["H_reproj_diff_px"]["median"] < 1.0  # both ≈ identity
+
+
 def test_compare_gpu_magsacpp_backend_smoke():
     """The 'latest GPU variant' backend wires to experiments/magsacpp_torch and counts inliers on a
     clean planted homography (identity → all points inliers)."""
