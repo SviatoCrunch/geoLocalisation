@@ -170,7 +170,44 @@ def compute(diag_dir, gpu_counts_fn, *, level_agg="sum", cell_agg="mean", only_d
     }
 
 
-def _gpu_counts_fn(backend: str, device: str, n_hyp: int, seed: int):
+def _magsacpp_fn(device: str, n_hyp: int, sigma_max: float, reproj_thresh: float):
+    """Backend = the faithful Torch MAGSAC++ port (experiments/magsacpp_torch), the 'latest GPU
+    variant'. Config mirrors its optimized GPU path (closed_form, float32, sigma_max/inlier_threshold
+    set to match the cv2 run). Feeds points1=rm, points2=qm (same rm→qm direction as cv2) and returns
+    inlier counts at inlier_threshold=reproj_thresh — directly comparable to cv2's n_inliers."""
+    import sys
+    exp = str(Path(__file__).resolve().parents[1] / "experiments")
+    if exp not in sys.path:
+        sys.path.insert(0, exp)
+    import torch
+    from magsacpp_torch import MagsacppConfig
+    from magsacpp_torch.batch import estimate_homography_magsacpp_batch
+    cfg = MagsacppConfig(dtype=torch.float32, minimal_solver="closed_form", max_hypotheses=int(n_hyp),
+                         sigma_max=float(sigma_max), inlier_threshold=float(reproj_thresh))
+
+    def fn(pairs):
+        if not pairs:
+            return []
+        P = len(pairs)
+        nmax = max(p[1].shape[0] for p in pairs)                 # rm point count
+        p1 = torch.zeros(P, nmax, 2, dtype=torch.float32, device=device)   # rm (source)
+        p2 = torch.zeros(P, nmax, 2, dtype=torch.float32, device=device)   # qm (dest)
+        valid = torch.zeros(P, nmax, dtype=torch.bool, device=device)
+        for i, (qm, rm) in enumerate(pairs):
+            m = rm.shape[0]
+            p1[i, :m] = torch.as_tensor(np.asarray(rm, np.float32), device=device)
+            p2[i, :m] = torch.as_tensor(np.asarray(qm, np.float32), device=device)
+            valid[i, :m] = True
+        counts, _ = estimate_homography_magsacpp_batch(p1, p2, valid, config=cfg, return_counts=True)
+        return [int(x) for x in counts.tolist()]
+    return fn
+
+
+def _gpu_counts_fn(backend: str, device: str, n_hyp: int, seed: int, sigma_max: float = 2.0,
+                   reproj_thresh: float = 2.0):
+    if backend == "magsacpp_torch":
+        return _magsacpp_fn(device, n_hyp, sigma_max, reproj_thresh)
+
     def fn(pairs):
         if backend == "gpu_batch":
             from .gpu_verify import ransac_homography_batch
@@ -185,16 +222,20 @@ def _gpu_counts_fn(backend: str, device: str, n_hyp: int, seed: int):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--diag-dir", required=True)
-    ap.add_argument("--backend", choices=["gpu_batch", "gpu_kornia"], default="gpu_batch")
+    ap.add_argument("--backend", choices=["gpu_batch", "gpu_kornia", "magsacpp_torch"],
+                    default="gpu_batch", help="magsacpp_torch = the faithful Torch MAGSAC++ port")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--n-hyp", type=int, default=256)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--sigma-max", type=float, default=2.0, help="magsacpp_torch sigma_max")
+    ap.add_argument("--reproj-thresh", type=float, default=2.0, help="inlier threshold (match cv2 run)")
     ap.add_argument("--level-agg", choices=["sum", "max"], default="sum")
     ap.add_argument("--cell-agg", choices=["mean", "min", "max"], default="mean")
     ap.add_argument("--max-queries", type=int, default=0, help="limit frames (0=all) for a quick A/B")
     ap.add_argument("--out", default=None, help="default: <diag-dir>/compare_<backend>.json")
     args = ap.parse_args(argv)
-    res = compute(args.diag_dir, _gpu_counts_fn(args.backend, args.device, args.n_hyp, args.seed),
+    res = compute(args.diag_dir, _gpu_counts_fn(args.backend, args.device, args.n_hyp, args.seed,
+                                                args.sigma_max, args.reproj_thresh),
                   level_agg=args.level_agg, cell_agg=args.cell_agg, max_queries=args.max_queries,
                   verbose=True)
     out = Path(args.out).expanduser() if args.out else Path(args.diag_dir).expanduser() / f"compare_{args.backend}.json"

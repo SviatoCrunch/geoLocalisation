@@ -452,6 +452,16 @@ def test_compare_gpu_perfect_and_divergent(tmp_path, fake_cv2):
     assert zero["per_call"]["mean_delta_inliers"] < 0 and zero["n_calls"] == res["n_calls"]
 
 
+def test_compare_gpu_magsacpp_backend_smoke():
+    """The 'latest GPU variant' backend wires to experiments/magsacpp_torch and counts inliers on a
+    clean planted homography (identity → all points inliers)."""
+    from patch_rerank import compare_gpu
+    fn = compare_gpu._gpu_counts_fn("magsacpp_torch", "cpu", 64, 0, sigma_max=2.0, reproj_thresh=2.0)
+    pts = np.array([[0, 0], [10, 0], [10, 10], [0, 10], [5, 5], [3, 7], [8, 2], [1, 9]], float)
+    counts = fn([(pts.copy(), pts.copy())])                   # qm == rm → exact identity H
+    assert len(counts) == 1 and counts[0] >= 4                # recovers a model, most/all inliers
+
+
 def test_store_dir_xor_index_uri(tmp_path, fake_cv2):
     sl = tmp_path / "sl.json"; sl.write_text(json.dumps({"shortlist": {}}))
     qh5 = tmp_path / "q.h5"; _query_h5(qh5, F.normalize(_feats(3), dim=1).numpy().astype(np.float32))
