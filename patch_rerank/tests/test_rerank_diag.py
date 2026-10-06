@@ -425,6 +425,18 @@ def test_diag_kmz(tmp_path, fake_cv2):
     assert "GT" in kml and "<Polygon>" in kml and "kram:0_1.5_3.5" in kml
 
 
+def test_diag_gap(tmp_path, fake_cv2):
+    from patch_rerank import diag_gap
+    dd = _archive_2q(tmp_path, fake_cv2)
+    assert diag_gap.main(["--diag-dir", str(dd)]) == 0
+    g = json.loads((dd / "gap.json").read_text())
+    assert g["n_frames"] == 2
+    assert set(g["fine_ceiling"]) == {"best_candidate_within_250m", "best_candidate_within_500m",
+                                      "best_candidate_within_1000m"}
+    assert "median_rerank_rank" in g["gt_closest_candidate"]
+    assert "median" in g["score_gap_top1_minus_gtcell"]
+
+
 def test_compare_gpu_perfect_and_divergent(tmp_path, fake_cv2):
     from patch_rerank import compare_gpu
     dd = _archive_2q(tmp_path, fake_cv2)
