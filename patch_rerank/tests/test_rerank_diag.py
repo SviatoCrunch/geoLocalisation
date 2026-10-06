@@ -289,6 +289,47 @@ def test_main_diag_store_dir(tmp_path, fake_cv2):
     assert "kram:0_1.5_3.5" in json.loads((dd / "completed.json").read_text())["queries"]
 
 
+def _query_h5_2(path, feats):
+    import h5py
+    with h5py.File(path, "w") as f:
+        for k, (stem, lat, lon) in {"q0": ("0_1.5_3.5", 1.5, 3.5), "q1": ("1_2.5_4.5", 2.5, 4.5)}.items():
+            g = f.create_group(k)
+            g.create_dataset("ift_dino", data=feats.T.astype(np.float32))
+            g.attrs["patch_grid_h"] = 4; g.attrs["patch_grid_w"] = 4
+            g.attrs["lat"] = lat; g.attrs["lon"] = lon; g.attrs["filename"] = f"{stem}.jpg"
+
+
+def test_resume_is_per_query(tmp_path, fake_cv2):
+    """--max-queries 1 twice must finalize query-by-query: 2nd invocation resumes the NEXT query and
+    does NOT duplicate the first query's records (regression: finalize was once a post-scoring pass)."""
+    feats = F.normalize(_feats(3), dim=1).numpy().astype(np.float32)
+    qh5 = tmp_path / "q.h5"; _query_h5_2(qh5, feats)
+    root = tmp_path / "store"; _local_store(root, feats)
+    sl = tmp_path / "sl.json"
+    sl.write_text(json.dumps({"shortlist": {
+        "kram:0_1.5_3.5": {"cells": ["kram:0_lvl0", "kram:1_lvl0"]},
+        "kram:1_2.5_4.5": {"cells": ["kram:0_lvl0", "kram:1_lvl0"]}}}))
+    dd = tmp_path / "diag"
+
+    def _run():
+        return sps.main(["--queries", f"kram={qh5}", "--shortlist", str(sl), "--store-dir", str(root),
+                         "--k-coarse", "100", "--topk", "5", "--cell-agg", "mean", "--level-agg", "sum",
+                         "--device", "cpu", "--out", str(tmp_path / "o.json"), "--diag-dir", str(dd),
+                         "--max-queries", "1"])
+
+    assert _run() == 0                                        # processes 1st query only
+    done1 = json.loads((dd / "completed.json").read_text())["queries"]
+    assert done1 == ["kram:0_1.5_3.5"]                        # finalized after ONE query (not at the end)
+    n1 = len((dd / "records.jsonl").read_text().splitlines())
+
+    assert _run() == 0                                        # resume → 2nd query
+    done2 = set(json.loads((dd / "completed.json").read_text())["queries"])
+    assert done2 == {"kram:0_1.5_3.5", "kram:1_2.5_4.5"}
+    rows = [json.loads(l) for l in (dd / "records.jsonl").read_text().splitlines()]
+    assert len(rows) == 2 * n1                                # 2nd query appended, 1st NOT re-written
+    assert len([r for r in rows if r["query_id"] == "kram:0_1.5_3.5"]) == n1   # no duplicate of q0
+
+
 def test_main_diag_arrays_offload_to_s3(tmp_path, fake_cv2, monkeypatch):
     """--diag-arrays-s3: each query's arrays h5 is uploaded then deleted locally; jsonl stay on disk."""
     import os

@@ -406,6 +406,20 @@ def main(argv=None) -> int:
                 if diag is not None:
                     diag.finalize_cell(query_id=q, cell_id=cid, coarse_rank=p["cand_rank"][cid],
                                        pyr=pyr, blv=blv, cd=cd, level_agg=args.level_agg)
+            if diag is not None:                              # finalize THIS query now (per-query resume)
+                recs_q = list(qcell[q].values())
+                gt_ok = math.isfinite(p["qlat"]) and math.isfinite(p["qlon"])
+                full = sorted(recs_q, key=lambda r: r["cell_score"], reverse=True)
+                reranked = [{"cell_id": r["cell_id"], "cell_score": r["cell_score"], "rank": i + 1,
+                             "lat": r["lat"], "lon": r["lon"], "level_m": r["level_m"],
+                             "dist_m": (_haversine_m(p["qlat"], p["qlon"], r["lat"], r["lon"])
+                                        if gt_ok else None)} for i, r in enumerate(full)]
+                topk_q = reranked[:args.topk]
+                diag.finalize_query(query_id=q, gt=([p["qlat"], p["qlon"]] if gt_ok else None),
+                                    coarse_cells=p["coarse_top"], reranked=reranked, final_topk=topk_q,
+                                    metrics={"fine_dist_m": (topk_q[0]["dist_m"] if (topk_q and gt_ok) else None),
+                                             "fine_dist_topk_m": (min((t["dist_m"] for t in topk_q), default=None)
+                                                                  if gt_ok else None)})
             if str(dev).startswith("cuda"):
                 torch.cuda.empty_cache()
 
@@ -426,16 +440,7 @@ def main(argv=None) -> int:
             dumped[q] = {r["cell_id"]: {"mean": r["mean_score"], "best": r["best_score"],
                                         "lat": r["lat"], "lon": r["lon"], "level_m": r["level_m"]}
                          for r in recs}
-        if diag is not None:                                   # full reranked list (ALL candidates) + summary
-            full = sorted(recs, key=lambda r: r["cell_score"], reverse=True)
-            reranked = [{"cell_id": r["cell_id"], "cell_score": r["cell_score"], "rank": i + 1,
-                         "lat": r["lat"], "lon": r["lon"], "level_m": r["level_m"],
-                         "dist_m": (_haversine_m(p["qlat"], p["qlon"], r["lat"], r["lon"])
-                                    if has_gt else None)} for i, r in enumerate(full)]
-            diag.finalize_query(query_id=q, gt=([p["qlat"], p["qlon"]] if has_gt else None),
-                                coarse_cells=p["coarse_top"], reranked=reranked,
-                                final_topk=reranked[:args.topk],
-                                metrics={"fine_dist_m": df, "fine_dist_topk_m": dft})
+        # (diag per-query summary/offload/resume is written in the scoring loop above — per query)
         if has_gt:
             d_fine.append(df); d_ftop.append(dft)
 
