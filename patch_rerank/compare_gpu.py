@@ -62,9 +62,13 @@ def _aggregate_gpu(cells: dict, level_agg: str, cell_agg: str):
     return ranked
 
 
-def compute(diag_dir, gpu_counts_fn, *, level_agg="sum", cell_agg="mean", only_done=True) -> dict:
+def compute(diag_dir, gpu_counts_fn, *, level_agg="sum", cell_agg="mean", only_done=True,
+            max_queries=0, verbose=False) -> dict:
     """Core A/B. ``gpu_counts_fn(pairs)`` takes a list of ``(qm, rm)`` arrays and returns a list of gpu
-    inlier COUNTS (injectable → testable without a GPU)."""
+    inlier COUNTS (injectable → testable without a GPU). ``max_queries`` limits the frames processed (0
+    = all); ``verbose`` prints a per-frame progress line (the GPU pass over all pairs is slow)."""
+    import time
+
     import h5py
     d = Path(diag_dir).expanduser()
     done = set(json.loads((d / "completed.json").read_text())["queries"]) if (d / "completed.json").exists() else None
@@ -84,24 +88,30 @@ def compute(diag_dir, gpu_counts_fn, *, level_agg="sum", cell_agg="mean", only_d
     cv2_t1, cv2_t5, gpu_t1, gpu_t5 = [], [], [], []
     lost, gained = [], []
     tmp = tempfile.mkdtemp()
-    for q, rows in recs.items():
-        if only_done and done is not None and q not in done:
-            continue
-        s = summ.get(q)
-        if s is None:
-            continue
+    todo = [q for q in recs if not (only_done and done is not None and q not in done) and q in summ]
+    if max_queries:
+        todo = todo[:max_queries]
+    for qi, q in enumerate(todo):
+        rows = recs[q]
+        s = summ[q]
         gt = s.get("gt")
         has_gt = bool(gt) and None not in gt
         n_q = nq[q] or 1
         # collect pairs for the cv2-called groups of this query
         uri = s.get("arrays") or f"arrays/{q.replace(':', '_').replace('/', '_')}.h5"
+        t0 = time.perf_counter()
         pairs, keys = [], []
         with h5py.File(_arrays_path(uri, d, tmp), "r") as f:
             for r in rows:
                 if r["cv2_called"] and r["h5_group"] in f:
                     g = f[r["h5_group"]]
                     pairs.append((g["qm"][:], g["rm"][:])); keys.append(r)
+        if verbose:
+            print(f"[compare] {qi + 1}/{len(todo)} {q}: {len(pairs)} pairs "
+                  f"(read {time.perf_counter() - t0:.1f}s) → gpu…", flush=True)
         gpu_counts = gpu_counts_fn(pairs) if pairs else []
+        if verbose:
+            print(f"[compare]   gpu done in {time.perf_counter() - t0:.1f}s", flush=True)
 
         # build gpu cell structure (start from ALL rows at score 0, fill cv2-called with gpu score)
         cells: dict = collections.defaultdict(dict)
@@ -181,10 +191,12 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--level-agg", choices=["sum", "max"], default="sum")
     ap.add_argument("--cell-agg", choices=["mean", "min", "max"], default="mean")
+    ap.add_argument("--max-queries", type=int, default=0, help="limit frames (0=all) for a quick A/B")
     ap.add_argument("--out", default=None, help="default: <diag-dir>/compare_<backend>.json")
     args = ap.parse_args(argv)
     res = compute(args.diag_dir, _gpu_counts_fn(args.backend, args.device, args.n_hyp, args.seed),
-                  level_agg=args.level_agg, cell_agg=args.cell_agg)
+                  level_agg=args.level_agg, cell_agg=args.cell_agg, max_queries=args.max_queries,
+                  verbose=True)
     out = Path(args.out).expanduser() if args.out else Path(args.diag_dir).expanduser() / f"compare_{args.backend}.json"
     out.write_text(json.dumps(res, indent=2), encoding="utf-8")
     pc, rk = res["per_call"], res["ranking"]
