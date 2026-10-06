@@ -60,12 +60,16 @@ def _load_cell(cd, device):
     return torch.stack(grids), keys, kp
 
 
-def _score_loaded(grids, keys, kp, cd, qfeat, qxy, n_q, args, device):
+def _score_loaded(grids, keys, kp, cd, qfeat, qxy, n_q, args, device, diag_ctx=None):
     """Score a cell's pre-loaded grids against one query → (pyramid_score[n_pos], best_level[n_pos]).
 
     ``--verify-backend`` picks the geometric verifier (gpu_batch MSAC / gpu_kornia RANSAC / cpu_magsac
     cv2). ``--level-agg`` combines a position's per-level scores by max (best level) or sum (multi-scale
-    evidence, the old working rule). Grids matched/verified in --grid-chunk sub-batches (VRAM bound)."""
+    evidence, the old working rule). Grids matched/verified in --grid-chunk sub-batches (VRAM bound).
+
+    ``diag_ctx`` (cpu_magsac only): when set, the SAME single cv2 call that defines each level score is
+    also archived (H, mask, correspondences, residuals) via ``DiagWriter`` — scores are byte-identical
+    to ``diag_ctx=None`` because ``n_inliers`` comes from the same findHomography call."""
     from .matcher import _MIN_MATCHES
     _MIN = _MIN_MATCHES["homography"]
     sc = {}
@@ -73,6 +77,40 @@ def _score_loaded(grids, keys, kp, cd, qfeat, qxy, n_q, args, device):
     for s in range(0, len(keys), ch):
         gsub, ksub = grids[s:s + ch], keys[s:s + ch]
         if args.verify_backend == "cpu_magsac":                      # cv2 MAGSAC on host (control/old path)
+            if diag_ctx is not None:                                 # full-diagnostics capture branch
+                from .matcher import matched_coords_batch_idx, verify_homography_full
+                mcf = matched_coords_batch_idx(qfeat, gsub, qxy, kp)
+                mg_h, mg_w = int(kp[:, 1].max()) + 1, int(kp[:, 0].max()) + 1
+                w_, q_, cid = diag_ctx["writer"], diag_ctx["query_id"], diag_ctx["cell_id"]
+                rk, mi, thr = diag_ctx["coarse_rank"], diag_ctx["method_int"], args.reproj_thresh
+                for j, (i, L) in enumerate(ksub):
+                    qm, rm, n_mut, qidx, ridx = mcf[j]
+                    meta = {**diag_ctx["base_meta"], "map_grid_h": mg_h, "map_grid_w": mg_w,
+                            "pos_lat": float(cd.lat[i]), "pos_lon": float(cd.lon[i])}
+                    if n_q and n_mut >= _MIN:
+                        res = verify_homography_full(qm, rm, reproj_thresh=thr, method_int=mi)
+                        sc[(i, L)] = res.n_inliers / n_q
+                        w_.record_level(query_id=q_, cell_id=cid, coarse_rank=rk, position_id=i,
+                                        level_id=int(L), level_m=float(L), meta=meta,
+                                        n_query_patches=n_q, n_map_patches=len(kp), n_mutual=n_mut,
+                                        level_score=sc[(i, L)], cv2_called=True, status=res.status,
+                                        fail_reason=None, method_int=mi, reproj_thresh=thr,
+                                        n_inliers=res.n_inliers, verify_s=res.verify_s,
+                                        arrays={"qm": qm, "rm": rm, "q_idx": qidx, "r_idx": ridx,
+                                                "H": res.H, "mask": res.mask,
+                                                "residuals": res.residuals})
+                    else:
+                        sc[(i, L)] = 0.0
+                        w_.record_level(query_id=q_, cell_id=cid, coarse_rank=rk, position_id=i,
+                                        level_id=int(L), level_m=float(L), meta=meta,
+                                        n_query_patches=n_q, n_map_patches=len(kp), n_mutual=n_mut,
+                                        level_score=0.0, cv2_called=False,
+                                        status="skipped_insufficient_matches",
+                                        fail_reason=("n_query_patches==0" if not n_q
+                                                     else f"n_mutual {n_mut} < {_MIN}"),
+                                        method_int=mi, reproj_thresh=thr, n_inliers=0, verify_s=0.0,
+                                        arrays=None)
+                continue
             from .matcher import matched_coords_batch, verify_inliers
             mc = matched_coords_batch(qfeat, gsub, qxy, kp)
             for j, (i, L) in enumerate(ksub):
@@ -109,10 +147,10 @@ def _score_loaded(grids, keys, kp, cd, qfeat, qxy, n_q, args, device):
     return pyr, blv
 
 
-def _score_cell(cd, qfeat, qxy, n_q, args, device):
+def _score_cell(cd, qfeat, qxy, n_q, args, device, diag_ctx=None):
     """query-major convenience: load a cell's grids then score them for one query."""
     grids, keys, kp = _load_cell(cd, device)
-    return _score_loaded(grids, keys, kp, cd, qfeat, qxy, n_q, args, device)
+    return _score_loaded(grids, keys, kp, cd, qfeat, qxy, n_q, args, device, diag_ctx=diag_ctx)
 
 
 def _aggregate(pyr, blv, cd, cell_agg):
@@ -210,6 +248,13 @@ def main(argv=None) -> int:
     ap.add_argument("--dump-scores", default=None,
                     help="also write per-query per-candidate {cell_id: {mean,best,lat,lon,level_m}} to "
                          "this JSON — for offline aggregation/GT-rank diagnosis (ALL candidates, not top-k)")
+    ap.add_argument("--diag-dir", default=None,
+                    help="write the FULL cv2.MAGSAC++ diagnostics archive here (manifest/records.jsonl/"
+                         "aggregation.jsonl/summary.jsonl/arrays/*.h5). Forces --verify-backend cpu_magsac "
+                         "and --execution-order query-major (per-query resume). Scores are byte-identical "
+                         "to a non-diag run; captures H/mask/correspondences of every geometric check.")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="with --diag-dir: re-process queries already in completed.json instead of skipping")
     args = ap.parse_args(argv)
 
     import torch
@@ -222,6 +267,37 @@ def main(argv=None) -> int:
     store = CellStoreS3(args.index_uri, cache_dir=args.cache_dir, cache_cap=args.cache_cap)
     sj = json.loads(Path(args.shortlist).expanduser().read_text())
     dev = args.device
+
+    diag, method_int = None, None
+    if args.diag_dir:                                         # full cv2.MAGSAC++ diagnostics archive
+        from datetime import datetime, timezone
+
+        import cv2
+
+        from . import rerank_diag
+        from .matcher import magsac_method_int, verify_homography_full
+        args.verify_backend = "cpu_magsac"                    # the archive is of the cv2 MAGSAC path
+        if args.execution_order != "query-major":
+            print("[diag] forcing --execution-order query-major (per-query arrays/resume)", flush=True)
+            args.execution_order = "query-major"
+        method_int = magsac_method_int()                      # raises if this cv2 build lacks USAC_MAGSAC
+        _pr = np.array([[0., 0.], [1., 0.], [1., 1.], [0., 1.]])
+        verify_homography_full(_pr, _pr + 0.01, reproj_thresh=2.0, method_int=method_int)  # probe: it runs
+        cfg = {"k_coarse": args.k_coarse, "topk": args.topk, "level_agg": args.level_agg,
+               "cell_agg": args.cell_agg, "reproj_thresh": args.reproj_thresh,
+               "verify_backend": "cpu_magsac", "index_uri": args.index_uri,
+               "store_config": store.config, "method_int": method_int,
+               "queries": {c: str(p) for c, p in sorted(qpaths.items())}}
+        fp = rerank_diag.config_fingerprint(cfg)
+        manifest = {"run_id": fp, "git_commit": rerank_diag.git_commit(Path(__file__).resolve().parents[1]),
+                    "created_utc": datetime.now(timezone.utc).isoformat(), "config": cfg,
+                    "cv2": {"version": cv2.__version__, "method": "USAC_MAGSAC", "method_int": method_int},
+                    "store": {"index_uri": args.index_uri, "config": store.config},
+                    "queries": {c: str(p) for c, p in qpaths.items()}, "shortlist": str(args.shortlist),
+                    "seed": None}
+        diag = rerank_diag.DiagWriter(args.diag_dir, manifest, fp, resume=not args.no_resume)
+        print(f"[diag] archive -> {args.diag_dir}  fingerprint={fp}  already_done={len(diag._completed)}",
+              flush=True)
 
     out = {"meta": {"k_coarse": args.k_coarse, "topk": args.topk, "cell_agg": args.cell_agg,
                     "level_agg": args.level_agg, "verify_backend": args.verify_backend,
@@ -247,12 +323,16 @@ def main(argv=None) -> int:
             continue
         if not qstore.has(q):
             continue
+        if diag is not None and diag.is_done(q):              # resume: already archived this query
+            continue
         if args.max_queries and len(plans) >= args.max_queries:
             break
         qfeat, qxy, qlat, qlon = qstore.get(q)
-        cands = [c for c in entry["cells"][:args.k_coarse] if store.has(c)]
+        top = entry["cells"][:args.k_coarse]
+        cands = [c for c in top if store.has(c)]
         plans[q] = {"qfeat": qfeat.to(dev), "qxy": qxy, "qlat": qlat, "qlon": qlon,
-                    "n_q": int(qfeat.shape[0]), "cands": cands}
+                    "n_q": int(qfeat.shape[0]), "cands": cands, "coarse_top": top,
+                    "cand_rank": {c: r for r, c in enumerate(top)}}
     qcell = {q: {} for q in plans}                            # q -> {cell_id: rec}
     tscore = {q: 0.0 for q in plans}
 
@@ -273,14 +353,31 @@ def main(argv=None) -> int:
             del grids
             if str(dev).startswith("cuda"):
                 torch.cuda.empty_cache()
-    else:                                                     # query-major (default)
+    else:                                                     # query-major (default; forced under --diag)
         for q, p in tqdm(plans.items(), desc="search", unit="q"):
+            qh = qw = qk = None
+            if diag is not None:
+                diag.begin_query(q)
+                qh, qw, qk = qstore.grid_hw(q)
             for cid in tqdm(p["cands"], desc=f"  {q[:26]} cells", unit="cell", leave=False):
                 t0 = time.perf_counter(); cd = store.cell(cid); t_fetch_all += time.perf_counter() - t0
+                dctx = None
+                if diag is not None:
+                    ci = store.cells[cid]
+                    dctx = {"writer": diag, "query_id": q, "cell_id": cid,
+                            "coarse_rank": p["cand_rank"][cid], "method_int": method_int,
+                            "base_meta": {"crop_key": ci.get("key"), "cell_lat": ci.get("lat"),
+                                          "cell_lon": ci.get("lon"),
+                                          "tile_m": store.config.get("tile_size_m"),
+                                          "patch_px": store.config.get("patch"),
+                                          "query_grid_h": qh, "query_grid_w": qw, "query_n_keep": qk}}
                 t1 = time.perf_counter()
-                pyr, blv = _score_cell(cd, p["qfeat"], p["qxy"], p["n_q"], args, dev)
+                pyr, blv = _score_cell(cd, p["qfeat"], p["qxy"], p["n_q"], args, dev, diag_ctx=dctx)
                 dt = time.perf_counter() - t1; t_score_all += dt; tscore[q] += dt
                 qcell[q][cid] = _rec(cid, pyr, blv, cd)
+                if diag is not None:
+                    diag.finalize_cell(query_id=q, cell_id=cid, coarse_rank=p["cand_rank"][cid],
+                                       pyr=pyr, blv=blv, cd=cd, level_agg=args.level_agg)
             if str(dev).startswith("cuda"):
                 torch.cuda.empty_cache()
 
@@ -301,6 +398,16 @@ def main(argv=None) -> int:
             dumped[q] = {r["cell_id"]: {"mean": r["mean_score"], "best": r["best_score"],
                                         "lat": r["lat"], "lon": r["lon"], "level_m": r["level_m"]}
                          for r in recs}
+        if diag is not None:                                   # full reranked list (ALL candidates) + summary
+            full = sorted(recs, key=lambda r: r["cell_score"], reverse=True)
+            reranked = [{"cell_id": r["cell_id"], "cell_score": r["cell_score"], "rank": i + 1,
+                         "lat": r["lat"], "lon": r["lon"], "level_m": r["level_m"],
+                         "dist_m": (_haversine_m(p["qlat"], p["qlon"], r["lat"], r["lon"])
+                                    if has_gt else None)} for i, r in enumerate(full)]
+            diag.finalize_query(query_id=q, gt=([p["qlat"], p["qlon"]] if has_gt else None),
+                                coarse_cells=p["coarse_top"], reranked=reranked,
+                                final_topk=reranked[:args.topk],
+                                metrics={"fine_dist_m": df, "fine_dist_topk_m": dft})
         if has_gt:
             d_fine.append(df); d_ftop.append(dft)
 
@@ -321,6 +428,10 @@ def main(argv=None) -> int:
     if args.kmz:
         _write_kmz(args.kmz, per_query)
         print(f"[ok] kmz -> {args.kmz}", flush=True)
+    if diag is not None:
+        diag.close()
+        print(f"[ok] diag archive -> {args.diag_dir}  (queries this run={len(per_query)}; "
+              f"full-set metrics: aggregate summary.jsonl)", flush=True)
     store.close(); qstore.close()
     return 0
 

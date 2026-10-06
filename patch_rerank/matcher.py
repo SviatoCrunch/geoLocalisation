@@ -127,10 +127,103 @@ def matched_coords_batch_gpu(q_feat: torch.Tensor, r_feats: torch.Tensor, q_xy, 
     return out
 
 
+def matched_coords_batch_idx(q_feat: torch.Tensor, r_feats: torch.Tensor, q_xy: np.ndarray,
+                             r_xy: np.ndarray):
+    """Diagnostics variant of :func:`matched_coords_batch` that ALSO returns the patch indices of
+    every mutual-NN correspondence. Returns a list of P
+    ``(qm (M,2), rm (M,2), n_mutual, q_idx (M,), r_idx (M,))`` tuples. Selection logic is identical
+    to :func:`matched_coords_batch` (same deterministic argmax), so ``qm``/``rm`` — and therefore any
+    score computed from them — are **bit-identical**; this only additionally surfaces the indices for
+    the archive (which grid token each matched coordinate came from)."""
+    q = F.normalize(q_feat.float(), dim=1)                    # (Nq, D)
+    r = F.normalize(r_feats.float(), dim=2)                   # (P, Nr, D)
+    sims = torch.matmul(q, r.transpose(1, 2))                 # (P, Nq, Nr)
+    q2r = sims.argmax(dim=2)                                  # (P, Nq)
+    r2q = sims.argmax(dim=1)                                  # (P, Nr)
+    back = torch.gather(r2q, 1, q2r)                          # (P, Nq)
+    mutual = back == torch.arange(q.shape[0], device=q.device)   # (P, Nq)
+    mutual_c = mutual.cpu().numpy()
+    q2r_c = q2r.cpu().numpy()
+    qxy = np.asarray(q_xy, np.float64)
+    rxy = np.asarray(r_xy, np.float64)
+    out = []
+    for p in range(mutual_c.shape[0]):
+        qidx = np.nonzero(mutual_c[p])[0]
+        ridx = q2r_c[p][qidx]
+        out.append((qxy[qidx], rxy[ridx], int(qidx.size),
+                    qidx.astype(np.int64), ridx.astype(np.int64)))
+    return out
+
+
+@dataclass
+class HomographyResult:
+    """Full output of a single cv2 homography fit — everything the diagnostics archive needs from one
+    cv2 call. ``H`` maps ``rm`` (map crop, tile-side) → ``qm`` (query frame). ``mask`` is in the exact
+    order the correspondences were passed to cv2. ``n_inliers`` equals ``mask.sum()`` and is the number
+    the service score ``inliers / n_query_patches`` is built from — identical to the non-diag path."""
+    status: str                                       # "ok" | "no_consensus"
+    n_inliers: int
+    mask: np.ndarray                                  # (M,) uint8, input order (empty if no H)
+    H: np.ndarray | None                              # (3,3) float64, direction rm→qm (None if no H)
+    residuals: np.ndarray                             # (M,) float64 reprojection residual per corr.
+    inlier_r_xy: np.ndarray                           # (n_inliers, 2) tile-side inlier coords
+    verify_s: float
+
+
+def _reproj_residuals(H: np.ndarray, rm: np.ndarray, qm: np.ndarray) -> np.ndarray:
+    """Per-correspondence Euclidean reprojection residual ‖π(H·rm) − qm‖ (diagnostic only; does NOT
+    affect the inlier mask, which is cv2's). NaN where the projective denominator vanishes."""
+    if H is None or len(rm) == 0:
+        return np.full((len(rm),), np.nan, np.float64)
+    pts = np.concatenate([rm, np.ones((len(rm), 1))], axis=1)          # (M,3)
+    proj = pts @ np.asarray(H, np.float64).T                            # (M,3)
+    w = proj[:, 2:3]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xy = proj[:, :2] / w
+    return np.linalg.norm(xy - qm, axis=1)
+
+
+def verify_homography_full(qm: np.ndarray, rm: np.ndarray, reproj_thresh: float,
+                           method_int: int) -> HomographyResult:
+    """Fit a homography ``rm → qm`` with the given cv2 ``method_int`` in ONE call and return the full
+    result (H, inlier mask in input order, inlier count, per-correspondence reprojection residuals).
+
+    This is the diagnostics counterpart of :func:`verify_inliers`: it performs the identical single
+    ``cv2.findHomography(rm, qm, method_int, ransacReprojThreshold=thr)`` call, so ``n_inliers`` (and
+    any score derived from it) matches that function exactly — but it additionally surfaces ``H`` and
+    the residuals for the archive. **No silent RANSAC fallback**: a ``cv2.error`` propagates (the
+    caller is expected to have verified the estimator works), so the archive can never conflate
+    MAGSAC++ with a fallback estimator."""
+    import time
+
+    import cv2
+    t0 = time.perf_counter()
+    H, mask = cv2.findHomography(rm, qm, method_int, ransacReprojThreshold=float(reproj_thresh))
+    dt = time.perf_counter() - t0
+    if mask is None:
+        return HomographyResult("no_consensus", 0, np.empty((0,), np.uint8),
+                                np.asarray(H, np.float64) if H is not None else None,
+                                _reproj_residuals(H, rm, qm), np.empty((0, 2)), dt)
+    m = mask.ravel().astype(np.uint8)
+    Hf = np.asarray(H, np.float64) if H is not None else None
+    return HomographyResult("ok", int(m.sum()), m, Hf, _reproj_residuals(Hf, rm, qm),
+                            rm[m.astype(bool)], dt)
+
+
 def _cv2_method(estimator: str):
     import cv2
     return {"ransac": cv2.RANSAC, "magsac": getattr(cv2, "USAC_MAGSAC", cv2.RANSAC),
             "usac": getattr(cv2, "USAC_DEFAULT", cv2.RANSAC), "lmeds": cv2.LMEDS}[estimator]
+
+
+def magsac_method_int() -> int:
+    """cv2.USAC_MAGSAC integer, or raise if this OpenCV build lacks it (so the diagnostics run fails
+    loudly instead of silently reranking with RANSAC)."""
+    import cv2
+    if not hasattr(cv2, "USAC_MAGSAC"):
+        raise RuntimeError("this OpenCV build has no cv2.USAC_MAGSAC — refusing to fall back to RANSAC "
+                           f"for a MAGSAC++ diagnostics run (cv2 {cv2.__version__})")
+    return int(cv2.USAC_MAGSAC)
 
 
 def verify_inliers(qm: np.ndarray, rm: np.ndarray, model: str = "homography",

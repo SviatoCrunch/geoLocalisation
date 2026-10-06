@@ -41,6 +41,15 @@ class QueryGridStore:
     def has(self, point_id: str) -> bool:
         return point_id in self._index
 
+    def grid_hw(self, point_id: str):
+        """→ (patch_grid_h, patch_grid_w, n_kept_tokens) for the query — metadata for the archive so
+        a stored H (patch-grid units) is interpretable without re-reading the H5."""
+        city, key = self._index[point_id]
+        g = self._file(city)[key]
+        h, w = int(g.attrs["patch_grid_h"]), int(g.attrs["patch_grid_w"])
+        n_keep = int(np.asarray(g["keep_indices"]).size) if "keep_indices" in g else h * w
+        return h, w, n_keep
+
     def get(self, point_id: str):
         """→ (feat (N,D) torch, xy (N,2) np, lat, lon). xy in patch-grid units, sky tokens dropped."""
         city, key = self._index[point_id]

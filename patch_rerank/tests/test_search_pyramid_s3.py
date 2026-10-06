@@ -106,7 +106,7 @@ def test_search_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr("boto3.client", lambda svc, *a, **k: s3)
     # stub the GPU scorer (shared by both execution orders): cell a strong (best pyramid #1), b weak
     monkeypatch.setattr(sps, "_score_loaded",
-                        lambda grids, keys, kp, cd, qfeat, qxy, n_q, args, dev:
+                        lambda grids, keys, kp, cd, qfeat, qxy, n_q, args, dev, diag_ctx=None:
                         (([0.5, 0.9], [1000, 500]) if cd.cell_id == "kup:0_lvl0"
                          else ([0.1, 0.2], [1000, 1000])))
     sl = tmp_path / "sl.json"
