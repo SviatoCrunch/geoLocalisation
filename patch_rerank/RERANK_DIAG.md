@@ -81,7 +81,9 @@ cv2_called (bool), status, fail_reason    # ok | no_consensus | skipped_insuffic
 method_int, reproj_thresh                 # cv2 method (USAC_MAGSAC int) + threshold
 n_inliers, level_score                    # level_score = n_inliers / n_query_patches (verbatim)
 verify_s                                  # wall time of this one cv2 call
-h5, h5_group                              # pointer into arrays/<query>.h5 (null if cv2 not called)
+h5, h5_group                              # pointer to the arrays (null if cv2 not called): h5 is the
+                                          #   FINAL location — s3://… when --diag-arrays-s3 is set,
+                                          #   else local arrays/<query>.h5 ; h5_group = <cell>/p{i}/l{L}
 ```
 
 Three states are distinguished: **skipped** (`cv2_called=false`, `< 4` mutual matches),
@@ -118,17 +120,25 @@ Key = `query_id`. `gt [lat,lon]|null`, `coarse_top[{cell_id,coarse_rank}]` (all 
 ## Read one query / candidate / position / level
 
 ```python
-import json, h5py, numpy as np
+import json, os, tempfile, h5py, numpy as np
 DIR = "/home/ubuntu/work/diag_kram_cv2_magsac"
 
-# a records.jsonl row
+# read a FINALIZED query only (an in-progress query's arrays H5 is mid-write and unreadable)
+done = set(json.load(open(f"{DIR}/completed.json"))["queries"])
 row = next(json.loads(l) for l in open(f"{DIR}/records.jsonl")
-           if json.loads(l)["cv2_called"])
-print(row["query_id"], row["cell_id"], f"p{row['position_id']} l{row['level_id']}",
+           if (r := json.loads(l))["cv2_called"] and r["query_id"] in done)
+print(row["query_id"], row["cell_id"], row["h5_group"],
       "score", row["level_score"], "=", row["n_inliers"], "/", row["n_query_patches"])
 
-# its geometry — no re-matching / DINO / S3 needed
-with h5py.File(f"{DIR}/{row['h5']}", "r") as f:
+# row["h5"] is the final location: s3://… (when offloaded) or local arrays/<q>.h5
+uri = row["h5"]
+if uri.startswith("s3://"):
+    import boto3
+    b, key = uri[5:].split("/", 1); local = os.path.join(tempfile.gettempdir(), os.path.basename(key))
+    boto3.client("s3").download_file(b, key, local)
+else:
+    local = os.path.join(DIR, uri)
+with h5py.File(local, "r") as f:                               # no re-matching / DINO / fetch needed
     g = f[row["h5_group"]]
     qm, rm, mask, H = g["qm"][:], g["rm"][:], g["mask"][:], g["H"][:]
     assert int(mask.sum()) == row["n_inliers"]                 # reproduce the inlier count

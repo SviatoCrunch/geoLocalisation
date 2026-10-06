@@ -140,7 +140,7 @@ class DiagWriter:
                "level_score": float(level_score), "cv2_called": bool(cv2_called),
                "status": status, "fail_reason": fail_reason, "method_int": int(method_int),
                "reproj_thresh": float(reproj_thresh), "verify_s": float(verify_s),
-               "h5": (f"arrays/{_safe(query_id)}.h5" if h5_group else None), "h5_group": h5_group,
+               "h5": (self._arrays_location(query_id) if h5_group else None), "h5_group": h5_group,
                **meta}
         self._write(self._rec_f, row)
 
@@ -166,17 +166,25 @@ class DiagWriter:
             "best_position_id": bi, "best_level_m": int(blv[bi]),
             "best_h5_group": f"{_safe(cell_id)}/p{bi}/l{int(blv[bi])}"})
 
+    def _arrays_location(self, query_id: str) -> str:
+        """Final location of a query's arrays H5 — the s3:// uri when offloading, else the local
+        relative path. Used BOTH for the per-record ``h5`` pointer and the summary, so a records.jsonl
+        row points at where its arrays actually end up (not a deleted local path)."""
+        if self._s3_bucket:
+            key = f"{self._s3_prefix}/{_safe(query_id)}.h5" if self._s3_prefix else f"{_safe(query_id)}.h5"
+            return f"s3://{self._s3_bucket}/{key}"
+        return f"arrays/{_safe(query_id)}.h5"
+
     def _offload_arrays(self, query_id: str) -> str:
-        """Close+upload this query's arrays H5 to S3 and delete the local copy; return its location
-        (s3:// uri, or the local relative path when no S3 target). Upload errors propagate (the run
-        should fail loudly rather than silently drop geometry)."""
-        local = self.dir / "arrays" / (_safe(query_id) + ".h5")
+        """Upload this query's arrays H5 to S3 and delete the local copy; return its location. Upload
+        errors propagate (the run should fail loudly rather than silently drop geometry)."""
         if not self._s3_bucket:
-            return f"arrays/{_safe(query_id)}.h5"
-        key = f"{self._s3_prefix}/{_safe(query_id)}.h5" if self._s3_prefix else f"{_safe(query_id)}.h5"
+            return self._arrays_location(query_id)
+        local = self.dir / "arrays" / (_safe(query_id) + ".h5")
+        _, _, key = self._arrays_location(query_id)[5:].partition("/")
         self._s3.upload_file(str(local), self._s3_bucket, key)
         local.unlink(missing_ok=True)
-        return f"s3://{self._s3_bucket}/{key}"
+        return self._arrays_location(query_id)
 
     def finalize_query(self, *, query_id, gt, coarse_cells, reranked, final_topk, metrics):
         """Close the query's arrays file, offload it (S3 + local delete when configured), record the

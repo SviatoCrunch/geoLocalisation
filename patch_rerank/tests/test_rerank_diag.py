@@ -364,6 +364,9 @@ def test_main_diag_arrays_offload_to_s3(tmp_path, fake_cv2, monkeypatch):
     summ = json.loads((dd / "summary.jsonl").read_text().splitlines()[0])
     assert summ["arrays"] == "s3://bkt/diag/kram/kram_0_1.5_3.5.h5"
     assert (dd / "records.jsonl").stat().st_size > 0                           # jsonl kept local
+    rec = next(json.loads(l) for l in (dd / "records.jsonl").read_text().splitlines()
+               if json.loads(l)["cv2_called"])
+    assert rec["h5"] == "s3://bkt/diag/kram/kram_0_1.5_3.5.h5"                 # record points at S3, not a dead local path
 
 
 def test_store_dir_xor_index_uri(tmp_path, fake_cv2):
