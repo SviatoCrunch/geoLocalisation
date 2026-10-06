@@ -440,6 +440,20 @@ def test_diag_rank_curves(tmp_path, fake_cv2):
         assert all(rec[i] <= rec[i + 1] for i in range(len(rec) - 1))
 
 
+def test_gpu_rank_curves_via_dump_agg(tmp_path, fake_cv2):
+    """compare_gpu --dump-agg writes a GPU aggregation that diag_rank_curves consumes → GPU top-K
+    curves. With a GPU fn reproducing cv2 counts, GPU curves must equal cv2 curves."""
+    from patch_rerank import compare_gpu, diag_rank_curves
+    dd = _archive_2q(tmp_path, fake_cv2)
+    aggp = dd / "aggregation_gpu.jsonl"
+    perfect = lambda pairs: [(len(q) + 1) // 2 for (q, _) in pairs]   # == FakeCv2 count
+    compare_gpu.compute(dd, perfect, dump_agg=str(aggp))
+    assert aggp.exists()
+    cv2_curve = diag_rank_curves.compute(dd, aggs=("sum",))
+    gpu_curve = diag_rank_curves.compute(dd, aggs=("sum",), agg_file="aggregation_gpu.jsonl")
+    assert gpu_curve["sum"]["by_topK"] == cv2_curve["sum"]["by_topK"]   # identical counts → identical curves
+
+
 def test_diag_gap(tmp_path, fake_cv2):
     from patch_rerank import diag_gap
     dd = _archive_2q(tmp_path, fake_cv2)

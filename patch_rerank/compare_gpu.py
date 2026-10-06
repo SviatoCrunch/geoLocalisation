@@ -63,13 +63,18 @@ def _aggregate_gpu(cells: dict, level_agg: str, cell_agg: str):
 
 
 def compute(diag_dir, gpu_counts_fn, *, level_agg="sum", cell_agg="mean", only_done=True,
-            max_queries=0, verbose=False) -> dict:
+            max_queries=0, verbose=False, dump_agg=None) -> dict:
     """Core A/B. ``gpu_counts_fn(pairs)`` takes a list of ``(qm, rm)`` arrays and returns a list of gpu
     inlier COUNTS (injectable → testable without a GPU). ``max_queries`` limits the frames processed (0
-    = all); ``verbose`` prints a per-frame progress line (the GPU pass over all pairs is slow)."""
+    = all); ``verbose`` prints a per-frame progress line (the GPU pass over all pairs is slow).
+
+    ``dump_agg`` (path): also write a GPU per-cell aggregation in the SAME schema as the archive's
+    ``aggregation.jsonl`` (query_id/cell_id/positions[{position_id,pos_lat,pos_lon,level_scores}]), so
+    ``diag_rank_curves --agg-file`` can produce the GPU top-K curves directly comparable to cv2's."""
     import time
 
     import h5py
+    agg_f = open(dump_agg, "w", encoding="utf-8") if dump_agg else None
     d = Path(diag_dir).expanduser()
     done = set(json.loads((d / "completed.json").read_text())["queries"]) if (d / "completed.json").exists() else None
     summ = {}
@@ -123,6 +128,14 @@ def compute(diag_dir, gpu_counts_fn, *, level_agg="sum", cell_agg="mean", only_d
             cells[r["cell_id"]][r["position_id"]]["levels"][int(r["level_id"])] = gc / n_q
             per_call.append((r["level_m"], r["n_mutual"], r["n_inliers"], gc))
 
+        if agg_f is not None:                                 # GPU aggregation in the cv2 schema
+            for cid, poss in cells.items():
+                agg_f.write(json.dumps({
+                    "query_id": q, "cell_id": cid,
+                    "positions": [{"position_id": pid, "pos_lat": pv["lat"], "pos_lon": pv["lon"],
+                                   "level_scores": {str(int(L)): sc for L, sc in pv["levels"].items()}}
+                                  for pid, pv in sorted(poss.items())]}) + "\n")
+
         ranked = _aggregate_gpu(cells, level_agg, cell_agg)
         if has_gt:
             for r in ranked[:5]:
@@ -136,6 +149,9 @@ def compute(diag_dir, gpu_counts_fn, *, level_agg="sum", cell_agg="mean", only_d
                     lost.append(q)
                 elif c5 > 250 and g5 <= 250:
                     gained.append(q)
+
+    if agg_f is not None:
+        agg_f.close()
 
     def _distR(xs, t):
         v = [x for x in xs if x is not None]
@@ -236,6 +252,9 @@ def main(argv=None) -> int:
                     help="run N times with different seeds and report mean±std of the headline metrics "
                          "(RANSAC/MAGSAC is stochastic — a single run can mislead)")
     ap.add_argument("--out", default=None, help="default: <diag-dir>/compare_<backend>.json")
+    ap.add_argument("--dump-agg", default=None,
+                    help="write GPU per-cell aggregation (cv2 aggregation.jsonl schema) here → feed to "
+                         "diag_rank_curves --agg-file for GPU top-K curves")
     args = ap.parse_args(argv)
 
     if args.repeats > 1:                                      # stochastic-variance metric (GPU eval)
@@ -267,7 +286,9 @@ def main(argv=None) -> int:
     res = compute(args.diag_dir, _gpu_counts_fn(args.backend, args.device, args.n_hyp, args.seed,
                                                 args.sigma_max, args.reproj_thresh),
                   level_agg=args.level_agg, cell_agg=args.cell_agg, max_queries=args.max_queries,
-                  verbose=True)
+                  verbose=True, dump_agg=args.dump_agg)
+    if args.dump_agg:
+        print(f"[ok] GPU aggregation -> {args.dump_agg}", flush=True)
     out = Path(args.out).expanduser() if args.out else Path(args.diag_dir).expanduser() / f"compare_{args.backend}.json"
     out.write_text(json.dumps(res, indent=2), encoding="utf-8")
     pc, rk = res["per_call"], res["ranking"]

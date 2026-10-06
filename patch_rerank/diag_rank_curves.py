@@ -42,7 +42,7 @@ def _rank(cells, agg):
     return out
 
 
-def compute(diag_dir, aggs=("sum", "max")) -> dict:
+def compute(diag_dir, aggs=("sum", "max"), agg_file="aggregation.jsonl") -> dict:
     d = Path(diag_dir).expanduser()
     gt = {}
     for line in (d / "summary.jsonl").read_text(encoding="utf-8").splitlines():
@@ -50,7 +50,10 @@ def compute(diag_dir, aggs=("sum", "max")) -> dict:
         if s.get("gt") and None not in s["gt"]:
             gt[s["query_id"]] = s["gt"]
     cells = collections.defaultdict(list)
-    for line in (d / "aggregation.jsonl").read_text(encoding="utf-8").splitlines():
+    agg_path = Path(agg_file).expanduser()
+    if not agg_path.is_absolute():
+        agg_path = d / agg_file
+    for line in agg_path.read_text(encoding="utf-8").splitlines():
         a = json.loads(line)
         if a["query_id"] in gt:
             cells[a["query_id"]].append(a)
@@ -81,9 +84,12 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--diag-dir", required=True)
     ap.add_argument("--aggs", default="sum,max", help="comma list of level_agg to compare (sum,max)")
+    ap.add_argument("--agg-file", default="aggregation.jsonl",
+                    help="aggregation source (default cv2 aggregation.jsonl; pass aggregation_gpu.jsonl "
+                         "from compare_gpu --dump-agg for the GPU curves)")
     ap.add_argument("--out", default=None, help="default: <diag-dir>/rank_curves.json")
     args = ap.parse_args(argv)
-    res = compute(args.diag_dir, aggs=tuple(a.strip() for a in args.aggs.split(",")))
+    res = compute(args.diag_dir, aggs=tuple(a.strip() for a in args.aggs.split(",")), agg_file=args.agg_file)
     out = Path(args.out).expanduser() if args.out else Path(args.diag_dir).expanduser() / "rank_curves.json"
     out.write_text(json.dumps(res, indent=2), encoding="utf-8")
     for agg, r in res.items():
