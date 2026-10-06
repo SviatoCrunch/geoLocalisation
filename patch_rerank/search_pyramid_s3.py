@@ -215,7 +215,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--queries", nargs="+", required=True, help="city=query_dinov3sat.h5 (DINOv3 tokens)")
     ap.add_argument("--shortlist", required=True, help="coarse (DINOv2) top-N cells per query, matching store ids")
-    ap.add_argument("--index-uri", required=True, help="s3://…/<city>/_index.json manifest")
+    ap.add_argument("--index-uri", default=None, help="s3://…/<city>/_index.json manifest (S3 store)")
+    ap.add_argument("--store-dir", default=None,
+                    help="local pyramid store dir (<root>/_index.json + cells/) — zero S3 downloads, no "
+                         "cell cache. Mutually exclusive with --index-uri (give exactly one).")
     ap.add_argument("--cache-dir", default="/tmp/cellcache")
     ap.add_argument("--cache-cap", type=int, default=256)
     ap.add_argument("--k-coarse", type=int, default=100, help="candidate cells refined per query")
@@ -259,12 +262,21 @@ def main(argv=None) -> int:
 
     import torch
     from tqdm import tqdm
-    from .cell_store_s3 import CellStoreS3
     from .query_io import QueryGridStore
+
+    if bool(args.index_uri) == bool(args.store_dir):
+        ap.error("give exactly one of --index-uri (S3) or --store-dir (local)")
 
     qpaths = dict(a.split("=", 1) for a in args.queries)
     qstore = QueryGridStore(qpaths)
-    store = CellStoreS3(args.index_uri, cache_dir=args.cache_dir, cache_cap=args.cache_cap)
+    if args.store_dir:
+        from .cell_store_local import CellStoreLocal
+        store = CellStoreLocal(args.store_dir)
+        store_source = f"local:{args.store_dir}"
+    else:
+        from .cell_store_s3 import CellStoreS3
+        store = CellStoreS3(args.index_uri, cache_dir=args.cache_dir, cache_cap=args.cache_cap)
+        store_source = args.index_uri
     sj = json.loads(Path(args.shortlist).expanduser().read_text())
     dev = args.device
 
@@ -285,14 +297,14 @@ def main(argv=None) -> int:
         verify_homography_full(_pr, _pr + 0.01, reproj_thresh=2.0, method_int=method_int)  # probe: it runs
         cfg = {"k_coarse": args.k_coarse, "topk": args.topk, "level_agg": args.level_agg,
                "cell_agg": args.cell_agg, "reproj_thresh": args.reproj_thresh,
-               "verify_backend": "cpu_magsac", "index_uri": args.index_uri,
+               "verify_backend": "cpu_magsac", "store_source": store_source,
                "store_config": store.config, "method_int": method_int,
                "queries": {c: str(p) for c, p in sorted(qpaths.items())}}
         fp = rerank_diag.config_fingerprint(cfg)
         manifest = {"run_id": fp, "git_commit": rerank_diag.git_commit(Path(__file__).resolve().parents[1]),
                     "created_utc": datetime.now(timezone.utc).isoformat(), "config": cfg,
                     "cv2": {"version": cv2.__version__, "method": "USAC_MAGSAC", "method_int": method_int},
-                    "store": {"index_uri": args.index_uri, "config": store.config},
+                    "store": {"source": store_source, "config": store.config},
                     "queries": {c: str(p) for c, p in qpaths.items()}, "shortlist": str(args.shortlist),
                     "seed": None}
         diag = rerank_diag.DiagWriter(args.diag_dir, manifest, fp, resume=not args.no_resume)
@@ -302,7 +314,7 @@ def main(argv=None) -> int:
     out = {"meta": {"k_coarse": args.k_coarse, "topk": args.topk, "cell_agg": args.cell_agg,
                     "level_agg": args.level_agg, "verify_backend": args.verify_backend,
                     "execution_order": args.execution_order,
-                    "index_uri": args.index_uri, "store_config": store.config,
+                    "store_source": store_source, "store_config": store.config,
                     "gpu": {"n_hyp": args.gpu_n_hyp, "score_type": args.gpu_score_type,
                             "refine_iter": args.gpu_refine_iter}},
            "per_query": {}}

@@ -256,3 +256,45 @@ def test_main_diag_end_to_end(tmp_path, fake_cv2, monkeypatch):
     assert _run() == 0                                       # resume: query already done → skipped
     recs2 = (dd / "records.jsonl").read_text().splitlines()
     assert len(recs2) == n_recs                              # no new records appended
+
+
+def _local_store(root, feats):
+    """Write a <root>/_index.json + cells/*.h5 store like build_cell_store_s3 (no S3)."""
+    (root / "cells").mkdir(parents=True, exist_ok=True)
+    cells = {}
+    for cid, lat, lon in [("kram:0_lvl0", 1.0, 3.0), ("kram:1_lvl0", 2.0, 4.0)]:
+        safe = cid.replace(":", "_")
+        _distinct_cell(root / "cells" / f"{safe}.h5", feats)
+        cells[cid] = {"key": f"cells/{safe}.h5", "lat": lat, "lon": lon}
+    (root / "_index.json").write_text(json.dumps(
+        {"city": "kram", "config": {"tile_size_m": 1000.0, "patch": 14}, "cells": cells}))
+
+
+def test_main_diag_store_dir(tmp_path, fake_cv2):
+    """--store-dir reads a local pyramid store: zero downloads, no boto3, full archive still written."""
+    feats = F.normalize(_feats(3), dim=1).numpy().astype(np.float32)
+    qh5 = tmp_path / "q.h5"; _query_h5(qh5, feats)
+    root = tmp_path / "store"; _local_store(root, feats)
+    sl = tmp_path / "sl.json"
+    sl.write_text(json.dumps({"shortlist": {"kram:0_1.5_3.5": {"cells": ["kram:0_lvl0", "kram:1_lvl0"]}}}))
+    dd = tmp_path / "diag"
+    rc = sps.main(["--queries", f"kram={qh5}", "--shortlist", str(sl), "--store-dir", str(root),
+                   "--k-coarse", "100", "--topk", "5", "--cell-agg", "mean", "--level-agg", "sum",
+                   "--device", "cpu", "--out", str(tmp_path / "out.json"), "--diag-dir", str(dd)])
+    assert rc == 0
+    man = json.loads((dd / "manifest.json").read_text())
+    assert man["config"]["store_source"] == f"local:{root}"
+    recs = (dd / "records.jsonl").read_text().splitlines()
+    assert len(recs) == 2 * 2 * 2                            # 2 cells × 2 positions × 2 levels
+    assert "kram:0_1.5_3.5" in json.loads((dd / "completed.json").read_text())["queries"]
+
+
+def test_store_dir_xor_index_uri(tmp_path, fake_cv2):
+    sl = tmp_path / "sl.json"; sl.write_text(json.dumps({"shortlist": {}}))
+    qh5 = tmp_path / "q.h5"; _query_h5(qh5, F.normalize(_feats(3), dim=1).numpy().astype(np.float32))
+    base = ["--queries", f"kram={qh5}", "--shortlist", str(sl), "--device", "cpu",
+            "--out", str(tmp_path / "o.json")]
+    with pytest.raises(SystemExit):                          # neither given
+        sps.main(base)
+    with pytest.raises(SystemExit):                          # both given
+        sps.main(base + ["--store-dir", str(tmp_path), "--index-uri", "s3://b/k/_index.json"])
