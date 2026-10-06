@@ -232,8 +232,38 @@ def main(argv=None) -> int:
     ap.add_argument("--level-agg", choices=["sum", "max"], default="sum")
     ap.add_argument("--cell-agg", choices=["mean", "min", "max"], default="mean")
     ap.add_argument("--max-queries", type=int, default=0, help="limit frames (0=all) for a quick A/B")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="run N times with different seeds and report mean±std of the headline metrics "
+                         "(RANSAC/MAGSAC is stochastic — a single run can mislead)")
     ap.add_argument("--out", default=None, help="default: <diag-dir>/compare_<backend>.json")
     args = ap.parse_args(argv)
+
+    if args.repeats > 1:                                      # stochastic-variance metric (GPU eval)
+        import statistics
+        md, lost, g5 = [], [], []
+        for i in range(args.repeats):
+            r = compute(args.diag_dir, _gpu_counts_fn(args.backend, args.device, args.n_hyp,
+                                                      args.seed + i, args.sigma_max, args.reproj_thresh),
+                        level_agg=args.level_agg, cell_agg=args.cell_agg, max_queries=args.max_queries,
+                        verbose=False)
+            md.append(r["per_call"]["mean_delta_inliers"]); lost.append(r["ranking"]["paired_top5@250m"]["gpu_lost"])
+            g5.append(r["ranking"]["gpu"]["top5_distR@250m"])
+            print(f"[repeat {i + 1}/{args.repeats}] meanΔinl={md[-1]} gpu_lost={lost[-1]} "
+                  f"gpu_top5@250m={g5[-1]}", flush=True)
+        sd = lambda xs: (statistics.pstdev(xs) if len(xs) > 1 else 0.0)
+        res = {"repeats": args.repeats,
+               "mean_delta_inliers": {"mean": statistics.mean(md), "std": sd(md)},
+               "gpu_lost_top5@250m": {"mean": statistics.mean(lost), "std": sd(lost)},
+               "gpu_top5_distR@250m": {"mean": statistics.mean(g5), "std": sd(g5)}}
+        out = Path(args.out).expanduser() if args.out else Path(args.diag_dir).expanduser() / f"compare_{args.backend}_repeats.json"
+        out.write_text(json.dumps(res, indent=2), encoding="utf-8")
+        print(f"[repeats={args.repeats}] meanΔinl {res['mean_delta_inliers']['mean']:.3f}"
+              f"±{res['mean_delta_inliers']['std']:.3f} | gpu_lost {res['gpu_lost_top5@250m']['mean']:.1f}"
+              f"±{res['gpu_lost_top5@250m']['std']:.1f} | gpu_top5@250m {res['gpu_top5_distR@250m']['mean']:.3f}"
+              f"±{res['gpu_top5_distR@250m']['std']:.3f}", flush=True)
+        print(f"[ok] -> {out}", flush=True)
+        return 0
+
     res = compute(args.diag_dir, _gpu_counts_fn(args.backend, args.device, args.n_hyp, args.seed,
                                                 args.sigma_max, args.reproj_thresh),
                   level_agg=args.level_agg, cell_agg=args.cell_agg, max_queries=args.max_queries,

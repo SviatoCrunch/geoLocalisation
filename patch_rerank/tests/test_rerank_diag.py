@@ -425,6 +425,21 @@ def test_diag_kmz(tmp_path, fake_cv2):
     assert "GT" in kml and "<Polygon>" in kml and "kram:0_1.5_3.5" in kml
 
 
+def test_diag_rank_curves(tmp_path, fake_cv2):
+    from patch_rerank import diag_rank_curves
+    dd = _archive_2q(tmp_path, fake_cv2)
+    r = diag_rank_curves.compute(dd, aggs=("sum", "max"))
+    assert set(r) == {"sum", "max"}
+    for agg in ("sum", "max"):
+        assert r[agg]["n_frames"] == 2
+        c20 = r[agg]["by_topK"][20]
+        assert set(c20) == {"distR@250m", "distR@500m", "distR@1000m", "gtcell_recall"}
+        assert 0.0 <= c20["gtcell_recall"] <= 1.0
+        # recall is monotonic non-decreasing in K
+        rec = [r[agg]["by_topK"][K]["gtcell_recall"] for K in (1, 5, 10, 15, 20)]
+        assert all(rec[i] <= rec[i + 1] for i in range(len(rec) - 1))
+
+
 def test_diag_gap(tmp_path, fake_cv2):
     from patch_rerank import diag_gap
     dd = _archive_2q(tmp_path, fake_cv2)
@@ -450,6 +465,19 @@ def test_compare_gpu_perfect_and_divergent(tmp_path, fake_cv2):
     # a GPU that finds nothing → scores collapse; structure still valid, deltas negative
     zero = compare_gpu.compute(dd, lambda pairs: [0 for _ in pairs])
     assert zero["per_call"]["mean_delta_inliers"] < 0 and zero["n_calls"] == res["n_calls"]
+
+
+def test_compare_gpu_repeats_cli(tmp_path, fake_cv2, monkeypatch, capsys):
+    """--repeats runs the magsacpp backend N times and reports mean±std (stochastic-variance metric)."""
+    from patch_rerank import compare_gpu
+    dd = _archive_2q(tmp_path, fake_cv2)
+    rc = compare_gpu.main(["--diag-dir", str(dd), "--backend", "magsacpp_torch", "--device", "cpu",
+                           "--n-hyp", "32", "--repeats", "2"])
+    assert rc == 0
+    r = json.loads((dd / "compare_magsacpp_torch_repeats.json").read_text())
+    assert r["repeats"] == 2
+    assert set(r) >= {"mean_delta_inliers", "gpu_lost_top5@250m", "gpu_top5_distR@250m"}
+    assert "std" in r["mean_delta_inliers"]
 
 
 def test_compare_fields(tmp_path, fake_cv2):
