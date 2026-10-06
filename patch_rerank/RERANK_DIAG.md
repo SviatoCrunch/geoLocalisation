@@ -110,9 +110,21 @@ position_score, best_level_m}`; plus `position_scores[]`, `n_positions`, `cell_s
 
 ### `summary.jsonl` row
 
-Key = `query_id`. `gt [lat,lon]|null`, `coarse_top[{cell_id,coarse_rank}]` (all 100),
-`reranked_top[{cell_id,cell_score,rank,lat,lon,level_m,dist_m}]` (ALL candidates, not just top-k),
-`final_topk[...]`, `metrics{fine_dist_m, fine_dist_topk_m}`.
+Key = `query_id`. `gt [lat,lon]|null`, `arrays` (location of this query's arrays H5),
+`coarse_top[{cell_id,coarse_rank}]` (all 100),
+`reranked_top[{cell_id, coarse_rank, rerank_rank, cell_score, lat, lon, level_m, dist_m}]` (ALL
+candidates after rerank sort, not just top-k), `final_topk[...]`, `metrics{fine_dist_m, fine_dist_topk_m}`.
+
+## Summary metrics (`diag_stats`)
+
+Point-9 aggregates are computed from the archive itself (so they cover the full set across resumes,
+unlike `search.json` which is per-invocation):
+
+    python -m patch_rerank.diag_stats --diag-dir /…/diag_kram_cv2_magsac    # -> <dir>/stats.json
+
+`stats.json`: `coarse_recall@100` (GT within distR of any of the 100 candidate cell centres),
+`fine_top1`/`fine_top5` (distR@250/500/1000m + median/p90/p95), and `counts` (frames, candidates,
+positions, levels, `cv2_calls`, `failed_checks`, status breakdown) + `time.verify_s_total`.
 
 > Full-set top-5 metrics: on a resumed run, `search.json` only covers the queries processed *this*
 > invocation. Aggregate `summary.jsonl` across the whole archive for the complete-set numbers.

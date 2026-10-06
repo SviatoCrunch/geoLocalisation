@@ -369,6 +369,35 @@ def test_main_diag_arrays_offload_to_s3(tmp_path, fake_cv2, monkeypatch):
     assert rec["h5"] == "s3://bkt/diag/kram/kram_0_1.5_3.5.h5"                 # record points at S3, not a dead local path
 
 
+def test_coarse_rank_in_reranked_and_diag_stats(tmp_path, fake_cv2):
+    """reranked_top carries coarse_rank + rerank_rank; diag_stats aggregates point-9 metrics."""
+    from patch_rerank import diag_stats
+    feats = F.normalize(_feats(3), dim=1).numpy().astype(np.float32)
+    qh5 = tmp_path / "q.h5"; _query_h5_2(qh5, feats)
+    root = tmp_path / "store"; _local_store(root, feats)
+    sl = tmp_path / "sl.json"
+    sl.write_text(json.dumps({"shortlist": {
+        "kram:0_1.5_3.5": {"cells": ["kram:1_lvl0", "kram:0_lvl0"]},     # note: kram:1 first in coarse order
+        "kram:1_2.5_4.5": {"cells": ["kram:0_lvl0", "kram:1_lvl0"]}}}))
+    dd = tmp_path / "diag"
+    assert sps.main(["--queries", f"kram={qh5}", "--shortlist", str(sl), "--store-dir", str(root),
+                     "--k-coarse", "100", "--topk", "5", "--cell-agg", "mean", "--level-agg", "sum",
+                     "--device", "cpu", "--out", str(tmp_path / "o.json"), "--diag-dir", str(dd)]) == 0
+
+    summ = [json.loads(l) for l in (dd / "summary.jsonl").read_text().splitlines()]
+    rr = {s["query_id"]: s["reranked_top"] for s in summ}["kram:0_1.5_3.5"]
+    assert len(rr) == 2 and {e["cell_id"]: e["coarse_rank"] for e in rr} == {"kram:1_lvl0": 0, "kram:0_lvl0": 1}
+    assert all("rerank_rank" in e for e in rr) and [e["rerank_rank"] for e in rr] == [1, 2]
+
+    assert diag_stats.main(["--diag-dir", str(dd)]) == 0
+    st = json.loads((dd / "stats.json").read_text())
+    assert st["counts"]["frames"] == 2 and st["counts"]["cv2_calls"] > 0
+    assert st["counts"]["checks_total"] == len((dd / "records.jsonl").read_text().splitlines())
+    assert "distR@250m" in st["fine_top1"] and "distR@250m" in st["fine_top5"]
+    assert "recall@100_250m" in st["coarse_recall@100"]
+    assert set(st["counts"]["status_breakdown"]) <= {"ok", "no_consensus", "skipped_insufficient_matches"}
+
+
 def test_store_dir_xor_index_uri(tmp_path, fake_cv2):
     sl = tmp_path / "sl.json"; sl.write_text(json.dumps({"shortlist": {}}))
     qh5 = tmp_path / "q.h5"; _query_h5(qh5, F.normalize(_feats(3), dim=1).numpy().astype(np.float32))

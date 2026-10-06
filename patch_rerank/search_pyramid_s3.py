@@ -410,7 +410,8 @@ def main(argv=None) -> int:
                 recs_q = list(qcell[q].values())
                 gt_ok = math.isfinite(p["qlat"]) and math.isfinite(p["qlon"])
                 full = sorted(recs_q, key=lambda r: r["cell_score"], reverse=True)
-                reranked = [{"cell_id": r["cell_id"], "cell_score": r["cell_score"], "rank": i + 1,
+                reranked = [{"cell_id": r["cell_id"], "coarse_rank": p["cand_rank"][r["cell_id"]],
+                             "rerank_rank": i + 1, "rank": i + 1, "cell_score": r["cell_score"],
                              "lat": r["lat"], "lon": r["lon"], "level_m": r["level_m"],
                              "dist_m": (_haversine_m(p["qlat"], p["qlon"], r["lat"], r["lon"])
                                         if gt_ok else None)} for i, r in enumerate(full)]
