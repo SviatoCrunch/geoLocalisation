@@ -258,6 +258,10 @@ def main(argv=None) -> int:
                          "to a non-diag run; captures H/mask/correspondences of every geometric check.")
     ap.add_argument("--no-resume", action="store_true",
                     help="with --diag-dir: re-process queries already in completed.json instead of skipping")
+    ap.add_argument("--diag-arrays-s3", default=None,
+                    help="with --diag-dir: after each query, upload its arrays/<q>.h5 to this "
+                         "s3://bucket/prefix and delete it locally — only the compact jsonl stay on disk "
+                         "(for a full-set run that would otherwise overflow local disk). Needs S3 write.")
     args = ap.parse_args(argv)
 
     import torch
@@ -301,13 +305,25 @@ def main(argv=None) -> int:
                "store_config": store.config, "method_int": method_int,
                "queries": {c: str(p) for c, p in sorted(qpaths.items())}}
         fp = rerank_diag.config_fingerprint(cfg)
+        arrays_bucket = arrays_prefix = s3c = None
+        if args.diag_arrays_s3:                               # offload arrays to S3 + delete locally
+            if not args.diag_arrays_s3.startswith("s3://"):
+                ap.error("--diag-arrays-s3 must be s3://bucket/prefix")
+            arrays_bucket, _, arrays_prefix = args.diag_arrays_s3[5:].partition("/")
+            import boto3
+            s3c = boto3.client("s3")
+            probe = f"{arrays_prefix.rstrip('/')}/_diag_probe_{fp}.txt" if arrays_prefix else f"_diag_probe_{fp}.txt"
+            s3c.put_object(Bucket=arrays_bucket, Key=probe, Body=b"ok")   # fail fast if no write perms
         manifest = {"run_id": fp, "git_commit": rerank_diag.git_commit(Path(__file__).resolve().parents[1]),
                     "created_utc": datetime.now(timezone.utc).isoformat(), "config": cfg,
                     "cv2": {"version": cv2.__version__, "method": "USAC_MAGSAC", "method_int": method_int},
                     "store": {"source": store_source, "config": store.config},
+                    "arrays_dest": args.diag_arrays_s3 or "local",
                     "queries": {c: str(p) for c, p in qpaths.items()}, "shortlist": str(args.shortlist),
                     "seed": None}
-        diag = rerank_diag.DiagWriter(args.diag_dir, manifest, fp, resume=not args.no_resume)
+        diag = rerank_diag.DiagWriter(args.diag_dir, manifest, fp, resume=not args.no_resume,
+                                      arrays_s3_bucket=arrays_bucket, arrays_s3_prefix=arrays_prefix,
+                                      s3_client=s3c)
         print(f"[diag] archive -> {args.diag_dir}  fingerprint={fp}  already_done={len(diag._completed)}",
               flush=True)
 

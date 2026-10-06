@@ -289,6 +289,42 @@ def test_main_diag_store_dir(tmp_path, fake_cv2):
     assert "kram:0_1.5_3.5" in json.loads((dd / "completed.json").read_text())["queries"]
 
 
+def test_main_diag_arrays_offload_to_s3(tmp_path, fake_cv2, monkeypatch):
+    """--diag-arrays-s3: each query's arrays h5 is uploaded then deleted locally; jsonl stay on disk."""
+    import os
+    import shutil
+
+    dest = tmp_path / "s3dest"; dest.mkdir()
+
+    class _FakeS3:
+        put = []
+
+        def put_object(self, Bucket, Key, Body):            # the write-perms probe
+            _FakeS3.put.append(Key)
+
+        def upload_file(self, local, Bucket, Key):
+            shutil.copy(local, dest / os.path.basename(Key))
+
+    monkeypatch.setattr("boto3.client", lambda svc, *a, **k: _FakeS3())
+    feats = F.normalize(_feats(3), dim=1).numpy().astype(np.float32)
+    qh5 = tmp_path / "q.h5"; _query_h5(qh5, feats)
+    root = tmp_path / "store"; _local_store(root, feats)
+    sl = tmp_path / "sl.json"
+    sl.write_text(json.dumps({"shortlist": {"kram:0_1.5_3.5": {"cells": ["kram:0_lvl0", "kram:1_lvl0"]}}}))
+    dd = tmp_path / "diag"
+    rc = sps.main(["--queries", f"kram={qh5}", "--shortlist", str(sl), "--store-dir", str(root),
+                   "--k-coarse", "100", "--topk", "5", "--cell-agg", "mean", "--level-agg", "sum",
+                   "--device", "cpu", "--out", str(tmp_path / "out.json"), "--diag-dir", str(dd),
+                   "--diag-arrays-s3", "s3://bkt/diag/kram"])
+    assert rc == 0
+    assert any(k.startswith("diag/kram/_diag_probe") for k in _FakeS3.put)     # probe ran
+    assert (dest / "kram_0_1.5_3.5.h5").exists()                               # uploaded
+    assert not (dd / "arrays" / "kram_0_1.5_3.5.h5").exists()                  # deleted locally
+    summ = json.loads((dd / "summary.jsonl").read_text().splitlines()[0])
+    assert summ["arrays"] == "s3://bkt/diag/kram/kram_0_1.5_3.5.h5"
+    assert (dd / "records.jsonl").stat().st_size > 0                           # jsonl kept local
+
+
 def test_store_dir_xor_index_uri(tmp_path, fake_cv2):
     sl = tmp_path / "sl.json"; sl.write_text(json.dumps({"shortlist": {}}))
     qh5 = tmp_path / "q.h5"; _query_h5(qh5, F.normalize(_feats(3), dim=1).numpy().astype(np.float32))

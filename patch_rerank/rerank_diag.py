@@ -57,13 +57,22 @@ class DiagWriter:
     and :meth:`close` at the end. Opening with ``resume=True`` on an existing dir skips already-finished
     queries (same fingerprint required)."""
 
-    def __init__(self, diag_dir: str | Path, manifest: dict, fingerprint: str, *, resume: bool = True):
+    def __init__(self, diag_dir: str | Path, manifest: dict, fingerprint: str, *, resume: bool = True,
+                 arrays_s3_bucket: str | None = None, arrays_s3_prefix: str | None = None,
+                 s3_client=None):
+        """``arrays_s3_bucket``/``arrays_s3_prefix`` (optional): after each query is finalized, upload
+        its ``arrays/<query>.h5`` to ``s3://<bucket>/<prefix>/<query>.h5`` and delete the local copy —
+        so only the compact jsonl + completed.json stay on disk (the full geometry lives on S3). Without
+        them, arrays stay local."""
         self.dir = Path(diag_dir).expanduser()
         (self.dir / "arrays").mkdir(parents=True, exist_ok=True)
         self.fingerprint = fingerprint
         self._completed_path = self.dir / "completed.json"
         self._completed: set[str] = set()
         self._manifest_path = self.dir / "manifest.json"
+        self._s3_bucket = arrays_s3_bucket
+        self._s3_prefix = (arrays_s3_prefix or "").rstrip("/")
+        self._s3 = s3_client
 
         if self._completed_path.exists():
             prev = json.loads(self._completed_path.read_text())
@@ -157,15 +166,29 @@ class DiagWriter:
             "best_position_id": bi, "best_level_m": int(blv[bi]),
             "best_h5_group": f"{_safe(cell_id)}/p{bi}/l{int(blv[bi])}"})
 
+    def _offload_arrays(self, query_id: str) -> str:
+        """Close+upload this query's arrays H5 to S3 and delete the local copy; return its location
+        (s3:// uri, or the local relative path when no S3 target). Upload errors propagate (the run
+        should fail loudly rather than silently drop geometry)."""
+        local = self.dir / "arrays" / (_safe(query_id) + ".h5")
+        if not self._s3_bucket:
+            return f"arrays/{_safe(query_id)}.h5"
+        key = f"{self._s3_prefix}/{_safe(query_id)}.h5" if self._s3_prefix else f"{_safe(query_id)}.h5"
+        self._s3.upload_file(str(local), self._s3_bucket, key)
+        local.unlink(missing_ok=True)
+        return f"s3://{self._s3_bucket}/{key}"
+
     def finalize_query(self, *, query_id, gt, coarse_cells, reranked, final_topk, metrics):
-        """Record the per-query summary (full coarse list, full reranked list, final top-K, metrics),
-        close the query's arrays file and mark it complete (so resume skips it)."""
-        self._write(self._sum_f, {
-            "query_id": query_id, "gt": gt,
-            "coarse_top": [{"cell_id": c, "coarse_rank": r} for r, c in enumerate(coarse_cells)],
-            "reranked_top": reranked, "final_topk": final_topk, "metrics": metrics})
+        """Close the query's arrays file, offload it (S3 + local delete when configured), record the
+        per-query summary (full coarse list, full reranked list, final top-K, metrics, arrays location)
+        and mark it complete (so resume skips it)."""
         if self._h5 is not None:
             self._h5.close(); self._h5 = None
+        arrays_location = self._offload_arrays(query_id)
+        self._write(self._sum_f, {
+            "query_id": query_id, "gt": gt, "arrays": arrays_location,
+            "coarse_top": [{"cell_id": c, "coarse_rank": r} for r, c in enumerate(coarse_cells)],
+            "reranked_top": reranked, "final_topk": final_topk, "metrics": metrics})
         self._completed.add(query_id)
         self._completed_path.write_text(json.dumps(
             {"fingerprint": self.fingerprint, "queries": sorted(self._completed)}))
