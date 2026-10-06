@@ -398,6 +398,48 @@ def test_coarse_rank_in_reranked_and_diag_stats(tmp_path, fake_cv2):
     assert set(st["counts"]["status_breakdown"]) <= {"ok", "no_consensus", "skipped_insufficient_matches"}
 
 
+def _archive_2q(tmp_path, fake_cv2):
+    """Produce a small real archive (2 queries, local store) for the kmz/compare tools."""
+    feats = F.normalize(_feats(3), dim=1).numpy().astype(np.float32)
+    qh5 = tmp_path / "q.h5"; _query_h5_2(qh5, feats)
+    root = tmp_path / "store"; _local_store(root, feats)
+    sl = tmp_path / "sl.json"
+    sl.write_text(json.dumps({"shortlist": {
+        "kram:0_1.5_3.5": {"cells": ["kram:0_lvl0", "kram:1_lvl0"]},
+        "kram:1_2.5_4.5": {"cells": ["kram:0_lvl0", "kram:1_lvl0"]}}}))
+    dd = tmp_path / "diag"
+    assert sps.main(["--queries", f"kram={qh5}", "--shortlist", str(sl), "--store-dir", str(root),
+                     "--k-coarse", "100", "--topk", "5", "--cell-agg", "mean", "--level-agg", "sum",
+                     "--device", "cpu", "--out", str(tmp_path / "o.json"), "--diag-dir", str(dd)]) == 0
+    return dd
+
+
+def test_diag_kmz(tmp_path, fake_cv2):
+    import zipfile
+    from patch_rerank import diag_kmz
+    dd = _archive_2q(tmp_path, fake_cv2)
+    assert diag_kmz.main(["--diag-dir", str(dd)]) == 0
+    kmz = dd / "accuracy.kmz"; assert kmz.exists()
+    with zipfile.ZipFile(kmz) as z:
+        kml = z.read("doc.kml").decode()
+    assert "GT" in kml and "<Polygon>" in kml and "kram:0_1.5_3.5" in kml
+
+
+def test_compare_gpu_perfect_and_divergent(tmp_path, fake_cv2):
+    from patch_rerank import compare_gpu
+    dd = _archive_2q(tmp_path, fake_cv2)
+    # fake GPU that reproduces _FakeCv2 exactly (every-other inlier -> ceil(M/2)) → perfect agreement
+    perfect = lambda pairs: [(len(q) + 1) // 2 for (q, _) in pairs]
+    res = compare_gpu.compute(dd, perfect)
+    assert res["n_calls"] > 0
+    assert res["per_call"]["mean_delta_inliers"] == 0.0 and res["per_call"]["exact_match_frac"] == 1.0
+    assert res["ranking"]["paired_top5@250m"]["gpu_lost"] == 0
+    assert res["ranking"]["gpu"]["top5_distR@250m"] == res["ranking"]["cv2"]["top5_distR@250m"]
+    # a GPU that finds nothing → scores collapse; structure still valid, deltas negative
+    zero = compare_gpu.compute(dd, lambda pairs: [0 for _ in pairs])
+    assert zero["per_call"]["mean_delta_inliers"] < 0 and zero["n_calls"] == res["n_calls"]
+
+
 def test_store_dir_xor_index_uri(tmp_path, fake_cv2):
     sl = tmp_path / "sl.json"; sl.write_text(json.dumps({"shortlist": {}}))
     qh5 = tmp_path / "q.h5"; _query_h5(qh5, F.normalize(_feats(3), dim=1).numpy().astype(np.float32))
