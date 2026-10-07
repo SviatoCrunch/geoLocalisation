@@ -85,8 +85,7 @@ def main(argv=None) -> int:
     ap.add_argument("--diag-dir", required=True)
     ap.add_argument("--aggs", default="sum,max", help="comma list of level_agg to compare (sum,max)")
     ap.add_argument("--agg-file", default="aggregation.jsonl",
-                    help="aggregation source (default cv2 aggregation.jsonl; pass aggregation_gpu.jsonl "
-                         "from compare_gpu --dump-agg for the GPU curves)")
+                    help="aggregation source (default cv2 aggregation.jsonl)")
     ap.add_argument("--out", default=None, help="default: <diag-dir>/rank_curves.json")
     args = ap.parse_args(argv)
     res = compute(args.diag_dir, aggs=tuple(a.strip() for a in args.aggs.split(",")), agg_file=args.agg_file)

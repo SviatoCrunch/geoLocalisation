@@ -440,20 +440,6 @@ def test_diag_rank_curves(tmp_path, fake_cv2):
         assert all(rec[i] <= rec[i + 1] for i in range(len(rec) - 1))
 
 
-def test_gpu_rank_curves_via_dump_agg(tmp_path, fake_cv2):
-    """compare_gpu --dump-agg writes a GPU aggregation that diag_rank_curves consumes → GPU top-K
-    curves. With a GPU fn reproducing cv2 counts, GPU curves must equal cv2 curves."""
-    from patch_rerank import compare_gpu, diag_rank_curves
-    dd = _archive_2q(tmp_path, fake_cv2)
-    aggp = dd / "aggregation_gpu.jsonl"
-    perfect = lambda pairs: [(len(q) + 1) // 2 for (q, _) in pairs]   # == FakeCv2 count
-    compare_gpu.compute(dd, perfect, dump_agg=str(aggp))
-    assert aggp.exists()
-    cv2_curve = diag_rank_curves.compute(dd, aggs=("sum",))
-    gpu_curve = diag_rank_curves.compute(dd, aggs=("sum",), agg_file="aggregation_gpu.jsonl")
-    assert gpu_curve["sum"]["by_topK"] == cv2_curve["sum"]["by_topK"]   # identical counts → identical curves
-
-
 def test_diag_gap(tmp_path, fake_cv2):
     from patch_rerank import diag_gap
     dd = _archive_2q(tmp_path, fake_cv2)
@@ -466,34 +452,6 @@ def test_diag_gap(tmp_path, fake_cv2):
     assert "median" in g["score_gap_top1_minus_gtcell"]
 
 
-def test_compare_gpu_perfect_and_divergent(tmp_path, fake_cv2):
-    from patch_rerank import compare_gpu
-    dd = _archive_2q(tmp_path, fake_cv2)
-    # fake GPU that reproduces _FakeCv2 exactly (every-other inlier -> ceil(M/2)) → perfect agreement
-    perfect = lambda pairs: [(len(q) + 1) // 2 for (q, _) in pairs]
-    res = compare_gpu.compute(dd, perfect)
-    assert res["n_calls"] > 0
-    assert res["per_call"]["mean_delta_inliers"] == 0.0 and res["per_call"]["exact_match_frac"] == 1.0
-    assert res["ranking"]["paired_top5@250m"]["gpu_lost"] == 0
-    assert res["ranking"]["gpu"]["top5_distR@250m"] == res["ranking"]["cv2"]["top5_distR@250m"]
-    # a GPU that finds nothing → scores collapse; structure still valid, deltas negative
-    zero = compare_gpu.compute(dd, lambda pairs: [0 for _ in pairs])
-    assert zero["per_call"]["mean_delta_inliers"] < 0 and zero["n_calls"] == res["n_calls"]
-
-
-def test_compare_gpu_repeats_cli(tmp_path, fake_cv2, monkeypatch, capsys):
-    """--repeats runs the magsacpp backend N times and reports mean±std (stochastic-variance metric)."""
-    from patch_rerank import compare_gpu
-    dd = _archive_2q(tmp_path, fake_cv2)
-    rc = compare_gpu.main(["--diag-dir", str(dd), "--backend", "magsacpp_torch", "--device", "cpu",
-                           "--n-hyp", "32", "--repeats", "2"])
-    assert rc == 0
-    r = json.loads((dd / "compare_magsacpp_torch_repeats.json").read_text())
-    assert r["repeats"] == 2
-    assert set(r) >= {"mean_delta_inliers", "gpu_lost_top5@250m", "gpu_top5_distR@250m"}
-    assert "std" in r["mean_delta_inliers"]
-
-
 def test_compare_fields(tmp_path, fake_cv2):
     """Field-level cv2-vs-GPU: mask IoU, H reproj diff, Δinliers over the archived rm/qm (CPU)."""
     from patch_rerank import compare_fields
@@ -504,16 +462,6 @@ def test_compare_fields(tmp_path, fake_cv2):
     assert 0.3 <= r["mask_iou"]["mean"] <= 0.7
     assert r["delta_inliers"]["mean"] > 0
     assert r["H_reproj_diff_px"]["median"] is not None and r["H_reproj_diff_px"]["median"] < 1.0  # both ≈ identity
-
-
-def test_compare_gpu_magsacpp_backend_smoke():
-    """The 'latest GPU variant' backend wires to experiments/magsacpp_torch and counts inliers on a
-    clean planted homography (identity → all points inliers)."""
-    from patch_rerank import compare_gpu
-    fn = compare_gpu._gpu_counts_fn("magsacpp_torch", "cpu", 64, 0, sigma_max=2.0, reproj_thresh=2.0)
-    pts = np.array([[0, 0], [10, 0], [10, 10], [0, 10], [5, 5], [3, 7], [8, 2], [1, 9]], float)
-    counts = fn([(pts.copy(), pts.copy())])                   # qm == rm → exact identity H
-    assert len(counts) == 1 and counts[0] >= 4                # recovers a model, most/all inliers
 
 
 def test_store_dir_xor_index_uri(tmp_path, fake_cv2):

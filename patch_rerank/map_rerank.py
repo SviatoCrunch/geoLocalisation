@@ -36,7 +36,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # 
 import numpy as np
 
 from .matcher import (_MIN_MATCHES, grid_keypoints, matched_coords, matched_coords_batch,
-                      matched_coords_batch_gpu, verify_inliers)
+                      verify_inliers)
 from .map_source import (latlon_to_merc, merc_to_latlon, open_src, read_pyramid_from_one,
                          resolve_maps, true_m_to_crs)
 from .map_dino import build_matched_extractor, extract_grids
@@ -231,13 +231,8 @@ def _run_crop_major(args, store, qstore, row_of, lat, lon, radius_m, backbone, p
                 p["score"][(px, py, L)] = 0.0
                 continue
             t2 = time.perf_counter()
-            if args.verify_backend == "gpu_kornia":
-                from .gpu_verify import verify_inliers_kornia
-                inl = verify_inliers_kornia(qm, rm, reproj_thresh=args.reproj_thresh,
-                                            max_iter=args.gpu_max_iter, seed=args.gpu_seed, device=dev)
-            else:
-                inl = verify_inliers(qm, rm, model=args.model, estimator=args.estimator,
-                                     reproj_thresh=args.reproj_thresh)
+            inl = verify_inliers(qm, rm, model=args.model, estimator=args.estimator,
+                                 reproj_thresh=args.reproj_thresh)
             prof["verify"] += time.perf_counter() - t2
             p["score"][(px, py, L)] = inl.shape[0] / p["nqf"] if p["nqf"] else 0.0
         if str(dev).startswith("cuda"):
@@ -297,24 +292,9 @@ def main(argv=None) -> int:
     ap.add_argument("--model", default="homography")
     ap.add_argument("--estimator", default="magsac")
     ap.add_argument("--reproj-thresh", type=float, default=2.0)
-    ap.add_argument("--verify-backend", choices=["cpu_magsac", "gpu_kornia", "gpu_batch"],
-                    default="cpu_magsac",
-                    help="geometric verifier for scorer=ransac. cpu_magsac (default): cv2 "
-                         "USAC_MAGSAC on the CPU (control + fallback). gpu_kornia: per-pair kornia "
-                         "RANSAC on GPU. gpu_batch: custom PyTorch MSAC batching hypotheses across "
-                         "many crop↔query pairs at once. GPU backends fit HOMOGRAPHY only; the score "
-                         "formula (inliers/n_query_patches) and aggregation are unchanged.")
-    ap.add_argument("--gpu-n-hyp", type=int, default=256,
-                    help="gpu_batch: minimal (4-point) hypotheses sampled per pair")
-    ap.add_argument("--gpu-max-iter", type=int, default=10, help="gpu_kornia: kornia RANSAC max_iter")
-    ap.add_argument("--gpu-score-type", choices=["msac", "ransac"], default="msac",
-                    help="gpu_batch objective: msac (truncated-L2) or ransac (inlier count). NOT "
-                         "MAGSAC++. (gpu_kornia always uses kornia's ransac scorer — its msac is buggy.)")
-    ap.add_argument("--gpu-refine-iter", type=int, default=5,
-                    help="gpu_batch: IRLS DLT refinement iterations on the winning inliers (0=off)")
-    ap.add_argument("--gpu-seed", type=int, default=0, help="GPU verifier RNG seed (hypothesis sampling)")
-    ap.add_argument("--gpu-points-budget", type=int, default=24_000_000,
-                    help="gpu_batch: cap on P·n_hyp·M_max work-tensor size per chunk (lower if GPU OOM)")
+    # Verifier = cv2 cpu_magsac only; GPU MAGSAC++ lives in magsacpp_torch.search. gpu_batch/gpu_kornia removed 2026-10.
+    ap.add_argument("--verify-backend", choices=["cpu_magsac"], default="cpu_magsac",
+                    help="geometric verifier for scorer=ransac: cv2 USAC_MAGSAC on the CPU.")
     ap.add_argument("--batch", type=int, default=8, help="crops per DINO forward batch (lower if OOM)")
     ap.add_argument("--jobs", type=int, default=1,
                     help="ransac only: CPU threads for the cv2 geometric verify (cv2 releases the GIL, "
@@ -407,19 +387,12 @@ def main(argv=None) -> int:
                     "execution_order": args.execution_order,
                     "model": args.model, "estimator": args.estimator, "backbone": backbone,
                     "projector": bool(proj),
-                    "verify_backend": args.verify_backend,
-                    "gpu_verify": ({"n_hyp": args.gpu_n_hyp, "max_iter": args.gpu_max_iter,
-                                    "score_type": args.gpu_score_type, "refine_iter": args.gpu_refine_iter,
-                                    "seed": args.gpu_seed, "points_budget": args.gpu_points_budget}
-                                   if args.verify_backend != "cpu_magsac" else None)},
+                    "verify_backend": args.verify_backend},
            "per_query": {}}
 
     if args.execution_order == "crop-major":
         if store is None:
             raise SystemExit("--execution-order crop-major requires --store (random grid access)")
-        if args.verify_backend == "gpu_batch":
-            raise SystemExit("--verify-backend gpu_batch batches pairs per query (query-major); "
-                             "crop-major matches one grid vs many queries — use gpu_kornia or cpu_magsac")
         return _run_crop_major(args, store, qstore, row_of, lat, lon, radius_m, backbone, proj, out["meta"])
 
     dumped = {}                                          # query -> per-crop exact scores (--dump-scores)
@@ -558,13 +531,8 @@ def main(argv=None) -> int:
                 key, qm, rm, n_mutual = item
                 if n_mutual < _MIN_MATCHES[args.model]:
                     return key, 0.0
-                if args.verify_backend == "gpu_kornia":
-                    from .gpu_verify import verify_inliers_kornia
-                    inl = verify_inliers_kornia(qm, rm, reproj_thresh=args.reproj_thresh,
-                                                max_iter=args.gpu_max_iter, seed=args.gpu_seed, device=dev)
-                else:
-                    inl = verify_inliers(qm, rm, model=args.model, estimator=args.estimator,
-                                         reproj_thresh=args.reproj_thresh)
+                inl = verify_inliers(qm, rm, model=args.model, estimator=args.estimator,
+                                     reproj_thresh=args.reproj_thresh)
                 return key, (inl.shape[0] / n_q if n_q else 0.0)
 
             bufs = {}                                        # (h,w) -> [keys, grids]; group by shape,
@@ -573,29 +541,6 @@ def main(argv=None) -> int:
             def _drain(hw):
                 keys, grids = bufs[hw]
                 if not grids:
-                    return
-                if args.verify_backend == "gpu_batch":       # batch MSAC over all pairs at once (on GPU)
-                    from .gpu_verify import ransac_homography_batch
-                    t0 = time.perf_counter()
-                    pairs = matched_coords_batch_gpu(qfeat, torch.stack(grids), qxy,
-                                                     grid_keypoints(hw[0], hw[1]), dev)
-                    t1 = time.perf_counter(); prof["match"] += t1 - t0
-                    inls = ransac_homography_batch([(qm, rm) for (qm, rm, _) in pairs],
-                                                   reproj_thresh=args.reproj_thresh, n_hyp=args.gpu_n_hyp,
-                                                   score_type=args.gpu_score_type,
-                                                   refine=args.gpu_refine_iter > 0,
-                                                   refine_iter=args.gpu_refine_iter, device=dev,
-                                                   seed=args.gpu_seed, points_budget=args.gpu_points_budget)
-                    for i, key in enumerate(keys):
-                        n_mut = pairs[i][2]
-                        score[key] = (inls[i].shape[0] / n_q
-                                      if (n_q and n_mut >= _MIN_MATCHES[args.model]) else 0.0)
-                    prof["verify"] += time.perf_counter() - t1
-                    if mnn_dump is not None:
-                        for (qm_i, rm_i, _) in pairs:
-                            mnn_dump.append((qm_i.cpu().numpy().astype(np.float32),
-                                             rm_i.cpu().numpy().astype(np.float32), n_q))
-                    keys.clear(); grids.clear()
                     return
                 t0 = time.perf_counter()
                 mc = matched_coords_batch(qfeat, torch.stack(grids), qxy, grid_keypoints(hw[0], hw[1]))

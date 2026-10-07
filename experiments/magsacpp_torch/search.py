@@ -86,9 +86,57 @@ def _mutual_nn_padded(q_feat, r_feats, q_xy, r_xy, device, match_budget: int = 5
     return qm, rm, valid
 
 
+def _record_diag(diag, q, cid, cd, nlev, n_q, valid, res_list, s2d, pyr, bi, lvl_i, cs,
+                 level_agg, cell_agg):
+    """Fill ``diag[q][cid]`` with every numeric MAGSAC++ homography + pyramid-level characteristic.
+
+    ``res_list`` = per-crop :class:`HomographyResult` (crop order = pos-major: ``c = pos*nlev + lvl``).
+    For each pyramid position records its per-level (H 3x3 + det, inlier_count, level_score, loss,
+    score, status, success, #hypotheses, #IRLS, #mutual matches) and the position/cell aggregation —
+    the inputs a test needs to re-derive the ranking from the raw homography numbers."""
+    nmut = valid.sum(1).tolist()                                 # #mutual matches per crop (C,)
+    positions = []
+    for i in range(cd.n_pos):
+        levels = []
+        for jl, L in enumerate(cd.levels):
+            c = i * nlev + jl
+            r = res_list[c]
+            H = r.H.detach().to("cpu", torch.float64)
+            finite = bool(torch.isfinite(H).all())
+            levels.append({
+                "level_m": int(L),
+                "n_mutual": int(nmut[c]),
+                "inlier_count": int(r.inlier_count),
+                "level_score": (r.inlier_count / n_q) if n_q else 0.0,
+                "total_loss": (None if r.total_loss == float("inf") else float(r.total_loss)),
+                "score": (None if r.score == float("inf") else float(r.score)),
+                "status": r.status,
+                "success": bool(r.success),
+                "n_hypotheses": int(r.n_hypotheses),
+                "n_irls_steps": int(r.n_irls_steps),
+                "sigma_max": float(r.sigma_max),
+                "H": (H.tolist() if finite else None),
+                "H_det": (float(torch.det(H)) if finite else None),
+            })
+        positions.append({
+            "pos": i, "pos_lat": float(cd.lat[i]), "pos_lon": float(cd.lon[i]),
+            "position_score": float(pyr[i]),
+            "best_level_m": int(cd.levels[int(s2d[i].argmax())]),
+            "levels": levels,
+        })
+    diag.setdefault(q, {})[cid] = {
+        "n_q": int(n_q), "n_pos": int(cd.n_pos), "levels_m": [int(x) for x in cd.levels],
+        "level_agg": level_agg, "cell_agg": cell_agg,
+        "cell_score": float(cs), "best_pos": int(bi),
+        "best_pos_lat": float(cd.lat[bi]), "best_pos_lon": float(cd.lon[bi]),
+        "best_level_m": int(cd.levels[lvl_i]),
+        "positions": positions,
+    }
+
+
 def search(queries: dict, shortlist: dict, store, *, config: MagsacppConfig, k_coarse: int = 30,
            topk: int = 5, level_agg: str = "sum", cell_agg: str = "mean", device: str = "cuda",
-           generator=None, flat: bool = True, match_budget: int = 50_000_000):
+           generator=None, flat: bool = True, match_budget: int = 50_000_000, diag_records=None):
     """Localize a batch of query embeddings.
 
     ``queries``: ``{query_id: {"feat": (N,D) tensor, "xy": (N,2), "lat": float|nan, "lon": float|nan}}``
@@ -133,8 +181,14 @@ def search(queries: dict, shortlist: dict, store, *, config: MagsacppConfig, k_c
                     torch.cuda.synchronize()
                 t_match += time.perf_counter() - tm
                 tv = time.perf_counter()
-                counts, _ = estimate_homography_magsacpp_batch(rm, qm, valid, config=config,
-                                                               generator=gen, return_counts=True)
+                if diag_records is None:                               # fast tensor path
+                    counts, _ = estimate_homography_magsacpp_batch(rm, qm, valid, config=config,
+                                                                   generator=gen, return_counts=True)
+                    res_list = None
+                else:                                                  # full per-crop results for diag JSON
+                    res_list = estimate_homography_magsacpp_batch(rm, qm, valid, config=config,
+                                                                  generator=gen, return_counts=False)
+                    counts = torch.tensor([r.inlier_count for r in res_list], device=device)
                 if str(device).startswith("cuda"):
                     torch.cuda.synchronize()
                 t_verify += time.perf_counter() - tv
@@ -147,6 +201,9 @@ def search(queries: dict, shortlist: dict, store, *, config: MagsacppConfig, k_c
                       "max": float(pyr.max())}[cell_agg]
                 qcell[q][cid] = {"cell_id": cid, "cell_score": cs, "lat": float(cd.lat[bi]),
                                  "lon": float(cd.lon[bi]), "level_m": int(cd.levels[lvl_i])}
+                if res_list is not None:
+                    _record_diag(diag_records, q, cid, cd, nlev, p["n_q"], valid, res_list,
+                                 s2d, pyr, bi, lvl_i, cs, level_agg, cell_agg)
                 continue
             tm = time.perf_counter()
             mc = matched_coords_batch(p["feat"], grids, p["xy"], kp)
@@ -203,7 +260,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--queries", nargs="+", required=True, help="city=query_d1024.h5 (token grids)")
     ap.add_argument("--shortlist", required=True)
-    ap.add_argument("--index-uri", required=True, help="s3://…/<city>/_index.json")
+    ap.add_argument("--index-uri", default=None, help="s3://…/<city>/_index.json (S3 store)")
+    ap.add_argument("--store-dir", default=None, dest="store_dir",
+                    help="LOCAL store dir (fetch_local output: _index.json + cells/); "
+                         "mutually exclusive with --index-uri")
     ap.add_argument("--cache-dir", default="/tmp/cellcache")
     ap.add_argument("--cache-cap", type=int, default=2)
     ap.add_argument("--k-coarse", type=int, default=30)
@@ -225,10 +285,18 @@ def main(argv=None) -> int:
     ap.add_argument("--only-city", default=None)
     ap.add_argument("--max-queries", type=int, default=0)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--diag-json", default=None, dest="diag_json",
+                    help="optional: write a JSON of ALL numeric homography + pyramid-level "
+                         "characteristics per (query, cell) for testing (flat path only; large — "
+                         "pair with --max-queries). Scores are identical to the fast path.")
     args = ap.parse_args(argv)
 
-    from patch_rerank.cell_store_s3 import CellStoreS3
     from patch_rerank.query_io import QueryGridStore
+
+    if bool(args.index_uri) == bool(args.store_dir):
+        ap.error("give exactly one of --index-uri (S3) or --store-dir (local)")
+    if args.diag_json and args.legacy_match:
+        ap.error("--diag-json is supported on the flat path only (drop --legacy-match)")
 
     device = args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu"
     cfg = MagsacppConfig(sigma_max=args.mpp_sigma_max, inlier_threshold=args.reproj_thresh,
@@ -238,7 +306,14 @@ def main(argv=None) -> int:
     gen = torch.Generator(device=device).manual_seed(args.mpp_seed)
 
     qstore = QueryGridStore(dict(a.split("=", 1) for a in args.queries))
-    store = CellStoreS3(args.index_uri, cache_dir=args.cache_dir, cache_cap=args.cache_cap)
+    if args.store_dir:
+        from .local_store import LocalCellStore
+        store = LocalCellStore(args.store_dir)
+        store_source = f"local:{args.store_dir}"
+    else:
+        from patch_rerank.cell_store_s3 import CellStoreS3
+        store = CellStoreS3(args.index_uri, cache_dir=args.cache_dir, cache_cap=args.cache_cap)
+        store_source = args.index_uri
     sj = json.loads(Path(args.shortlist).expanduser().read_text())
 
     # build the batch of embeddings that "arrive together"
@@ -255,12 +330,14 @@ def main(argv=None) -> int:
     if not queries:
         print("[search] no queries matched shortlist/store/city filters"); return 2
 
+    diag = {} if args.diag_json else None
     per_query, summary, speed = search(queries, sj, store, config=cfg, k_coarse=args.k_coarse,
                                        topk=args.topk, level_agg=args.level_agg,
                                        cell_agg=args.cell_agg, device=device, generator=gen,
-                                       flat=not args.legacy_match, match_budget=args.match_budget)
+                                       flat=not args.legacy_match, match_budget=args.match_budget,
+                                       diag_records=diag)
     out = {"meta": {"k_coarse": args.k_coarse, "topk": args.topk, "level_agg": args.level_agg,
-                    "cell_agg": args.cell_agg, "index_uri": args.index_uri, "device": str(device),
+                    "cell_agg": args.cell_agg, "store_source": store_source, "device": str(device),
                     "mpp": {"sigma_max": args.mpp_sigma_max, "hyps": args.mpp_hyps,
                             "irls": args.mpp_irls, "dtype": args.mpp_dtype, "solver": args.mpp_solver}},
            "summary": summary, "per_query": per_query, "speed": speed}
@@ -275,6 +352,14 @@ def main(argv=None) -> int:
           f"verify={speed['verify_s']:.1f}s downloads={speed['cells_downloaded']}", flush=True)
     Path(args.out).expanduser().write_text(json.dumps(out), encoding="utf-8")
     print(f"[ok] -> {args.out}", flush=True)
+    if diag is not None:
+        diag_out = {"meta": {**out["meta"], "reproj_thresh": args.reproj_thresh,
+                             "note": "ALL numeric homography + pyramid-level characteristics "
+                                     "(flat MAGSAC++ path); scores identical to --out"},
+                    "queries": diag}
+        Path(args.diag_json).expanduser().write_text(json.dumps(diag_out), encoding="utf-8")
+        ncells = sum(len(v) for v in diag.values())
+        print(f"[ok] diag -> {args.diag_json}  (queries={len(diag)} cell-records={ncells})", flush=True)
     store.close(); qstore.close()
     return 0
 

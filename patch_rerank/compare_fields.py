@@ -19,13 +19,25 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
 
-from .compare_gpu import _arrays_path
+
+def _arrays_path(uri: str, diag_dir: Path, tmp: str) -> str:
+    """Resolve a diag-archive arrays H5 location: download from s3:// into ``tmp`` once, else the
+    local ``diag_dir/<uri>``. (Inlined from the removed ``compare_gpu``.)"""
+    if uri.startswith("s3://"):
+        import boto3
+        b, key = uri[5:].split("/", 1)
+        loc = os.path.join(tmp, os.path.basename(key))
+        if not os.path.exists(loc):
+            boto3.client("s3").download_file(b, key, loc)
+        return loc
+    return str(diag_dir / uri)
 
 
 def _transform(H, pts):

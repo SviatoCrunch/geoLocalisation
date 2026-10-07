@@ -2,7 +2,7 @@
 
 Per query (drone frame, DINOv3-sat tokens): take the coarse (DINOv2) shortlist's top-``k_coarse``
 candidate cells, fetch each cell's pyramids from S3 by index (``CellStoreS3``), score every
-(position, level) grid against the query with the GPU homography verifier (``gpu_verify``), then:
+(position, level) grid against the query with the cv2 MAGSAC++ verifier (``cpu_magsac``), then:
 
   * pyramid (position) score = MAX over its levels  (best level);
   * cell score = MEAN over its pyramids  (``--cell-agg`` also allows min/max);
@@ -63,9 +63,9 @@ def _load_cell(cd, device):
 def _score_loaded(grids, keys, kp, cd, qfeat, qxy, n_q, args, device, diag_ctx=None):
     """Score a cell's pre-loaded grids against one query → (pyramid_score[n_pos], best_level[n_pos]).
 
-    ``--verify-backend`` picks the geometric verifier (gpu_batch MSAC / gpu_kornia RANSAC / cpu_magsac
-    cv2). ``--level-agg`` combines a position's per-level scores by max (best level) or sum (multi-scale
-    evidence, the old working rule). Grids matched/verified in --grid-chunk sub-batches (VRAM bound).
+    The geometric verifier is cv2 ``cpu_magsac`` (USAC MAGSAC). ``--level-agg`` combines a position's
+    per-level scores by max (best level) or sum (multi-scale evidence, the old working rule). Grids
+    matched/verified in --grid-chunk sub-batches (VRAM bound).
 
     ``diag_ctx`` (cpu_magsac only): when set, the SAME single cv2 call that defines each level score is
     also archived (H, mask, correspondences, residuals) via ``DiagWriter`` — scores are byte-identical
@@ -122,22 +122,6 @@ def _score_loaded(grids, keys, kp, cd, qfeat, qxy, n_q, args, device, diag_ctx=N
                 else:
                     sc[(i, L)] = 0.0
             continue
-        from .matcher import matched_coords_batch_gpu
-        pairs = matched_coords_batch_gpu(qfeat, gsub, qxy, kp, device)
-        if args.verify_backend == "gpu_kornia":
-            from .gpu_verify import verify_inliers_kornia
-            inls = [verify_inliers_kornia(qm, rm, reproj_thresh=args.reproj_thresh,
-                                          max_iter=args.gpu_max_iter, seed=args.gpu_seed, device=device)
-                    for (qm, rm, _) in pairs]
-        else:                                                        # gpu_batch (default)
-            from .gpu_verify import ransac_homography_batch
-            inls = ransac_homography_batch([(qm, rm) for (qm, rm, _) in pairs],
-                                           reproj_thresh=args.reproj_thresh, n_hyp=args.gpu_n_hyp,
-                                           score_type=args.gpu_score_type, refine=args.gpu_refine_iter > 0,
-                                           refine_iter=args.gpu_refine_iter, device=device, seed=args.gpu_seed)
-        for j, (i, L) in enumerate(ksub):
-            n_mut = pairs[j][2]
-            sc[(i, L)] = (inls[j].shape[0] / n_q) if (n_q and n_mut >= _MIN) else 0.0
     pyr, blv = [], []
     for i in range(cd.n_pos):
         per = {L: sc[(i, L)] for L in cd.levels}
@@ -232,16 +216,12 @@ def main(argv=None) -> int:
     ap.add_argument("--grid-chunk", type=int, default=64,
                     help="crops per batched mutual-NN+verify (lower if GPU OOM at high output_px)")
     ap.add_argument("--reproj-thresh", type=float, default=2.0)
-    ap.add_argument("--verify-backend", choices=["gpu_batch", "gpu_kornia", "cpu_magsac"],
-                    default="gpu_batch", help="geometric verifier: gpu_batch MSAC (default) / gpu_kornia "
-                                              "RANSAC / cpu_magsac cv2 (the old working path)")
+    # Verifier = cv2 cpu_magsac only. The GPU path (faithful Torch MAGSAC++) lives in
+    # magsacpp_torch.search (--store-dir); the gpu_batch/gpu_kornia verifiers were removed (2026-10).
+    ap.add_argument("--verify-backend", choices=["cpu_magsac"], default="cpu_magsac",
+                    help="geometric verifier: cv2 USAC_MAGSAC (only backend; GPU = magsacpp_torch.search)")
     ap.add_argument("--level-agg", choices=["max", "sum"], default="max",
                     help="per-position level aggregation: max (best level) or sum (multi-scale, old rule)")
-    ap.add_argument("--gpu-max-iter", type=int, default=10, help="gpu_kornia RANSAC max_iter")
-    ap.add_argument("--gpu-n-hyp", type=int, default=256)
-    ap.add_argument("--gpu-score-type", choices=["msac", "ransac"], default="msac")
-    ap.add_argument("--gpu-refine-iter", type=int, default=5)
-    ap.add_argument("--gpu-seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--only-city", default=None)
     ap.add_argument("--day-only", action="store_true")
@@ -330,9 +310,7 @@ def main(argv=None) -> int:
     out = {"meta": {"k_coarse": args.k_coarse, "topk": args.topk, "cell_agg": args.cell_agg,
                     "level_agg": args.level_agg, "verify_backend": args.verify_backend,
                     "execution_order": args.execution_order,
-                    "store_source": store_source, "store_config": store.config,
-                    "gpu": {"n_hyp": args.gpu_n_hyp, "score_type": args.gpu_score_type,
-                            "refine_iter": args.gpu_refine_iter}},
+                    "store_source": store_source, "store_config": store.config},
            "per_query": {}}
     per_query, d_fine, d_ftop, t_fetch_all, t_score_all = {}, [], [], 0.0, 0.0
     dumped = {} if args.dump_scores else None
