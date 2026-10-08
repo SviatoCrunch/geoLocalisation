@@ -141,14 +141,15 @@ def test_loader_chunks_and_store(tmp_path):
     # resolve: int global_cell_idx and str cell_id both -> cell_id
     ld = ChunkedCellLoader(dst, chunk_cells=2, to_device=False)
     assert ld.resolve([0, "kup:1_lvl0", 2]) == ["kup:0_lvl0", "kup:1_lvl0", "kup:2_lvl0"]
-    # chunked iteration: request order preserved, bitwise, 2 then 1
+    # chunked iteration: PHYSICAL (read) order, not request order — adjacent cells batch together.
+    # Request [2,0,1] → file0 {0,1} then file1 {2} → planned order [0,1,2], chunked by 2.
     seen = []
     for sub, arr in ld.iter_chunks([2, 0, 1]):          # out-of-order, cross-shard
         assert arr.dtype == np.float16
         for k, cid in enumerate(sub):
             assert np.array_equal(arr[k].view(np.uint16), blocks[cid].view(np.uint16))
         seen.append(tuple(sub))
-    assert seen == [("kup:2_lvl0", "kup:0_lvl0"), ("kup:1_lvl0",)]
+    assert seen == [("kup:0_lvl0", "kup:1_lvl0"), ("kup:2_lvl0",)]
     ld.close()
     # store adapter: block + coords + levels
     st = NewFormatCellStore(dst)

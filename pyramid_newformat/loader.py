@@ -16,6 +16,7 @@ from __future__ import annotations
 import numpy as np
 
 from .reader import NewFormatReader
+from .scheduler import plan_reads
 
 
 def _is_int(x):
@@ -54,21 +55,35 @@ class ChunkedCellLoader:
                 raise KeyError(f"index {x!r} is neither a global_cell_idx nor a known cell_id")
         return out
 
+    def plan(self, indices):
+        """Plan the WHOLE list before batching (§3): dedup + group-by-file + sort-by-local_idx +
+        coalesce, so physically-adjacent cells land in one read instead of being split by request
+        order. Returns the cell_ids in physical (read) order."""
+        cids = self.resolve(indices)
+        bpc = next(iter(self.r.files.values()))["bytes_per_cell"] if self.r.files else 0
+        needed = [(self.r.cells[c]["file"], int(self.r.cells[c]["local_cell_idx"]), c) for c in cids]
+        reads, _ = plan_reads(needed, bpc)
+        return [c for rd in reads for _, c in rd.cells]       # flatten reads = global physical order
+
     def iter_chunks(self, indices):
         """Yield (cell_ids_chunk, data). data = torch (C,P,L,H,W,D) float16 on ``device`` (to_device)
-        else numpy. Order within a chunk follows the request order."""
-        cids = self.resolve(indices)
-        for i in range(0, len(cids), self.chunk):
-            sub = cids[i:i + self.chunk]
-            arr = np.stack(self.r.read_cells(sub))          # (C,P,L,H,W,D) fp16, coalesced reads
+        else numpy. Cells are returned in PHYSICAL (read) order, not request order, so adjacent cells
+        batch together; callers key results by cell_id, so order is immaterial to correctness. A single
+        reusable CPU buffer is filled in place (read_cells_into) — no per-chunk alloc, no np.stack."""
+        order = self.plan(indices)
+        buf = np.empty((min(self.chunk, len(order) or 1),) + self.block_shape, np.dtype("<f2"))
+        for i in range(0, len(order), self.chunk):
+            sub = order[i:i + self.chunk]
+            _, got = self.r.read_cells_into(sub, buf)         # buf[:len(sub)] filled in physical order
+            arr = buf[:len(sub)]
             if not self.to_device:
-                yield sub, arr
+                yield got, arr.copy()                         # copy: buf is reused next chunk
                 continue
             import torch
             t = torch.from_numpy(arr)
             if self.pin and t.device.type == "cpu":
-                t = t.pin_memory()
-            yield sub, t.to(self.device, non_blocking=self.pin)
+                t = t.pin_memory()                            # pin forces a copy, so buf reuse is safe
+            yield got, t.to(self.device, non_blocking=self.pin)
 
     def close(self):
         self.r.close()

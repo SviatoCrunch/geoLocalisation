@@ -195,7 +195,17 @@ class Converter:
                 continue
             self._write_shard(fpath, fname, si, lo, shard_cells, dims, bpc, ckpt, ckpt_path, cell_map, files_meta)
 
-        # ---- manifest LAST ----
+        # ---- per-position coords for the manifest (TRUE coords; read once from local shards) ----
+        coords = {}
+        for fname in sorted(files_meta):
+            with h5py.File(self.work / fname, "r") as cf:
+                cids_f = [x.decode() if isinstance(x, bytes) else str(x) for x in cf[DS_CELL_IDS][:]]
+                pla, plo = cf[DS_POS_LAT][:], cf[DS_POS_LON][:]
+            for j, cid in enumerate(cids_f):
+                if cid:
+                    coords[cid] = (pla[j].tolist(), plo[j].tolist())
+
+        # ---- manifest LAST (only after every shard uploaded) ----
         manifest = {
             "schema_version": SCHEMA_VERSION, "city": self.index["city"], "source_prefix": self.src,
             "source_index_key": s3io.join(self.src, "_index.json"), "config": self.config,
@@ -206,7 +216,9 @@ class Converter:
             "cells": {cid: {"global_cell_idx": gi, "file": fn, "local_cell_idx": li,
                             "source_key": self._src_key(cid),
                             "lat": self.index["cells"][cid].get("lat"),
-                            "lon": self.index["cells"][cid].get("lon")}
+                            "lon": self.index["cells"][cid].get("lon"),
+                            "pos_lat": coords.get(cid, (None, None))[0],
+                            "pos_lon": coords.get(cid, (None, None))[1]}
                       for cid, (fn, gi, li) in cell_map.items()},
             "source_inventory": {"cell_attrs_example": inv0, "non_position_datasets": {k: list(v) for k, v in extra0.items()}},
         }
@@ -219,6 +231,13 @@ class Converter:
         P, L, H, W, D = dims
         nl = len(shard_cells)
         mode = "r+" if fpath.exists() else "w"
+        # Resume-safety: if the local shard is gone but its cells are already marked done, we'd recreate
+        # an empty dataset and upload zeros. Refuse — the cells must be re-materialised from a work-dir
+        # that still holds the shard (drop those cells from the checkpoint to force a real rewrite).
+        if mode == "w" and nl and all(cid in ckpt["done"] for cid in shard_cells) and fname not in ckpt["files"]:
+            raise SystemExit(f"[resume] {fname}: local shard missing but cells marked done — cannot "
+                             f"republish from nothing. Restore the work-dir shard or clear these cells "
+                             f"from {ckpt_path.name}.")
         f = h5py.File(fpath, mode)
         if DS_FEATURES not in f:
             f.create_dataset(DS_FEATURES, shape=(nl, P, L, H, W, D), dtype=FEATURES_DTYPE,
@@ -268,15 +287,18 @@ class Converter:
                 "sha256": sha, "features_byte_offset": int(off), "bytes_per_cell": int(bpc),
                 "itemsize": 2, "byte_order": "<" if sys.byteorder == "little" else ">",
                 "n_local_cells": nl}
-        files_meta[fname] = meta
-        ckpt["files"][fname] = meta
+        # STATE: written+verified (read-back checked per cell) — NOT yet uploaded. Do NOT mark complete.
+        ckpt.setdefault("written", {})[fname] = {"sha256": sha}
         s3io.write_json(str(ckpt_path), ckpt)
-        if s3io.is_s3(self.dst):
-            s3io.upload(str(fpath), s3io.join(self.dst, fname))
-            print(f"[shard {si}] uploaded {fname} ({meta['bytes']/2**30:.2f}GiB, sha {sha[:12]})", flush=True)
-        else:
-            s3io.upload(str(fpath), s3io.join(self.dst, fname))
-            print(f"[shard {si}] wrote {fname} ({meta['bytes']/2**30:.2f}GiB)", flush=True)
+        dest_uri = s3io.join(self.dst, fname)
+        s3io.upload(str(fpath), dest_uri)                             # UPLOAD first
+        ver, etag = s3io.head_identity(dest_uri)                      # then pin identity from the object
+        meta["version_id"] = ver; meta["etag"] = etag
+        files_meta[fname] = meta
+        ckpt["files"][fname] = meta                                   # STATE: UPLOADED = complete (AFTER upload)
+        s3io.write_json(str(ckpt_path), ckpt)
+        print(f"[shard {si}] uploaded {fname} ({meta['bytes']/2**30:.2f}GiB sha {sha[:12]} "
+              f"ver={str(ver)[:8] if ver else '-'})", flush=True)
 
 
 def main(argv=None) -> int:

@@ -33,11 +33,16 @@ def verify(source_prefix, dest_prefix, work_dir, max_cells=0, check_offset=True)
         # per-level slice consistency
         if not np.array_equal(r.read_cell_level(cid, conv.levels_m[0]).view(np.uint16), srcblk[:, 0].view(np.uint16)):
             mism.append((cid, "level-slice")); continue
+        # per-position coords: reader (from manifest) must match the source cell's true coords
+        rlat, rlon = r.read_cell_coords(cid)
+        if not (np.allclose(rlat, plat, atol=1e-9, rtol=0) and np.allclose(rlon, plon, atol=1e-9, rtol=0)):
+            mism.append((cid, "coords")); continue
         # offset / range read reproduces bytes
         if check_offset:
             fname, li = r._loc(cid); fm = r.files[fname]
             off = fm["features_byte_offset"] + li * fm["bytes_per_cell"]
-            raw = s3io.range_get(r._file_uri(fname), off, fm["bytes_per_cell"], r._version(fname))
+            ver, etag = r._pin(fname)
+            raw = s3io.range_get(r._file_uri(fname), off, fm["bytes_per_cell"], version=ver, etag=etag)
             if not np.array_equal(np.frombuffer(raw, "<f2").reshape(r.block_shape).view(np.uint16),
                                   srcblk.view(np.uint16)):
                 mism.append((cid, "range-offset")); continue

@@ -124,22 +124,32 @@ def main(argv=None) -> int:
     print(f"[search_shard] queries={len(Q)} cells={len(union)} shards={len(files)} "
           f"(cells/shard={[len(byfile[f]) for f in files]}) gpu_cells={args.gpu_cells} prefetch={args.prefetch}", flush=True)
 
-    def load_shard(fname):                                    # read this shard's needed cells (coalesced runs)
+    # Reusable bounded buffers sized to the largest shard — no per-shard realloc, no np.stack copy.
+    # Prefetch needs two (one filling ahead while the other is on the GPU); else one. read_cells_into
+    # fills the buffer in place via read_direct and returns the (file,local_idx) cell order it wrote.
+    maxcells = max(len(byfile[f]) for f in files)
+    nbuf = 2 if args.prefetch else 1
+    bufs = [np.empty((maxcells,) + r.block_shape, np.dtype("<f2")) for _ in range(nbuf)]
+
+    def load_shard(fname, buf):                               # read this shard's needed cells (coalesced runs)
         cids = [c for _, c in byfile[fname]]
-        arr = np.stack(r.read_cells(cids))                    # (nc, P, L, H, W, D) fp16, few sequential reads
-        co = [r.read_cell_coords(c) for c in cids]
-        return cids, arr, co
+        _, order = r.read_cells_into(cids, buf)               # buf[:len(order)] filled; order = read order
+        co = [r.read_cell_coords(c) for c in order]
+        return order, buf, co
 
     t_read = t_gpu = 0.0
-    ex = ThreadPoolExecutor(max_workers=1)
-    fut = ex.submit(load_shard, files[0]) if files else None
+    ex = ThreadPoolExecutor(max_workers=1) if args.prefetch else None
+    # Only arm the 1-shard-ahead future when prefetch is enabled; otherwise the initial submit would
+    # read shard 0 in the background AND load_shard(fname) would read it again (double read).
+    fut = ex.submit(load_shard, files[0], bufs[0]) if (args.prefetch and files) else None
     t0 = time.perf_counter()
     for fi, fname in enumerate(files):
         tr = time.perf_counter()
-        cids, arr, co = fut.result() if args.prefetch else load_shard(fname)
+        cids, arr, co = fut.result() if args.prefetch else load_shard(fname, bufs[0])
         sr = time.perf_counter() - tr; t_read += sr
         if args.prefetch:
-            fut = ex.submit(load_shard, files[fi + 1]) if fi + 1 < len(files) else None
+            fut = (ex.submit(load_shard, files[fi + 1], bufs[(fi + 1) % 2])
+                   if fi + 1 < len(files) else None)
         tg = time.perf_counter()
         n = len(cids)
         for cs in range(0, n, args.gpu_cells):
