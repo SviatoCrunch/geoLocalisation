@@ -113,6 +113,18 @@ class NewFormatReader:
                         out[req_i] = chunk[k]
         return out
 
+    def read_cell_coords(self, cell_id):
+        """(pos_lat (P,), pos_lon (P,)) for a cell. Local: from position_lat/lon datasets; S3: falls
+        back to the cell-level lat/lon broadcast (per-position arrays aren't range-addressable)."""
+        from .schema import DS_POS_LAT, DS_POS_LON
+        fname, li = self._loc(cell_id)
+        if self._is_s3:
+            c = self.cells[cell_id]
+            return (np.full(self.P, c.get("lat") if c.get("lat") is not None else np.nan),
+                    np.full(self.P, c.get("lon") if c.get("lon") is not None else np.nan))
+        f = self._handle(fname)
+        return np.asarray(f[DS_POS_LAT][li], np.float64), np.asarray(f[DS_POS_LON][li], np.float64)
+
     def close(self):
         for f in self._fh.values():
             f.close()

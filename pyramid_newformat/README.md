@@ -88,6 +88,29 @@ cd ~/work/geoLocalisation
 uv run --python 3.11 --with h5py --with numpy --with pytest pytest pyramid_newformat/tests -q
 ```
 
+## GPU search over the new format (external top-K indices + directory)
+Chunked index interface + drop-in store so the faithful-MAGSAC++ reranker runs on this format:
+```python
+from pyramid_newformat.loader import ChunkedCellLoader, NewFormatCellStore
+# fetch cells by index (cell_id OR global_cell_idx), in GPU-ready chunks:
+ld = ChunkedCellLoader("/home/ubuntu/work/mpp_local/kup", device="cuda", chunk_cells=8)
+for cell_ids, batch in ld.iter_chunks([0, 5, 12, "kup:73_lvl0"]):   # batch: (C,25,8,32,32,1024) fp16 on GPU
+    ...
+# or let the existing reranker use it as the store:
+store = NewFormatCellStore("/home/ubuntu/work/mpp_local/kup")   # .has/.cell/.config
+```
+End-to-end rerank of 1..N frames with externally-supplied top-K cell indices over a local directory:
+```bash
+cd ~/work/geoLocalisation
+uv run --python 3.11 --with "torch==2.5.1" --with h5py --with numpy --with tqdm python -m pyramid_newformat.search_newformat \
+  --queries kup=/home/ubuntu/work/out/gallery_h5/geo_iso_noverlap/queries/query_kup_d1024.h5 \
+  --indices /home/ubuntu/work/out/gallery_h5/kup/shortlist_kup_prod_k100.json \
+  --dataset-dir /home/ubuntu/work/mpp_local/kup \
+  --topk 5 --level-agg sum --cell-agg mean --device cuda \
+  --out /home/ubuntu/work/kup_newfmt_search.json
+```
+`--indices` = `{query_id:[idx...]}` or a shortlist JSON; idx is a `global_cell_idx` or `cell_id`.
+
 ## Inspect results on S3
 ```bash
 aws s3 ls s3://geo-reference/embeddings/kup_newformat/  --recursive --human-readable

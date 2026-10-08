@@ -133,6 +133,44 @@ def test_resume_idempotent(tmp_path):
     r.close()
 
 
+def test_loader_chunks_and_store(tmp_path):
+    from pyramid_newformat.loader import ChunkedCellLoader, NewFormatCellStore
+    src, blocks = _write_source(tmp_path / "s", n=3)
+    dst = str(tmp_path / "d"); work = str(tmp_path / "w")
+    man = _convert(src, dst, work, cps=2)
+    # resolve: int global_cell_idx and str cell_id both -> cell_id
+    ld = ChunkedCellLoader(dst, chunk_cells=2, to_device=False)
+    assert ld.resolve([0, "kup:1_lvl0", 2]) == ["kup:0_lvl0", "kup:1_lvl0", "kup:2_lvl0"]
+    # chunked iteration: request order preserved, bitwise, 2 then 1
+    seen = []
+    for sub, arr in ld.iter_chunks([2, 0, 1]):          # out-of-order, cross-shard
+        assert arr.dtype == np.float16
+        for k, cid in enumerate(sub):
+            assert np.array_equal(arr[k].view(np.uint16), blocks[cid].view(np.uint16))
+        seen.append(tuple(sub))
+    assert seen == [("kup:2_lvl0", "kup:0_lvl0"), ("kup:1_lvl0",)]
+    ld.close()
+    # store adapter: block + coords + levels
+    st = NewFormatCellStore(dst)
+    assert st.has("kup:0_lvl0") and st.resolve(2) == "kup:2_lvl0"
+    cd = st.cell("kup:1_lvl0")
+    assert cd.n_pos == P and cd.levels == LEVELS
+    assert np.array_equal(cd._block.view(np.uint16), blocks["kup:1_lvl0"].view(np.uint16))
+    assert np.allclose(cd.lat, np.arange(P) + 1 * 10.0)      # position_lat from file
+    st.close()
+
+
+def test_cell_to_crops(tmp_path):
+    pytest.importorskip("torch")
+    from pyramid_newformat.loader import cell_to_crops
+    _, blocks = _write_source(tmp_path / "s", n=1)
+    blk = blocks["kup:0_lvl0"]
+    grids, keys, kp = cell_to_crops(blk, LEVELS)
+    assert tuple(grids.shape) == (P * len(LEVELS), H * W, D)
+    assert keys[0] == (0, 1000) and len(keys) == P * len(LEVELS)
+    assert kp.shape == (H * W, 2)
+
+
 def test_errors(tmp_path):
     from pyramid_newformat.convert import read_source_cell
     # missing level
