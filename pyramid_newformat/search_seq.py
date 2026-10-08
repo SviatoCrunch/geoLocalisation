@@ -46,7 +46,9 @@ def main(argv=None) -> int:
     ap.add_argument("--indices", required=True, help="JSON {qid:[idx...]} or shortlist; idx=cell_id|global_cell_idx")
     ap.add_argument("--dataset-dir", required=True, help="new-format store dir (local)")
     ap.add_argument("--read-chunk-cells", type=int, default=16, dest="rck",
-                    help="cells per sequential read span (also the GPU sub-batch); RAM ~= 2*rck*419MB")
+                    help="cells per sequential read span (disk I/O); CPU RAM ~= 2*rck*419MB")
+    ap.add_argument("--gpu-cells", type=int, default=2, dest="gpu_cells",
+                    help="cells per GPU sub-batch (bounds VRAM; crops=gpu_cells*P*L cast to fp32 inside matcher)")
     ap.add_argument("--k-coarse", type=int, default=1000)
     ap.add_argument("--topk", type=int, default=5)
     ap.add_argument("--level-agg", choices=["sum", "max"], default="sum")
@@ -64,6 +66,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
 
+    import os
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     repo = Path(__file__).resolve().parents[1]
     for p in (str(repo), str(repo / "experiments")):
         if p not in sys.path:
@@ -135,28 +139,32 @@ def main(argv=None) -> int:
         fut = ex.submit(read_chunk, chunks[ci + 1]) if ci + 1 < len(chunks) else None   # prefetch next
         tg = time.perf_counter()
         C = len(sub)
-        grids = torch.from_numpy(arr).reshape(C * P * L, H * W, D).to(dev)   # one H2D, fp16 (matcher casts)
-        qset = {q for c in sub for q in need[c]}
-        for q in qset:
-            p = Q[q]
-            qm, rm, valid = _mutual_nn_padded(p["feat"], grids, p["xy"], kp, dev, args.match_budget)
-            counts, _ = estimate_homography_magsacpp_batch(rm, qm, valid, config=cfg, generator=gen,
-                                                           return_counts=True)
-            s = (counts.double() / p["nq"] if p["nq"] else counts.double()).view(C, P, L)
-            pyr = s.sum(2) if args.level_agg == "sum" else s.amax(2)         # (C, P)
-            for k, cid in enumerate(sub):
-                if cid not in cand[q]:
-                    continue
-                prow = pyr[k]
-                bi = int(prow.argmax())
-                cs = {"mean": float(prow.mean()), "min": float(prow.min()), "max": float(prow.max())}[args.cell_agg]
-                lvl_i = int(s[k, bi].argmax())
-                plat, plon = co[k]
-                qcell[q][cid] = {"cell_id": cid, "cell_score": cs, "lat": float(plat[bi]),
-                                 "lon": float(plon[bi]), "level_m": int(levels[lvl_i])}
-        del grids
+        for g0 in range(0, C, args.gpu_cells):              # GPU sub-batch bounds VRAM (read span stays big)
+            g1 = min(g0 + args.gpu_cells, C); gc = g1 - g0
+            subc = sub[g0:g1]
+            grids = torch.from_numpy(arr[g0:g1]).reshape(gc * P * L, H * W, D).to(dev)   # fp16 (matcher casts)
+            for q in {qq for c in subc for qq in need[c]}:
+                p = Q[q]
+                qm, rm, valid = _mutual_nn_padded(p["feat"], grids, p["xy"], kp, dev, args.match_budget)
+                counts, _ = estimate_homography_magsacpp_batch(rm, qm, valid, config=cfg, generator=gen,
+                                                               return_counts=True)
+                s = (counts.double() / p["nq"] if p["nq"] else counts.double()).view(gc, P, L)
+                pyr = s.sum(2) if args.level_agg == "sum" else s.amax(2)       # (gc, P)
+                for k, cid in enumerate(subc):
+                    if cid not in cand[q]:
+                        continue
+                    prow = pyr[k]; bi = int(prow.argmax())
+                    cs = {"mean": float(prow.mean()), "min": float(prow.min()),
+                          "max": float(prow.max())}[args.cell_agg]
+                    lvl_i = int(s[k, bi].argmax())
+                    plat, plon = co[g0 + k]
+                    qcell[q][cid] = {"cell_id": cid, "cell_score": cs, "lat": float(plat[bi]),
+                                     "lon": float(plon[bi]), "level_m": int(levels[lvl_i])}
+            del grids
+            if str(dev).startswith("cuda"):
+                torch.cuda.empty_cache()
         if str(dev).startswith("cuda"):
-            torch.cuda.synchronize(); torch.cuda.empty_cache()
+            torch.cuda.synchronize()
         t_gpu += time.perf_counter() - tg
     wall = time.perf_counter() - t0
     ex.shutdown()
