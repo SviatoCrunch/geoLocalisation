@@ -26,6 +26,12 @@ from .schema import (AXES, CHECKPOINT_NAME, DS_CELL_IDS, DS_CELL_LAT, DS_CELL_LO
 
 _POS = re.compile(POS_GROUP_RE)
 
+try:
+    from tqdm import tqdm as _tqdm
+except Exception:                                            # progress bar optional
+    def _tqdm(x, **k):
+        return x
+
 
 def sorted_cell_ids(index: dict) -> list:
     """Deterministic cell order: numeric by the <N> in '<city>:<N>_lvl0' (fallback: string)."""
@@ -226,10 +232,13 @@ class Converter:
             f.attrs.update({"schema_version": SCHEMA_VERSION, "city": self.index["city"],
                             "axes": ",".join(AXES), "shard_index": si, "n_local_cells": nl})
         ds = f[DS_FEATURES]
-        for j, cid in enumerate(shard_cells):
+        bar = _tqdm(list(enumerate(shard_cells)), desc=f"shard {si} {fname}", unit="cell")
+        for j, cid in bar:
             gi = lo + j
             if cid in ckpt["done"]:
                 cell_map[cid] = (fname, gi, j); continue
+            if hasattr(bar, "set_postfix_str"):
+                bar.set_postfix_str(cid)
             local = self._download(cid)
             block, plat, plon, d2, inv, _ = read_source_cell(local, self.levels_m, expect_pos=P)
             if d2 != dims:
