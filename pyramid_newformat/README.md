@@ -165,17 +165,39 @@ uv run --python 3.11 --with "torch==2.5.1" --with h5py --with numpy --with tqdm 
 ```
 `--indices` = `{query_id:[idx...]}` or a shortlist JSON; idx is a `global_cell_idx` or `cell_id`.
 
-### Minimum-reads shard search (`search_shard`)
-Reads **shard-by-shard**, each shard's needed cells as coalesced sequential runs into a **reusable
-buffer** (`read_cells_into`, no `np.stack`), scores per level on GPU, with a real 1-shard-ahead
-prefetch (double-buffered). Each union cell is read once across all queries. Per-shard progress logs
-`read=.. gpu=..`; the final `speed` block separates `wall_s / read_s / gpu_s`.
+### `locate` — frame(s) + top-K indices + local gallery → localized cells (code **and** CLI)
+Canonical interface. Reads **shard-by-shard**, each shard's needed cells as coalesced sequential runs
+into a **reusable buffer** (`read_cells_into`, no `np.stack`), scores per level on GPU, with a real
+1-shard-ahead prefetch (double-buffered). Each union cell is read once across all queries. Returns
+`{meta, summary, per_query, speed}` (and writes JSON if `out=`).
+
+In code:
+```python
+from pyramid_newformat.locate import locate   # (or: from pyramid_newformat import locate)
+res = locate(
+    queries={"kup": "/…/query_kup_d1024.h5"},          # name→H5, or a ready QueryGridStore
+    indices="/…/shortlist_kup_prod_k100.json",         # path, or {qid:[idx…]}, or a shortlist dict
+    dataset_dir="/home/ubuntu/work/mpp_local/kup",     # LOCAL packed gallery (картотека)
+    topk=5, gpu_cells=4, device="cuda")
+for cell in res["per_query"]["<qid>"]["topk"]:          # cell_id, cell_score, lat, lon, level_m, rank, dist_m
+    ...
+res["summary"]   # top1/topK distR@{250,500,1000}m when GT present
+res["speed"]     # wall_s / read_s / gpu_s  (kept separate)
+```
+`idx` is a `global_cell_idx` (int/str) or a `cell_id`. `--no-prefetch` / `prefetch=False` for low RAM
+(and it starts **no** background read, so the first shard is not read twice). `--gpu-cells N` bounds
+the per-level GPU batch (`crops = N·25`) independently of read size.
+
+CLI (same engine):
 ```bash
-uv run … python -m pyramid_newformat.search_shard \
+uv run --python 3.11 --with "torch==2.5.1" --with h5py --with numpy --with tqdm \
+  python -m pyramid_newformat.locate \
   --queries kup=/…/query_kup_d1024.h5 --indices /…/shortlist_kup_prod_k100.json \
   --dataset-dir /home/ubuntu/work/mpp_local/kup --gpu-cells 4 --topk 5 --device cuda \
-  --out /home/ubuntu/work/kup_shard_search.json
+  --out /home/ubuntu/work/kup_locate.json
 ```
+`python -m pyramid_newformat.search_shard …` still works — it is a thin **deprecated alias** of
+`locate` (one engine, no divergence).
 - `--gpu-cells N` bounds the per-level GPU batch (`crops = N·25`) independently of read size — raise it
   only if VRAM allows; it does **not** change read count.
 - `--no-prefetch` disables the read-ahead for low-RAM hosts; with it off **no** background read is

@@ -234,6 +234,28 @@ def test_bench_cache_wired(tmp_path):
     assert res["cache"]["n_cached"] == 4 and res["cache"]["hits"] == 0
 
 
+# ---------------- locate interface (input contract; no torch) ----------------
+def test_locate_input_parsing(tmp_path):
+    from pyramid_newformat.locate import _candidates, _load_indices
+    # plain {qid: [idx...]}
+    plain = {"q0": [1, 2, 3], "q1": [4]}
+    assert _candidates(plain, "q0") == [1, 2, 3]
+    # shortlist dict shape
+    shortlist = {"shortlist": {"q0": {"cells": [7, 8]}}}
+    assert _candidates(shortlist, "q0") == [7, 8]
+    assert _candidates(shortlist, "missing") == []
+    # indices from a JSON path vs passed object
+    p = tmp_path / "idx.json"; p.write_text(json.dumps(plain))
+    assert _load_indices(str(p)) == plain
+    assert _load_indices(plain) is plain
+
+
+def test_search_shard_delegates_to_locate():
+    import pyramid_newformat.locate as loc
+    import pyramid_newformat.search_shard as ss
+    assert ss.locate is loc.locate and ss.main is loc.main    # one engine, no divergence
+
+
 def test_resume_refuses_zeros_when_shard_missing(tmp_path):
     """If the local shard is gone but cells are marked done and not uploaded, refuse (don't ship zeros)."""
     src, _ = _write_source(tmp_path / "s", n=3)

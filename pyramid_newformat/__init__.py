@@ -10,4 +10,11 @@ direct GPU hand-off, in a sibling ``*_newformat`` S3 prefix. See README.md.
 from .reader import NewFormatReader
 from .schema import AXES, SCHEMA_VERSION
 
-__all__ = ["NewFormatReader", "AXES", "SCHEMA_VERSION"]
+
+def locate(*args, **kwargs):
+    """Lazy proxy to :func:`pyramid_newformat.locate.locate` (keeps torch import out of package load)."""
+    from .locate import locate as _locate
+    return _locate(*args, **kwargs)
+
+
+__all__ = ["NewFormatReader", "AXES", "SCHEMA_VERSION", "locate"]
