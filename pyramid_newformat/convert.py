@@ -75,7 +75,8 @@ def read_source_cell(local_h5: str, levels_m, expect_pos=None):
         lat = np.asarray(f["lat"][:], np.float64) if "lat" in f else np.full(P, np.nan)
         lon = np.asarray(f["lon"][:], np.float64) if "lon" in f else np.full(P, np.nan)
         inv = {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in f.attrs.items()}
-        extra = {k: f[k].shape for k in f.keys() if not _POS.match(k)}   # non-position datasets (px/py/lat/lon)
+        extra = {k: list(f[k].shape) for k in f.keys()                   # non-position DATASETS (px/py/lat/lon)
+                 if hasattr(f[k], "shape") and not _POS.match(k)}
     return block, lat.astype(np.float64), lon.astype(np.float64), (P, L, H, W, D), inv, extra
 
 
