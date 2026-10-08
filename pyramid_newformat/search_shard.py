@@ -1,17 +1,15 @@
-"""Minimum-reads GPU rerank over the packed new format: ONE sequential read per shard, slice in RAM.
+"""Minimum-reads GPU rerank over the packed new format: read a shard's NEEDED cells as coalesced
+sequential runs, slice in RAM, score PER LEVEL on GPU. Shard-by-shard with a real 1-shard-ahead
+prefetch (overlaps the sequential read with GPU work) and per-shard progress logging.
 
-Per the h5py/HDF-forum consensus (read the largest useful block once, slice in memory; no chunking for
-dense sequential data), this reads each shard's whole contiguous ``/features`` in ONE pass and slices
-cells/levels in memory — so disk requests = number of shards (e.g. 6), not per-cell (143) or per-level
-(1144). GPU work is batched PER LEVEL (25 positions) across ``--gpu-cells`` cells, so VRAM stays small
-regardless of the read size. A 1-shard-ahead prefetch hides GPU under the sequential read.
+Read pattern (h5py/HDF-forum consensus): few large sequential reads, slice in memory; no chunking
+(data is contiguous). Per shard we read only its needed cells via ``reader.read_cells`` which coalesces
+consecutive local indices into one ``ds[lo:hi]`` span — so reads ≈ #contiguous runs (≤ #shards when
+dense), not per-cell (143) or per-level (1144). GPU batches PER LEVEL (n_positions) across
+``--gpu-cells`` cells so VRAM stays tiny regardless of read size. Math = faithful MAGSAC++
+(magsacpp_torch primitives), identical scoring/aggregation.
 
-Read modes:
-  * default: ``f[/features][:]`` — whole shard into RAM (1 read/shard; needs ~shape bytes RAM/shard).
-  * ``--mmap``: ``np.memmap`` the contiguous ``/features`` (RAM-safe; OS does large sequential readahead).
-The manifest's ``features_byte_offset`` also enables a future kvikio/GPUDirect direct-to-GPU read.
-
-Math is the faithful MAGSAC++ (reuses magsacpp_torch primitives) — identical scoring/aggregation.
+RAM: ~ needed-cells-of-one-shard (×2 with prefetch). Use ``--no-prefetch`` if RAM-limited.
 """
 from __future__ import annotations
 
@@ -24,8 +22,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
-
-from .schema import DS_FEATURES, DS_POS_LAT, DS_POS_LON
 
 
 def _haversine_m(a, b, c, d):
@@ -49,8 +45,8 @@ def main(argv=None) -> int:
     ap.add_argument("--indices", required=True)
     ap.add_argument("--dataset-dir", required=True)
     ap.add_argument("--gpu-cells", type=int, default=4, dest="gpu_cells",
-                    help="cells per per-level GPU batch (crops = gpu_cells*n_positions; VRAM ~ small)")
-    ap.add_argument("--mmap", action="store_true", help="np.memmap shards (RAM-safe) instead of whole-shard read")
+                    help="cells per per-level GPU batch (crops = gpu_cells*n_positions)")
+    ap.add_argument("--no-prefetch", dest="prefetch", action="store_false", help="disable 1-shard-ahead read (low RAM)")
     ap.add_argument("--k-coarse", type=int, default=1000)
     ap.add_argument("--topk", type=int, default=5)
     ap.add_argument("--level-agg", choices=["sum", "max"], default="sum")
@@ -74,7 +70,6 @@ def main(argv=None) -> int:
     for p in (str(repo), str(repo / "experiments")):
         if p not in sys.path:
             sys.path.insert(0, p)
-    import h5py
     import torch
 
     from magsacpp_torch import MagsacppConfig
@@ -118,70 +113,67 @@ def main(argv=None) -> int:
         print("[search_shard] no queries matched"); return 2
 
     union = set().union(*cand.values())
-    need = {}                                                 # file -> sorted [(local_idx, cell_id)]
+    byfile = {}                                               # file -> sorted [(local_idx, cell_id)]
     for cid in union:
-        c = r.cells[cid]; need.setdefault(c["file"], []).append((int(c["local_cell_idx"]), cid))
-    for f in need:
-        need[f].sort()
+        c = r.cells[cid]; byfile.setdefault(c["file"], []).append((int(c["local_cell_idx"]), cid))
+    for f in byfile:
+        byfile[f].sort()
     qneed = {cid: [q for q in Q if cid in cand[q]] for cid in union}
     qcell = {q: {} for q in Q}
-    files = sorted(need, key=lambda fn: fn)                   # shard order
-    fmeta = {f["name"]: f for f in r.manifest["files"]}
+    files = sorted(byfile)
+    print(f"[search_shard] queries={len(Q)} cells={len(union)} shards={len(files)} "
+          f"(cells/shard={[len(byfile[f]) for f in files]}) gpu_cells={args.gpu_cells} prefetch={args.prefetch}", flush=True)
 
-    def load_shard(fname):                                    # ONE sequential read per shard (or mmap)
-        fm = fmeta[fname]; path = str(Path(args.dataset_dir) / fname)
-        shape = tuple(fm["shape"])
-        if args.mmap:
-            arr = np.memmap(path, dtype="<f2", mode="r", offset=int(fm["features_byte_offset"]), shape=shape)
-            with h5py.File(path, "r") as f:
-                plat, plon = f[DS_POS_LAT][:], f[DS_POS_LON][:]
-        else:
-            with h5py.File(path, "r") as f:
-                arr = f[DS_FEATURES][:]; plat, plon = f[DS_POS_LAT][:], f[DS_POS_LON][:]
-        return arr, plat, plon
+    def load_shard(fname):                                    # read this shard's needed cells (coalesced runs)
+        cids = [c for _, c in byfile[fname]]
+        arr = np.stack(r.read_cells(cids))                    # (nc, P, L, H, W, D) fp16, few sequential reads
+        co = [r.read_cell_coords(c) for c in cids]
+        return cids, arr, co
 
     t_read = t_gpu = 0.0
     ex = ThreadPoolExecutor(max_workers=1)
     fut = ex.submit(load_shard, files[0]) if files else None
     t0 = time.perf_counter()
     for fi, fname in enumerate(files):
-        tr = time.perf_counter(); arr, plat, plon = fut.result(); t_read += time.perf_counter() - tr
-        fut = ex.submit(load_shard, files[fi + 1]) if fi + 1 < len(files) else None    # prefetch next shard
+        tr = time.perf_counter()
+        cids, arr, co = fut.result() if args.prefetch else load_shard(fname)
+        sr = time.perf_counter() - tr; t_read += sr
+        if args.prefetch:
+            fut = ex.submit(load_shard, files[fi + 1]) if fi + 1 < len(files) else None
         tg = time.perf_counter()
-        items = need[fname]
-        for cs in range(0, len(items), args.gpu_cells):
-            sub = items[cs:cs + args.gpu_cells]
-            lidx = [li for li, _ in sub]; cids = [c for _, c in sub]
-            qset = {q for c in cids for q in qneed[c]}
-            blocks = np.ascontiguousarray(arr[lidx])          # (nc,P,L,H,W,D) materialized (seq / page-fault)
-            nc = len(sub)
+        n = len(cids)
+        for cs in range(0, n, args.gpu_cells):
+            ce = min(cs + args.gpu_cells, n); nc = ce - cs
+            sub_cids = cids[cs:ce]
+            qset = {q for c in sub_cids for q in qneed[c]}
             accq = {q: np.zeros((nc, P, L), np.float64) for q in qset}
             for li_ in range(L):
-                crops = blocks[:, :, li_].reshape(nc * P, H * W, D)
-                grids = torch.from_numpy(crops).to(dev)       # fp16; small (nc*P crops)
+                crops = np.ascontiguousarray(arr[cs:ce, :, li_]).reshape(nc * P, H * W, D)
+                grids = torch.from_numpy(crops).to(dev)
                 for q in qset:
                     p = Q[q]
                     qm, rm, valid = _mutual_nn_padded(p["feat"], grids, p["xy"], kp, dev, args.match_budget)
                     counts, _ = estimate_homography_magsacpp_batch(rm, qm, valid, config=cfg, generator=gen,
                                                                    return_counts=True)
-                    sc = (counts.double() / p["nq"] if p["nq"] else counts.double()).view(nc, P)
-                    accq[q][:, :, li_] = sc.cpu().numpy()
+                    accq[q][:, :, li_] = (counts.double() / p["nq"] if p["nq"] else counts.double()).view(nc, P).cpu().numpy()
                 del grids
                 if str(dev).startswith("cuda"):
                     torch.cuda.empty_cache()
-            for k, cid in enumerate(cids):
+            for k in range(nc):
+                cid = sub_cids[k]; plat, plon = co[cs + k]
                 for q in qneed[cid]:
-                    s = accq[q][k]                             # (P, L)
+                    s = accq[q][k]
                     pyr = s.sum(1) if args.level_agg == "sum" else s.max(1)
                     bi = int(pyr.argmax())
                     cs_ = {"mean": float(pyr.mean()), "min": float(pyr.min()), "max": float(pyr.max())}[args.cell_agg]
                     lvl_i = int(s[bi].argmax())
-                    qcell[q][cid] = {"cell_id": cid, "cell_score": cs_, "lat": float(plat[lidx[k]][bi]),
-                                     "lon": float(plon[lidx[k]][bi]), "level_m": int(levels[lvl_i])}
+                    qcell[q][cid] = {"cell_id": cid, "cell_score": cs_, "lat": float(plat[bi]),
+                                     "lon": float(plon[bi]), "level_m": int(levels[lvl_i])}
         del arr
         if str(dev).startswith("cuda"):
             torch.cuda.synchronize()
-        t_gpu += time.perf_counter() - tg
+        sg = time.perf_counter() - tg; t_gpu += sg
+        print(f"  shard {fi + 1}/{len(files)} {fname}: cells={n} read={sr:.1f}s gpu={sg:.1f}s", flush=True)
     wall = time.perf_counter() - t0
     ex.shutdown()
 
@@ -200,15 +192,12 @@ def main(argv=None) -> int:
     if d1:
         summary["top1"] = {f"distR@{int(t)}m": float((np.asarray(d1) <= t).mean()) for t in thr}
         summary[f"top{args.topk}"] = {f"distR@{int(t)}m": float((np.asarray(dk) <= t).mean()) for t in thr}
-    out = {"meta": {"dataset_dir": args.dataset_dir, "read": "mmap" if args.mmap else "whole-shard",
-                    "gpu_cells": args.gpu_cells, "topk": args.topk, "level_agg": args.level_agg,
-                    "cell_agg": args.cell_agg, "device": str(dev)},
+    out = {"meta": {"dataset_dir": args.dataset_dir, "gpu_cells": args.gpu_cells, "prefetch": args.prefetch,
+                    "topk": args.topk, "level_agg": args.level_agg, "cell_agg": args.cell_agg, "device": str(dev)},
            "summary": summary, "per_query": per_query,
-           "speed": {"wall_s": wall, "read_s": t_read, "gpu_s": t_gpu, "n_shards_read": len(files),
-                     "n_cells": len(union)}}
+           "speed": {"wall_s": wall, "read_s": t_read, "gpu_s": t_gpu, "n_shards": len(files), "n_cells": len(union)}}
     Path(args.out).expanduser().write_text(json.dumps(out), encoding="utf-8")
-    print(f"[search_shard] cells={len(union)} shard-reads={len(files)} gpu_cells={args.gpu_cells} "
-          f"read={'mmap' if args.mmap else 'whole'} | wall={wall:.1f}s read={t_read:.1f}s gpu={t_gpu:.1f}s"
+    print(f"[search_shard] DONE cells={len(union)} shards={len(files)} | wall={wall:.1f}s read={t_read:.1f}s gpu={t_gpu:.1f}s"
           + (f" | top{args.topk} distR@250m={summary[f'top{args.topk}']['distR@250m']:.3f}" if d1 else ""), flush=True)
     print(f"[ok] -> {args.out}", flush=True)
     r.close(); qs.close()
