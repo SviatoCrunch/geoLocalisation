@@ -195,15 +195,9 @@ class Converter:
                 continue
             self._write_shard(fpath, fname, si, lo, shard_cells, dims, bpc, ckpt, ckpt_path, cell_map, files_meta)
 
-        # ---- per-position coords for the manifest (TRUE coords; read once from local shards) ----
-        coords = {}
-        for fname in sorted(files_meta):
-            with h5py.File(self.work / fname, "r") as cf:
-                cids_f = [x.decode() if isinstance(x, bytes) else str(x) for x in cf[DS_CELL_IDS][:]]
-                pla, plo = cf[DS_POS_LAT][:], cf[DS_POS_LON][:]
-            for j, cid in enumerate(cids_f):
-                if cid:
-                    coords[cid] = (pla[j].tolist(), plo[j].tolist())
+        # ---- per-position coords for the manifest: accumulated in the checkpoint DURING write, so
+        # shards are deleted right after upload (peak disk ~1 shard) without a second local read.
+        coords = {cid: tuple(v) for cid, v in ckpt.get("coords", {}).items()}
 
         # ---- manifest LAST (only after every shard uploaded) ----
         manifest = {
@@ -274,6 +268,7 @@ class Converter:
                     raise RuntimeError(f"{cid}: read-back bitwise mismatch in {fname}[{j}]")
             Path(local).unlink(missing_ok=True)
             ckpt["done"][cid] = [fname, gi, j]
+            ckpt.setdefault("coords", {})[cid] = [plat.tolist(), plon.tolist()]   # for manifest, survives shard delete
             cell_map[cid] = (fname, gi, j)
             s3io.write_json(str(ckpt_path), ckpt)
         # contiguous offset (must be defined for Range GET)
@@ -297,8 +292,9 @@ class Converter:
         files_meta[fname] = meta
         ckpt["files"][fname] = meta                                   # STATE: UPLOADED = complete (AFTER upload)
         s3io.write_json(str(ckpt_path), ckpt)
+        fpath.unlink(missing_ok=True)                                 # free the shard NOW (peak disk ~1 shard)
         print(f"[shard {si}] uploaded {fname} ({meta['bytes']/2**30:.2f}GiB sha {sha[:12]} "
-              f"ver={str(ver)[:8] if ver else '-'})", flush=True)
+              f"ver={str(ver)[:8] if ver else '-'}) — local shard removed", flush=True)
 
 
 def main(argv=None) -> int:

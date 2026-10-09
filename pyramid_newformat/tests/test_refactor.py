@@ -181,23 +181,20 @@ def test_true_coords_from_manifest(tmp_path):
 
 
 # ---------------- resume after a failed upload ----------------
-def test_resume_after_failed_upload(tmp_path):
-    """Shard written+verified locally but manifest/files not recorded (upload died) → resume must
-    republish that shard and only then write the manifest."""
+def test_resume_rebuilds_manifest_from_ckpt(tmp_path):
+    """Crash-before-manifest: shards were uploaded AND deleted locally (delete-after-upload), the
+    checkpoint holds files+coords. Resume must rebuild the manifest (incl. per-position coords) from
+    the checkpoint WITHOUT re-reading any local shard."""
+    import os
+
     from pyramid_newformat.reader import NewFormatReader
     src, blocks = _write_source(tmp_path / "s", n=3)
     dst = str(tmp_path / "d"); work = str(tmp_path / "w")
     _convert(src, dst, work, cps=2)
-    man = Path(dst) / "manifest.json"
-    # simulate death right after the LAST shard's bytes were written but before it was published:
-    ck = json.loads((Path(work) / "_convert_checkpoint.json").read_text())
-    last = "features_00001.h5"
-    ck["files"].pop(last, None)                                    # forget the upload record
-    ck.setdefault("written", {})[last] = {"sha256": "stale"}       # keep written state
-    (Path(work) / "_convert_checkpoint.json").write_text(json.dumps(ck))
-    man.unlink()                                                   # manifest not yet written
-    out = _convert(src, dst, work, cps=2, resume=True)             # resume → finish publish + manifest
-    assert man.exists() and last in {f["name"] for f in out["files"]}
+    assert not any(f.startswith("features_") for f in os.listdir(work))   # shards removed post-upload
+    (Path(dst) / "manifest.json").unlink()                                # simulate crash pre-manifest
+    man = _convert(src, dst, work, cps=2, resume=True)                    # resume: manifest from ckpt
+    assert man["cells"]["kup:2_lvl0"]["pos_lat"] is not None              # coords survived via checkpoint
     r = NewFormatReader(dst)
     for cid, blk in blocks.items():
         assert np.array_equal(r.read_cell(cid).view(np.uint16), blk.view(np.uint16))
@@ -260,12 +257,11 @@ def test_resume_refuses_zeros_when_shard_missing(tmp_path):
     """If the local shard is gone but cells are marked done and not uploaded, refuse (don't ship zeros)."""
     src, _ = _write_source(tmp_path / "s", n=3)
     dst = str(tmp_path / "d"); work = str(tmp_path / "w")
-    _convert(src, dst, work, cps=2)
+    _convert(src, dst, work, cps=2)                                # shards already deleted post-upload
     ck = json.loads((Path(work) / "_convert_checkpoint.json").read_text())
     last = "features_00001.h5"
-    ck["files"].pop(last, None)
+    ck["files"].pop(last, None)                                    # forget upload record → not-in-files
     (Path(work) / "_convert_checkpoint.json").write_text(json.dumps(ck))
-    (Path(work) / last).unlink()                                   # local shard removed
     (Path(dst) / "manifest.json").unlink()
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit):                                # cells done + not uploaded + shard gone
         _convert(src, dst, work, cps=2, resume=True)
