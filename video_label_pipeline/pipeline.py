@@ -9,6 +9,7 @@ so it is unit-testable without OpenCV video decoding, torch, or S3.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,27 @@ from .segment import boundary_context, segment_frames, to_feature
 from .video_io import read_all_frames
 
 _QUALITY_CLASSES = ("good", "usable", "bad")
+
+
+def _chunk_key(rec: dict) -> tuple:
+    return (rec.get("station"), rec.get("date"), rec.get("chunk"))
+
+
+def _load_partial(partial_path) -> dict:
+    """Read an incremental JSONL (one chunk record per line) into {key: rec}."""
+    done: dict[tuple, dict] = {}
+    if not partial_path or not Path(partial_path).exists():
+        return done
+    for line in Path(partial_path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        done[_chunk_key(rec)] = rec
+    return done
 
 
 @dataclass
@@ -175,27 +197,47 @@ def process_frames_chunk(group, backend, k: int = 5, thr: float = THRESHOLD) -> 
 
 
 def build_frames_manifest(root, backend, *, k: int = 5, thr: float = THRESHOLD,
-                          limit: int | None = None, on_video=None) -> dict:
-    """Manifest from an already-split frame tree (``frames_good``)."""
-    videos = []
-    for i, group in enumerate(iter_chunk_groups(root)):
-        if limit is not None and i >= limit:
-            break
-        try:
-            rec = process_frames_chunk(group, backend, k, thr)
-        except Exception as e:
-            rec = {"source": "frames", "station": group.station, "date": group.date,
-                   "chunk": group.chunk, "chunk_dir": str(group.chunk_dir),
-                   "status": "error", "error": repr(e), "n_subvideos": 0, "subvideos": []}
-        videos.append(rec)
-        if on_video is not None:
-            on_video(i, rec)
+                          limit: int | None = None, on_video=None,
+                          partial_path=None) -> dict:
+    """Manifest from an already-split frame tree (``frames_good``).
+
+    If ``partial_path`` is given, each completed chunk is appended there as one
+    JSON line (flushed) and already-recorded chunks are SKIPPED on a re-run —
+    so an interrupted run resumes and keeps appending instead of restarting.
+    """
+    done = _load_partial(partial_path)
+    videos = list(done.values())
+    resumed = len(done)
+    fh = open(partial_path, "a", encoding="utf-8") if partial_path else None
+    new = 0
+    try:
+        for group in iter_chunk_groups(root):
+            if (group.station, group.date, group.chunk) in done:
+                continue
+            if limit is not None and new >= limit:
+                break
+            try:
+                rec = process_frames_chunk(group, backend, k, thr)
+            except Exception as e:
+                rec = {"source": "frames", "station": group.station, "date": group.date,
+                       "chunk": group.chunk, "chunk_dir": str(group.chunk_dir),
+                       "status": "error", "error": repr(e), "n_subvideos": 0, "subvideos": []}
+            videos.append(rec)
+            new += 1
+            if fh is not None:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n"); fh.flush()
+            if on_video is not None:
+                on_video(resumed + new - 1, rec)
+    finally:
+        if fh is not None:
+            fh.close()
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "source": "frames", "frames_root": str(root),
         "k_per_subvideo": k, "daynight_thr": thr,
         "split_recipe": {"note": "pre-split input (frames already grouped into sub_NN)"},
+        "resumed_chunks": resumed, "new_this_run": new,
         "n_videos": len(videos), "videos": videos,
     }
 
@@ -203,32 +245,50 @@ def build_frames_manifest(root, backend, *, k: int = 5, thr: float = THRESHOLD,
 def build_manifest(source, backend, recipe: SplitRecipe | None = None, *,
                    date_from: str | None = None, date_to: str | None = None,
                    k: int = 5, thr: float = THRESHOLD, every: int = 1,
-                   limit: int | None = None, on_video=None) -> dict:
-    """Iterate ``source`` (yields VideoRefs), build the full manifest dict."""
+                   limit: int | None = None, on_video=None, partial_path=None) -> dict:
+    """Iterate ``source`` (yields VideoRefs), build the full manifest dict.
+
+    ``partial_path`` enables the same append-and-resume behaviour as the frames
+    builder: completed videos are flushed to a JSONL and skipped on re-run.
+    """
     recipe = recipe or SplitRecipe()
-    videos = []
-    for i, ref in enumerate(source):
-        if limit is not None and i >= limit:
-            break
-        try:
-            with ref.open() as local_path:
-                rec = process_video(local_path, ref, backend, recipe, k, thr, every)
-        except Exception as e:                 # one bad video must not sink the run
-            rec = {
-                "s3_uri": getattr(ref, "s3_uri", None), "bucket": getattr(ref, "bucket", None),
-                "key": getattr(ref, "key", None), "station": ref.station, "date": ref.date,
-                "chunk": ref.chunk, "status": "error", "error": repr(e),
-                "n_subvideos": 0, "subvideos": [],
-            }
-        videos.append(rec)
-        if on_video is not None:
-            on_video(i, rec)
+    done = _load_partial(partial_path)
+    videos = list(done.values())
+    resumed = len(done)
+    fh = open(partial_path, "a", encoding="utf-8") if partial_path else None
+    new = 0
+    try:
+        for ref in source:
+            if (ref.station, ref.date, ref.chunk) in done:
+                continue
+            if limit is not None and new >= limit:
+                break
+            try:
+                with ref.open() as local_path:
+                    rec = process_video(local_path, ref, backend, recipe, k, thr, every)
+            except Exception as e:             # one bad video must not sink the run
+                rec = {
+                    "s3_uri": getattr(ref, "s3_uri", None), "bucket": getattr(ref, "bucket", None),
+                    "key": getattr(ref, "key", None), "station": ref.station, "date": ref.date,
+                    "chunk": ref.chunk, "status": "error", "error": repr(e),
+                    "n_subvideos": 0, "subvideos": [],
+                }
+            videos.append(rec)
+            new += 1
+            if fh is not None:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n"); fh.flush()
+            if on_video is not None:
+                on_video(resumed + new - 1, rec)
+    finally:
+        if fh is not None:
+            fh.close()
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "date_from": date_from, "date_to": date_to,
         "k_per_subvideo": k, "daynight_thr": thr, "sample_every": every,
         "split_recipe": recipe.as_dict(),
+        "resumed_chunks": resumed, "new_this_run": new,
         "n_videos": len(videos),
         "videos": videos,
     }

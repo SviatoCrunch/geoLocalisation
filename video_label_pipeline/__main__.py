@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -67,6 +68,9 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-structure", action="store_true",
                     help="no model: split-only (every frame counted 'good')")
     ap.add_argument("--out", required=True, help="output manifest JSON path")
+    ap.add_argument("--fresh", action="store_true",
+                    help="delete any existing <out>.partial.jsonl and start over "
+                         "(default: resume, appending new chunks)")
     args = ap.parse_args(argv)
 
     if args.source in ("s3", "local") and not (args.date_from and args.date_to):
@@ -85,11 +89,17 @@ def main(argv=None) -> int:
         print(f"[{i + 1}] {rec['chunk']}: {n} sub-videos, {sel} frames selected"
               f"{' (' + rec['status'] + ')' if rec.get('status') else ''}", flush=True)
 
+    partial = args.out + ".partial.jsonl"
+    if args.fresh and os.path.exists(partial):
+        os.remove(partial)
+    if os.path.exists(partial):
+        print(f"resuming from {partial} (skipping already-done chunks)", flush=True)
+
     if args.source == "frames":
         if not args.dir:
             ap.error("--dir (frames_good root) is required for --source frames")
         manifest = build_frames_manifest(args.dir, backend, k=args.k, thr=args.daynight_thr,
-                                         limit=args.limit, on_video=progress)
+                                         limit=args.limit, on_video=progress, partial_path=partial)
     else:
         if args.source == "s3":
             if not args.station:
@@ -104,7 +114,8 @@ def main(argv=None) -> int:
                              min_seg=args.min_seg, width=args.width)
         manifest = build_manifest(source, backend, recipe, date_from=args.date_from,
                                   date_to=args.date_to, k=args.k, thr=args.daynight_thr,
-                                  every=args.every, limit=args.limit, on_video=progress)
+                                  every=args.every, limit=args.limit, on_video=progress,
+                                  partial_path=partial)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

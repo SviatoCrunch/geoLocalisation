@@ -42,6 +42,28 @@ python -m video_label_pipeline --source local --dir ./v \
     --date-from 2026-10-10 --date-to 2026-10-15 --dry-structure --out split.json
 ```
 
+### Resume (long runs)
+Every completed chunk is appended to `<out>.partial.jsonl` and flushed, so an
+interrupted run **resumes** on restart — already-done chunks are skipped and new
+ones appended (no progress lost; works for all three sources). Re-run the exact
+same command to continue; pass `--fresh` to discard the partial and start over.
+The final `<out>` JSON is assembled from the partial at the end.
+
+### GPU on the server (Tesla T4, CUDA 12.4 driver)
+The default `quality-cls` torch may be built for a newer CUDA than the driver
+(→ "driver too old", CPU fallback, hours). Run with a matching wheel from the
+geoLocalisation uv project instead (verified cu121 recipe):
+```bash
+cd /home/ubuntu/work/geoLocalisation
+PYTHONPATH=/home/ubuntu/work/RevisitAnything/quality-cls/src \
+uv run --extra-index-url https://download.pytorch.org/whl/cu121 \
+    --with "torch==2.5.1+cu121" --with "torchvision==0.20.1" \
+    --with opencv-python-headless --with numpy --with pandas --with pyyaml --with pillow \
+    python -m video_label_pipeline --source frames \
+    --dir /home/ubuntu/work/out/frames_good --k 5 \
+    --out /home/ubuntu/work/out/frames_good/frames_good_manifest.json
+```
+
 ## Dependency: quality_cls
 The default backend loads `quality_cls.QualityPredictor` (frozen DINOv2 + linear
 head) for **both** the quality label and the DINO embedding (one model load).

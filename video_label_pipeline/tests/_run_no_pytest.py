@@ -12,7 +12,7 @@ import traceback
 from pathlib import Path
 
 MODULES = ["test_segment", "test_diversity", "test_daynight", "test_pipeline",
-           "test_source", "test_frames_tree"]
+           "test_source", "test_frames_tree", "test_resume"]
 
 
 def main() -> int:
