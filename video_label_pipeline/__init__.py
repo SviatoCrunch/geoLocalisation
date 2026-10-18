@@ -19,6 +19,7 @@ from .daynight import chroma, day_night
 from .diversity import farthest_point_select
 from .pipeline import SplitRecipe, build_manifest, process_decoded, process_video
 from .segment import (
+    boundary_context,
     content_deltas,
     cut_indices,
     feature_diff,
@@ -34,6 +35,7 @@ __all__ = [
     "process_decoded",
     "process_video",
     "segment_frames",
+    "boundary_context",
     "content_deltas",
     "cut_indices",
     "segments_from_cuts",

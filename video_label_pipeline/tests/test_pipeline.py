@@ -45,6 +45,11 @@ def test_process_decoded_splits_scores_selects_tags():
     assert a["boundary"] is None                    # first sub: no cut before it
     assert b["boundary"]["cut_before_frame"] == 6
     assert b["boundary"]["content_delta"] >= 15.0
+    # enriched boundary map (systematic S3-flow fields)
+    assert b["boundary"]["ratio"] >= b["boundary"]["adaptive_thr"]
+    assert "local_avg" in b["boundary"] and "min_content" in b["boundary"]
+    assert a["start_s"] == 0.0 and a["end_s"] == 0.5 and a["duration_s"] == 0.5
+    assert b["start_s"] == 0.6 and b["duration_s"] == round(b["end_s"] - b["start_s"], 3)
 
     # k good frames selected per sub, all distinct, ranked, with day/night.
     for sub, expect in ((a, "night"), (b, "day")):

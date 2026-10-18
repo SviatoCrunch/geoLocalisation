@@ -16,7 +16,7 @@ from pathlib import Path
 from .daynight import THRESHOLD, day_night
 from .diversity import farthest_point_select
 from .frames_tree import iter_chunk_groups
-from .segment import segment_frames, to_feature
+from .segment import boundary_context, segment_frames, to_feature
 from .video_io import read_all_frames
 
 _QUALITY_CLASSES = ("good", "usable", "bad")
@@ -76,18 +76,21 @@ def process_decoded(ref, fps, n_frames, frames, backend, recipe: SplitRecipe,
     subvideos = []
     for si, positions in enumerate(segs):
         start_pos, end_pos = positions[0], positions[-1]
+        start_s, end_s = frames[start_pos][1], frames[end_pos][1]
         counts, selected = _select_subvideo(positions, frames, backend, k, thr)
         boundary = None
         if si > 0:                             # first sub starts the clip, no cut
-            boundary = {
-                "cut_before_frame": frames[start_pos][0],
-                "content_delta": round(deltas[start_pos], 3) if start_pos < len(deltas) else None,
-            }
+            boundary = {"cut_before_frame": frames[start_pos][0],
+                        **boundary_context(deltas, start_pos, recipe.content_window,
+                                           recipe.min_content, recipe.adaptive_thr)}
         subvideos.append({
             "sub_id": f"sub_{si + 1:02d}",
             "start_frame": frames[start_pos][0],
             "end_frame": frames[end_pos][0],
             "n_frames": len(positions),
+            "start_s": round(start_s, 3),
+            "end_s": round(end_s, 3),
+            "duration_s": round(end_s - start_s, 3),
             "boundary": boundary,
             "quality": {c: counts.get(c, 0) for c in _QUALITY_CLASSES},
             "selected": selected,

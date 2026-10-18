@@ -67,6 +67,25 @@ def cut_indices(deltas: list[float], adaptive_thr: float = 3.0,
     return cuts
 
 
+def boundary_context(deltas: list[float], i: int, window: int = 2,
+                     min_content: float = 15.0, adaptive_thr: float = 3.0) -> dict:
+    """Explain why a cut fired before position ``i``: the content delta there,
+    the local average of neighbour deltas (+/-``window``), their ratio, and the
+    thresholds in force. Makes each boundary reproducible/auditable from JSON."""
+    n = len(deltas)
+    lo, hi = max(1, i - window), min(n - 1, i + window)
+    neigh = [deltas[j] for j in range(lo, hi + 1) if j != i]
+    local_avg = (sum(neigh) / len(neigh)) if neigh else 0.0
+    d = deltas[i] if 0 <= i < n else 0.0
+    return {
+        "content_delta": round(d, 3),
+        "local_avg": round(local_avg, 3),
+        "ratio": round(d / (local_avg + 1e-6), 3),
+        "min_content": min_content,
+        "adaptive_thr": adaptive_thr,
+    }
+
+
 def segments_from_cuts(n: int, cuts: set[int]) -> list[list[int]]:
     """Positions 0..n-1 grouped into contiguous segments split at ``cuts``."""
     if n <= 0:

@@ -1,6 +1,7 @@
 import numpy as np
 
 from video_label_pipeline.segment import (
+    boundary_context,
     merge_short,
     segment_frames,
     segments_from_cuts,
@@ -37,6 +38,16 @@ def test_merge_short_absorbs_tiny_segment():
 def test_segments_from_cuts_partition():
     assert segments_from_cuts(5, {2}) == [[0, 1], [2, 3, 4]]
     assert segments_from_cuts(3, set()) == [[0, 1, 2]]
+
+
+def test_boundary_context_explains_cut():
+    # a clear spike at index 3 over near-zero neighbours
+    deltas = [0.0, 1.0, 1.0, 40.0, 1.0, 1.0]
+    ctx = boundary_context(deltas, 3, window=2, min_content=15.0, adaptive_thr=3.0)
+    assert ctx["content_delta"] == 40.0
+    assert ctx["local_avg"] == 1.0                   # neighbours 1,2,4,5 all == 1.0
+    assert ctx["ratio"] == round(40.0 / (1.0 + 1e-6), 3)
+    assert ctx["min_content"] == 15.0 and ctx["adaptive_thr"] == 3.0
 
 
 def test_to_feature_reduces_and_is_hsv():
