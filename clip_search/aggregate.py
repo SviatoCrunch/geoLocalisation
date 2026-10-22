@@ -32,34 +32,54 @@ def haversine_m(lat1, lon1, lat2, lon2) -> float:
     return 2 * r * math.asin(min(1.0, math.sqrt(x)))
 
 
-def aggregate_clip(frames_topk: list[list[dict]], top_n: int) -> dict:
-    """frames_topk = per-frame ranked cell lists (each sorted desc by cell_score, as locate emits).
+METHODS = ("sum", "votes", "wsum", "max", "gated")
 
-    → {"sum": [cells...], "votes": [cells...]} each a ranked list of
-    {cell_id, score_sum, votes, lat, lon, level_m}. ``sum`` ranks by Σscore, ``votes`` by (#frames, Σscore).
-    A cell's lat/lon = the position from the frame where it scored highest.
+
+def aggregate_clip(frames_topk: list[list[dict]], top_n: int, *, gate_frac: float = 0.9) -> dict:
+    """frames_topk = per-frame ranked cell lists (each sorted desc by cell_score).
+
+    Returns a ranked cell list per method (all training-free; a frame's CONFIDENCE = its max cell_score
+    in top-N — the coarse stand-in for a geometric inlier-ratio weight):
+      * **sum**   — Σ cell_score over frames having the cell in top-N;
+      * **votes** — #frames with the cell in top-N (score-agnostic);
+      * **wsum**  — Σ (conf_f · cell_score): down-weights low-confidence (off-GT) frames [idea #1];
+      * **max**   — max cell_score across frames (strongest frame wins, no dilution) [coarse #3];
+      * **gated** — Σ cell_score but only over frames whose conf_f ≥ gate_frac·max_f(conf) — a
+                    variable-shape window kept by score [idea #2].
+    Each cell carries lat/lon from the frame where it scored highest.
     """
+    frames = [cells[:top_n] for cells in frames_topk]
+    conf = [max((float(c.get("cell_score", 0.0)) for c in cells), default=0.0) for cells in frames]
+    cmax = max(conf, default=0.0)
+    keep = [cf >= gate_frac * cmax for cf in conf] if cmax > 0 else [True] * len(frames)
+
     acc: dict[str, dict] = {}
-    for cells in frames_topk:
-        for c in cells[:top_n]:
-            cid = c["cell_id"]
-            sc = float(c.get("cell_score", 0.0))
+    for cells, cf, gk in zip(frames, conf, keep):
+        for c in cells:
+            cid = c["cell_id"]; sc = float(c.get("cell_score", 0.0))
             a = acc.get(cid)
             if a is None:
-                acc[cid] = {"cell_id": cid, "score_sum": sc, "votes": 1,
-                            "lat": c["lat"], "lon": c["lon"], "level_m": c.get("level_m"),
-                            "_best": sc}
-            else:
-                a["score_sum"] += sc
-                a["votes"] += 1
-                if sc > a["_best"]:                       # keep the strongest frame's position
-                    a["_best"] = sc; a["lat"] = c["lat"]; a["lon"] = c["lon"]; a["level_m"] = c.get("level_m")
+                a = acc[cid] = {"cell_id": cid, "score_sum": 0.0, "votes": 0, "wsum": 0.0,
+                                "score_max": -1e30, "gated_sum": 0.0,
+                                "lat": c["lat"], "lon": c["lon"], "level_m": c.get("level_m"), "_best": -1e30}
+            a["score_sum"] += sc
+            a["votes"] += 1
+            a["wsum"] += cf * sc
+            a["score_max"] = max(a["score_max"], sc)
+            if gk:
+                a["gated_sum"] += sc
+            if sc > a["_best"]:                           # strongest frame's position
+                a["_best"] = sc; a["lat"] = c["lat"]; a["lon"] = c["lon"]; a["level_m"] = c.get("level_m")
     cells = list(acc.values())
     for c in cells:
         c.pop("_best", None)
-    by_sum = sorted(cells, key=lambda c: c["score_sum"], reverse=True)
-    by_votes = sorted(cells, key=lambda c: (c["votes"], c["score_sum"]), reverse=True)
-    return {"sum": by_sum, "votes": by_votes}
+    return {
+        "sum":   sorted(cells, key=lambda c: c["score_sum"], reverse=True),
+        "votes": sorted(cells, key=lambda c: (c["votes"], c["score_sum"]), reverse=True),
+        "wsum":  sorted(cells, key=lambda c: c["wsum"], reverse=True),
+        "max":   sorted(cells, key=lambda c: c["score_max"], reverse=True),
+        "gated": sorted([c for c in cells if c["gated_sum"] > 0], key=lambda c: c["gated_sum"], reverse=True),
+    }
 
 
 def _ranked_entry(clip_id, gt, ranked, topk):
@@ -75,7 +95,7 @@ def _ranked_entry(clip_id, gt, ranked, topk):
 
 
 def run(locate_json: str, manifest_json: str, out_dir: str, *, topn_sweep=TOPN_SWEEP, topk=TOPK,
-        write_kmz=True, gt_frame_only=False, log=print) -> dict:
+        write_kmz=True, gt_frame_only=False, gate_frac=0.9, methods=METHODS, log=print) -> dict:
     loc = json.loads(Path(locate_json).expanduser().read_text())
     man = json.loads(Path(manifest_json).expanduser().read_text())
     per_q = loc.get("per_query", {})
@@ -84,12 +104,13 @@ def run(locate_json: str, manifest_json: str, out_dir: str, *, topn_sweep=TOPN_S
     clips = man["clips"]
     results: dict = {"meta": {"locate": locate_json, "manifest": manifest_json,
                               "topn_sweep": list(topn_sweep), "topk": topk,
-                              "gt_frame_only": gt_frame_only,
+                              "gt_frame_only": gt_frame_only, "gate_frac": gate_frac,
+                              "methods": list(methods),
                               "n_clips": len(clips)}, "per_clip": {}, "summary": {}}
-    # per (agg, N): collect top-1 and top-K distances across clips with GT
-    dist1 = {(agg, n): [] for agg in ("sum", "votes") for n in topn_sweep}
-    distk = {(agg, n): [] for agg in ("sum", "votes") for n in topn_sweep}
-    kmz_entries = {(agg, n): [] for agg in ("sum", "votes") for n in topn_sweep}
+    # per (method, N): collect top-1 and top-K distances across clips with GT
+    dist1 = {(agg, n): [] for agg in methods for n in topn_sweep}
+    distk = {(agg, n): [] for agg in methods for n in topn_sweep}
+    kmz_entries = {(agg, n): [] for agg in methods for n in topn_sweep}
 
     n_no_frames = 0
     for clip in clips:
@@ -107,9 +128,9 @@ def run(locate_json: str, manifest_json: str, out_dir: str, *, topn_sweep=TOPN_S
             results["per_clip"][cid] = rec
             continue
         for n in topn_sweep:
-            agg = aggregate_clip(frames_topk, n)
+            agg = aggregate_clip(frames_topk, n, gate_frac=gate_frac)
             rec["by_n"][str(n)] = {}
-            for name in ("sum", "votes"):
+            for name in methods:
                 ranked = [dict(c) for c in agg[name][:topk]]
                 for i, c in enumerate(ranked):
                     c["rank"] = i + 1
@@ -148,7 +169,7 @@ def run(locate_json: str, manifest_json: str, out_dir: str, *, topn_sweep=TOPN_S
     # compact table to stdout
     log(f"{'agg_topN':16} {'n':>4} | " + " ".join(f"t1@{int(t)}" for t in THRESH_M)
         + " | " + " ".join(f"t{topk}@{int(t)}" for t in THRESH_M))
-    for agg in ("sum", "votes"):
+    for agg in methods:
         for n in topn_sweep:
             s = results["summary"][f"{agg}_top{n}"]
             t1 = " ".join(f"{(s['top1'][f'distR@{int(t)}m'] or 0):.3f}" for t in THRESH_M)
@@ -168,9 +189,14 @@ def main(argv=None) -> int:
     ap.add_argument("--gt-frame-only", action="store_true",
                     help="baseline: localize using ONLY each clip's central GT frame (single-frame "
                          "search) instead of aggregating the clip's neighbours")
+    ap.add_argument("--gate", type=float, default=0.9,
+                    help="gated method: keep frames with confidence >= gate*max_conf (0..1)")
+    ap.add_argument("--methods", nargs="+", default=list(METHODS), choices=list(METHODS),
+                    help="which aggregation methods to evaluate")
     args = ap.parse_args(argv)
     run(args.locate, args.manifest, args.out_dir, topn_sweep=tuple(args.topn), topk=args.topk,
-        write_kmz=args.write_kmz, gt_frame_only=args.gt_frame_only)
+        write_kmz=args.write_kmz, gt_frame_only=args.gt_frame_only, gate_frac=args.gate,
+        methods=tuple(args.methods))
     return 0
 
 

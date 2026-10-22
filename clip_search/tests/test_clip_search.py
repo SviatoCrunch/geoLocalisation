@@ -88,6 +88,24 @@ def test_aggregate_sum_vs_votes():
     assert b["lat"] == 1.0 and b["level_m"] == 400          # position from the strongest frame (score 9.0)
 
 
+def test_methods_wsum_max_gated():
+    # frame A: strong (conf 9) sees cell X; frames B,C: weak (conf 1) see cell Y in all
+    frames = [
+        [{"cell_id": "X", "cell_score": 9.0, "lat": 0.0, "lon": 0.0}],
+        [{"cell_id": "Y", "cell_score": 1.0, "lat": 1.0, "lon": 1.0}],
+        [{"cell_id": "Y", "cell_score": 1.0, "lat": 1.0, "lon": 1.0}],
+    ]
+    agg = aggregate_clip(frames, top_n=50, gate_frac=0.9)
+    # votes favours Y (appears twice); score-based (sum/wsum/max) favour X (one strong frame, 9 > 1+1)
+    assert agg["sum"][0]["cell_id"] == "X"
+    assert agg["votes"][0]["cell_id"] == "Y"
+    assert agg["wsum"][0]["cell_id"] == "X"          # 9*9 >> 1*1+1*1
+    assert agg["max"][0]["cell_id"] == "X"           # max 9 > 1
+    # gated keeps only the high-confidence frame (A) → only X survives
+    gated_ids = {c["cell_id"] for c in agg["gated"]}
+    assert gated_ids == {"X"}
+
+
 def test_aggregate_topn_cut():
     # top_n=1 keeps only each frame's #1 cell → B (only in frame where it ranks below A) excluded
     frames = [[{"cell_id": "A", "cell_score": 2.0, "lat": 0, "lon": 0},
