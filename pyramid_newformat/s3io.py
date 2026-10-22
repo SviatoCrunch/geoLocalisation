@@ -9,9 +9,16 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 
 _client = None
+
+# Stream large S3 Range GETs in chunks and log progress (GB + MB/s). Off by default (zero overhead);
+# set NF_S3_PROGRESS=1 to see long reads tick instead of looking hung. Chunk size via NF_S3_CHUNK_MB.
+_S3_PROGRESS = os.environ.get("NF_S3_PROGRESS", "") not in ("", "0")
+_S3_CHUNK = int(os.environ.get("NF_S3_CHUNK_MB", "64")) << 20
+_S3_PROGRESS_MIN = int(os.environ.get("NF_S3_PROGRESS_MIN_MB", "512")) << 20
 
 # ---- optional IO counters (bench.py turns these on; zero overhead otherwise) ----
 COUNTERS = {"get": 0, "head": 0, "retry": 0, "get_bytes": 0, "range_calls": 0}
@@ -148,7 +155,27 @@ def range_get(uri: str, offset: int, length: int, version: str | None = None,
             kw["VersionId"] = version
         elif etag:
             kw["IfMatch"] = etag
-        return client().get_object(**kw)["Body"].read()
+        body = client().get_object(**kw)["Body"]
+        if not (_S3_PROGRESS and length >= _S3_PROGRESS_MIN):
+            return body.read()
+        # chunked read with per-GB progress so a multi-GB Range GET visibly ticks (and a stall is obvious)
+        buf = bytearray(length); mv = memoryview(buf); done = 0
+        t0 = time.time(); next_mark = 1 << 30
+        print(f"[s3] GET {k} range {length/1e9:.2f} GB @off {offset} ...", flush=True)
+        while done < length:
+            chunk = body.read(min(_S3_CHUNK, length - done))
+            if not chunk:
+                break
+            mv[done:done + len(chunk)] = chunk; done += len(chunk)
+            if done >= next_mark:
+                el = time.time() - t0
+                print(f"[s3]   {done/1e9:.1f}/{length/1e9:.1f} GB  {done/1e6/max(el, 1e-9):.0f} MB/s", flush=True)
+                next_mark += 1 << 30
+        el = time.time() - t0
+        print(f"[s3] done {done/1e9:.2f} GB in {el:.0f}s ({done/1e6/max(el, 1e-9):.0f} MB/s)", flush=True)
+        if done != length:
+            raise IOError(f"short S3 read: got {done} of {length} bytes for {k}")
+        return bytes(buf)
     with open(uri, "rb") as f:
         f.seek(offset)
         return f.read(length)

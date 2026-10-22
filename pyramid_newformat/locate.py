@@ -153,8 +153,14 @@ def locate(queries, indices, dataset_dir, *, k_coarse=1000, topk=5, gpu_cells=4,
 
     def load_shard(fname, buf):                               # read this shard's needed cells (coalesced runs)
         cids = [c for _, c in byfile[fname]]
-        _, order = r.read_cells_into(cids, buf)               # buf[:len(order)] filled; order = read order
-        co = [r.read_cell_coords(c) for c in order]
+        bpc = int(r.files.get(fname, {}).get("bytes_per_cell", 0))
+        say(f"[read] shard {fname}: {len(cids)} cells (~{len(cids) * bpc / 1e9:.1f} GB) ...")
+        try:
+            _, order = r.read_cells_into(cids, buf)           # buf[:len(order)] filled; order = read order
+            co = [r.read_cell_coords(c) for c in order]
+        except Exception as e:                                # surface read failures in the log, then re-raise
+            say(f"[read][ERROR] shard {fname}: {type(e).__name__}: {e}")
+            raise
         return order, buf, co
 
     t_read = t_gpu = 0.0
