@@ -37,6 +37,19 @@ def _gallery_tile_ids(gallery_h5: str, city: str):
     return [f"{city}:{k}" for k in keys]
 
 
+def _gallery_latlon(gallery_h5: str, city: str) -> dict:
+    """tile_id ``<city>:<groupkey>`` → (lat, lon) from per-group attrs (cell centroid)."""
+    import h5py
+    out = {}
+    with h5py.File(Path(gallery_h5).expanduser(), "r") as f:
+        for k in f.keys():
+            g = f[k]
+            if hasattr(g, "keys") and "ift_dino" in g:
+                out[f"{city}:{k}"] = (float(g.attrs.get("lat", float("nan"))),
+                                      float(g.attrs.get("lon", float("nan"))))
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True)
@@ -51,6 +64,10 @@ def main(argv=None) -> int:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit", type=int, default=0, help="cap queries (smoke)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--agg-out", default=None,
+                    help="also write an aggregate-ready JSON ({per_query:{qid:{topk:[{cell_id,cell_score,"
+                         "lat,lon}]}}}) consumable by clip_search.aggregate — enables coarse-only clip "
+                         "localization with NO fine store needed")
     args = ap.parse_args(argv)
 
     import numpy as np
@@ -105,26 +122,41 @@ def main(argv=None) -> int:
 
     # Rank in query-batches: scoring all queries at once materializes a (B, m, d) tensor that OOMs the
     # GPU for large B (e.g. thousands of clip frames). Chunk queries; tiles are already chunked inside.
-    order_rows = []
+    kk = min(args.k, len(tile_ids))
+    idx_rows, score_rows = [], []
     with torch.no_grad():
         for i in range(0, len(qids), args.query_chunk):
             qb = qids[i:i + args.query_chunk]
             Qb = torch.stack([model.encode_query(store.tokens(q).to(args.device)) for q in qb])
             Sb = model.score(Qb, galV, tile_chunk=args.eval_chunk)    # (b, n_tiles)
-            order_rows.append(Sb.argsort(dim=1, descending=True).cpu().numpy())
-            del Qb, Sb
+            topv, topi = Sb.topk(kk, dim=1)                           # (b, k) scores + indices
+            idx_rows.append(topi.cpu().numpy()); score_rows.append(topv.cpu().numpy())
+            del Qb, Sb, topv, topi
             if str(args.device).startswith("cuda"):
                 torch.cuda.empty_cache()
-    order = np.concatenate(order_rows, axis=0)
+    order = np.concatenate(idx_rows, axis=0)       # (B, kk) top-kk tile indices (already ranked)
+    scores = np.concatenate(score_rows, axis=0)    # (B, kk) matching scores
 
     out = {"meta": {"ckpt": args.ckpt, "epoch": ck.get("epoch"), "k": args.k,
                     "n_tiles": len(tile_ids), "n_queries": len(qids), "gallery": gpath},
            "shortlist": {}}
     for bi, q in enumerate(qids):
-        topk = [int(r) for r in order[bi][:args.k]]
-        out["shortlist"][q] = {"cells": [tile_ids[r] for r in topk], "dense": []}
+        out["shortlist"][q] = {"cells": [tile_ids[int(r)] for r in order[bi]],
+                               "scores": [float(s) for s in scores[bi]], "dense": []}
     Path(args.out).expanduser().write_text(json.dumps(out), encoding="utf-8")
-    print(f"[ok] shortlist ({len(qids)} q × top-{args.k}) -> {args.out}", flush=True)
+    print(f"[ok] shortlist ({len(qids)} q × top-{kk}) -> {args.out}", flush=True)
+
+    if args.agg_out:                                # coarse-only, aggregate-ready (cell centroid lat/lon)
+        latlon = _gallery_latlon(gpath, gcity)
+        per_query = {}
+        for bi, q in enumerate(qids):
+            topk = []
+            for r, sc in zip(order[bi], scores[bi]):
+                cid = tile_ids[int(r)]; la, lo = latlon.get(cid, (float("nan"), float("nan")))
+                topk.append({"cell_id": cid, "cell_score": float(sc), "lat": la, "lon": lo})
+            per_query[q] = {"topk": topk, "gt": None}
+        Path(args.agg_out).expanduser().write_text(json.dumps({"per_query": per_query}), encoding="utf-8")
+        print(f"[ok] aggregate-ready coarse scores -> {args.agg_out}", flush=True)
     tiles.close(); store.close()
     return 0
 
