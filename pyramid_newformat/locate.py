@@ -124,7 +124,9 @@ def locate(queries, indices, dataset_dir, *, k_coarse=1000, topk=5, gpu_cells=4,
         cells = [c for c in (resolve(x) for x in _candidates(ind, qid)) if c in r.cells][:k_coarse]
         if not cells:
             continue
-        Q[qid] = {"feat": feat.to(dev), "xy": xy, "nq": int(feat.shape[0]), "lat": lat, "lon": lon}
+        # keep query feats on CPU; move per-query to GPU at match time. Holding all query grids resident
+        # OOMs the GPU for large query sets (thousands of clip frames ~ tens of GiB).
+        Q[qid] = {"feat": feat, "xy": xy, "nq": int(feat.shape[0]), "lat": lat, "lon": lon}
         cand[qid] = set(cells)
     if not Q:
         say("[locate] no queries matched")
@@ -189,7 +191,8 @@ def locate(queries, indices, dataset_dir, *, k_coarse=1000, topk=5, gpu_cells=4,
                 grids = torch.from_numpy(crops).to(dev)
                 for q in qset:
                     p = Q[q]
-                    qm, rm, valid = _mutual_nn_padded(p["feat"], grids, p["xy"], kp, dev, match_budget)
+                    qf = p["feat"].to(dev, non_blocking=True)
+                    qm, rm, valid = _mutual_nn_padded(qf, grids, p["xy"], kp, dev, match_budget)
                     counts, _ = estimate_homography_magsacpp_batch(rm, qm, valid, config=cfg, generator=gen,
                                                                    return_counts=True)
                     accq[q][:, :, li_] = (counts.double() / p["nq"] if p["nq"] else counts.double()).view(nc, P).cpu().numpy()
