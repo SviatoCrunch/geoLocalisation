@@ -46,6 +46,8 @@ def main(argv=None) -> int:
     ap.add_argument("--assign", default=None, help="override resolved_config.assign_path (k32.pt)")
     ap.add_argument("--k", type=int, default=100, help="shortlist size (top-K cells)")
     ap.add_argument("--eval-chunk", type=int, default=64)
+    ap.add_argument("--query-chunk", type=int, default=256,
+                    help="score this many queries per GPU batch (lower if CUDA OOM)")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit", type=int, default=0, help="cap queries (smoke)")
     ap.add_argument("--out", required=True)
@@ -101,10 +103,19 @@ def main(argv=None) -> int:
         raise SystemExit(f"no queries for city {args.city!r} found in the store")
     print(f"[queries] {len(qids)}", flush=True)
 
-    Q = torch.stack([model.encode_query(store.tokens(q).to(args.device)) for q in qids])
+    # Rank in query-batches: scoring all queries at once materializes a (B, m, d) tensor that OOMs the
+    # GPU for large B (e.g. thousands of clip frames). Chunk queries; tiles are already chunked inside.
+    order_rows = []
     with torch.no_grad():
-        S = model.score(Q, galV, tile_chunk=args.eval_chunk)          # (B, n_tiles)
-    order = S.argsort(dim=1, descending=True).cpu().numpy()
+        for i in range(0, len(qids), args.query_chunk):
+            qb = qids[i:i + args.query_chunk]
+            Qb = torch.stack([model.encode_query(store.tokens(q).to(args.device)) for q in qb])
+            Sb = model.score(Qb, galV, tile_chunk=args.eval_chunk)    # (b, n_tiles)
+            order_rows.append(Sb.argsort(dim=1, descending=True).cpu().numpy())
+            del Qb, Sb
+            if str(args.device).startswith("cuda"):
+                torch.cuda.empty_cache()
+    order = np.concatenate(order_rows, axis=0)
 
     out = {"meta": {"ckpt": args.ckpt, "epoch": ck.get("epoch"), "k": args.k,
                     "n_tiles": len(tile_ids), "n_queries": len(qids), "gallery": gpath},
