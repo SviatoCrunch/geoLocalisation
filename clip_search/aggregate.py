@@ -75,7 +75,7 @@ def _ranked_entry(clip_id, gt, ranked, topk):
 
 
 def run(locate_json: str, manifest_json: str, out_dir: str, *, topn_sweep=TOPN_SWEEP, topk=TOPK,
-        write_kmz=True, log=print) -> dict:
+        write_kmz=True, gt_frame_only=False, log=print) -> dict:
     loc = json.loads(Path(locate_json).expanduser().read_text())
     man = json.loads(Path(manifest_json).expanduser().read_text())
     per_q = loc.get("per_query", {})
@@ -84,6 +84,7 @@ def run(locate_json: str, manifest_json: str, out_dir: str, *, topn_sweep=TOPN_S
     clips = man["clips"]
     results: dict = {"meta": {"locate": locate_json, "manifest": manifest_json,
                               "topn_sweep": list(topn_sweep), "topk": topk,
+                              "gt_frame_only": gt_frame_only,
                               "n_clips": len(clips)}, "per_clip": {}, "summary": {}}
     # per (agg, N): collect top-1 and top-K distances across clips with GT
     dist1 = {(agg, n): [] for agg in ("sum", "votes") for n in topn_sweep}
@@ -94,7 +95,11 @@ def run(locate_json: str, manifest_json: str, out_dir: str, *, topn_sweep=TOPN_S
     for clip in clips:
         cid = clip["clip_id"]
         gt = [clip["gt_lat"], clip["gt_lon"]]
-        frames_topk = [per_q[f["qid"]]["topk"] for f in clip.get("frames", []) if f["qid"] in per_q]
+        frames = clip.get("frames", [])
+        if gt_frame_only:                              # baseline: only the central GT frame (1-frame search)
+            gfi = clip.get("gt_frame_index")
+            frames = [f for f in frames if f.get("frame_index") == gfi] or frames[:1]
+        frames_topk = [per_q[f["qid"]]["topk"] for f in frames if f["qid"] in per_q]
         n_hit = len(frames_topk)
         rec = {"n_frames": len(clip.get("frames", [])), "n_frames_scored": n_hit, "gt": gt, "by_n": {}}
         if n_hit == 0:
@@ -160,9 +165,12 @@ def main(argv=None) -> int:
     ap.add_argument("--topn", type=int, nargs="+", default=list(TOPN_SWEEP), help="per-frame cut sweep")
     ap.add_argument("--topk", type=int, default=TOPK, help="final cells per clip (→ KMZ)")
     ap.add_argument("--no-kmz", dest="write_kmz", action="store_false")
+    ap.add_argument("--gt-frame-only", action="store_true",
+                    help="baseline: localize using ONLY each clip's central GT frame (single-frame "
+                         "search) instead of aggregating the clip's neighbours")
     args = ap.parse_args(argv)
     run(args.locate, args.manifest, args.out_dir, topn_sweep=tuple(args.topn), topk=args.topk,
-        write_kmz=args.write_kmz)
+        write_kmz=args.write_kmz, gt_frame_only=args.gt_frame_only)
     return 0
 
 
