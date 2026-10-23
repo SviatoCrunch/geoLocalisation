@@ -324,6 +324,62 @@ class SingleFrameLocator:
         recs = self._rerank(tokens, xy, [ti for ti, _ in coarse], self.rerank_topk or top)
         return [self._match_reranked(rec, r) for r, rec in enumerate(recs, 1)]
 
+    # -- fine rerank for a GROUP of frames: each cell of the UNION is read/built ONCE and matched
+    #    against ALL frames in one batched fp16 pass (server _score_cell_multiframe compute); every
+    #    frame then ranks ONLY its own coarse candidates → per-frame top-K, shared compute --
+    def _rerank_group(self, tokens_list, xy_list, cand_tis_list, topk: int) -> list[list[dict]]:
+        import torch
+
+        from .rerank.reranker import (_MIN_MATCHES, _mpp_config, _prefetched_cells,
+                                       _score_cell_multiframe)
+        base = self._load_store()
+        store = base if self.store_format == "packed" else _PackedLikeStore(base)
+        per_frame_ids = [[f"{self.city}:{self.keys[ti]}" for ti in tis] for tis in cand_tis_list]
+        union = list(dict.fromkeys(cid for ids in per_frame_ids for cid in ids if store.has(cid)))
+
+        cfg, device, gen = _mpp_config(self.rerank_reproj)
+        mdtype = torch.float16 if str(device) != "cpu" else torch.float32
+        q_norm = [torch.nn.functional.normalize(t.detach().to(device).to(mdtype), dim=-1)
+                  for t in tokens_list]
+        q_xys = [np.asarray(x, np.float64) for x in xy_list]
+        minm = _MIN_MATCHES["homography"]
+
+        scored: dict = {}                                        # cell_id -> per-frame [(cs,lat,lon,lvl)]
+        for cid, cd in _prefetched_cells(store, union):
+            if cd is None:
+                continue
+            scored[cid] = _score_cell_multiframe(cd, q_norm, q_xys, self.rerank_reproj, "sum",
+                                                 cfg, device, gen, minm, mdtype)
+        out = []
+        for f in range(len(tokens_list)):
+            recs = []
+            for cid in dict.fromkeys(per_frame_ids[f]):          # this frame's OWN candidates
+                if cid in scored:
+                    cs, lat, lon, lvl = scored[cid][f]
+                    recs.append({"cell_id": cid, "cell_score": cs, "lat": lat, "lon": lon,
+                                 "level_m": lvl})
+            recs.sort(key=lambda r: r["cell_score"], reverse=True)
+            recs = recs[:topk]
+            for rank, r in enumerate(recs, 1):
+                r["rank"] = rank
+            out.append(recs)
+        return out
+
+    def localize_group(self, frames_bgr: list, *, top: int | None = None) -> list[list[dict]]:
+        """Localize G frames together (shared cell reads + batched GPU match). Returns a per-frame
+        list of top-K match dicts — each frame keeps its OWN answer. For G==1 this equals localize()."""
+        top = int(top or self.rerank_topk or 10)
+        tokens_list, xy_list, cand_list = [], [], []
+        for img in frames_bgr:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            coarse, tokens, xy = self._topk_full(rgb, self.rerank_k)
+            tokens_list.append(tokens)
+            xy_list.append(xy)
+            cand_list.append([ti for ti, _ in coarse])
+        recs_per_frame = self._rerank_group(tokens_list, xy_list, cand_list, self.rerank_topk or top)
+        return [[self._match_reranked(rec, r) for r, rec in enumerate(recs, 1)]
+                for recs in recs_per_frame]
+
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -354,6 +410,9 @@ def main(argv=None) -> int:
                     help="torch.cuda.empty_cache() every N frames (0=never) — curbs VRAM fragmentation")
     ap.add_argument("--min-free-gb", type=float, default=10.0,
                     help="abort the batch if free disk on the cache/root drops below this (anti-hang guard)")
+    ap.add_argument("--frame-batch", type=int, default=1,
+                    help="localize G frames per group (shared cell reads + batched GPU match) for speed; "
+                         "each frame still keeps its own top-K. 1 = one frame at a time.")
     ap.add_argument("--index-cache", default=None, help="optional path to cache/reuse the gallery V")
     ap.add_argument("--rebuild", action="store_true", help="force-rebuild the gallery V cache")
     ap.add_argument("--out", default=None,
@@ -383,68 +442,89 @@ def main(argv=None) -> int:
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    # tqdm time log — falls back to plain iteration if tqdm is absent
+    # tqdm time log — falls back to plain prints if tqdm is absent
     try:
         from tqdm import tqdm
-        bar = tqdm(images, unit="frame", dynamic_ncols=True)
+        bar = tqdm(total=len(images), unit="frame", dynamic_ncols=True)
         emit = tqdm.write
     except Exception:                                    # noqa: BLE001
-        bar, emit = images, print
+        bar, emit = None, print
+
+    def _emit(msg):
+        (emit if bar else print)(msg)
 
     guard_path = loc.cache_dir if loc.store_format != "packed" else "/"
+    g_size = max(1, args.frame_batch)
     results = []
+    done = 0
     t_start = time.perf_counter()
-    for n, path in enumerate(bar, 1):
-        # anti-hang guard: stop cleanly before the cell cache fills the disk (what hung the box before)
+    for c0 in range(0, len(images), g_size):
+        chunk = images[c0:c0 + g_size]
+        # anti-hang guard: stop cleanly before the disk fills (what hung the box before)
         if args.min_free_gb > 0:
             try:
                 free_gb = shutil.disk_usage(guard_path).free / 1e9
             except OSError:
                 free_gb = 1e9
             if free_gb < args.min_free_gb:
-                emit("ABORT: free disk %.1fGB < --min-free-gb %.1f (stopping before the box hangs)"
-                     % (free_gb, args.min_free_gb))
+                _emit("ABORT: free disk %.1fGB < --min-free-gb %.1f" % (free_gb, args.min_free_gb))
                 break
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
-        if img is None:
-            emit("[%d/%d] SKIP unreadable %s" % (n, len(images), path))
-            results.append({"image": path, "error": "unreadable"})
+        imgs, paths_ok = [], []
+        for p in chunk:
+            im = cv2.imread(p, cv2.IMREAD_COLOR)
+            if im is None:
+                _emit("SKIP unreadable %s" % p)
+                results.append({"image": p, "error": "unreadable"})
+            else:
+                imgs.append(im)
+                paths_ok.append(p)
+        if not imgs:
+            if bar:
+                bar.update(len(chunk))
             continue
-        gt = None if args.no_gt else _gt_latlon_from_name(path)
         t0 = time.perf_counter()
         try:
-            matches = loc.localize(img)
-        except Exception as e:                           # noqa: BLE001 — one bad frame must not kill the batch
-            emit("[%d/%d] ERROR %s: %s" % (n, len(images), path, e))
-            results.append({"image": path, "error": str(e)})
+            per_frame = loc.localize_group(imgs) if g_size > 1 else [loc.localize(imgs[0])]
+        except Exception as e:                           # noqa: BLE001 — one bad group must not kill the batch
+            _emit("ERROR group @%d (%d frames): %s" % (c0, len(imgs), e))
+            for p in paths_ok:
+                results.append({"image": p, "error": str(e)})
+            if bar:
+                bar.update(len(chunk))
             continue
-        dt = time.perf_counter() - t0
+        grp_s = time.perf_counter() - t0
+        per_s = grp_s / len(imgs)
         ga, gr, l1 = _vram_load()
-        rec = {"image": path, "seconds": round(dt, 3), "gpu_alloc_gb": round(ga, 2),
-               "gpu_reserved_gb": round(gr, 2), "load1": round(l1, 2), "matches": matches}
-        if gt is not None:
-            rec["gt"] = {"lat": gt[0], "lon": gt[1]}
-            for m in matches:
-                m["dist_m_to_gt"] = round(_haversine_m(gt[0], gt[1], m["coordinates"]["lat"],
-                                                       m["coordinates"]["lon"]), 1)
-            rec["top1_err_m"] = matches[0]["dist_m_to_gt"] if matches else None
-        results.append(rec)
-        top = matches[0] if matches else None
-        emit("[%d/%d] %s  %.1fs  vram=%.1f/%.1fGB load=%.1f%s%s" % (
-            n, len(images), Path(path).name, dt, ga, gr, l1,
-            ("  top=%s (%.4f) %.5f,%.5f L%gm" % (
-                top["tile_key"], top["similarity"], top["coordinates"]["lat"],
-                top["coordinates"]["lon"], top["level_m"]) if top else "  (no matches)"),
-            ("  err=%.0fm" % rec["top1_err_m"]) if rec.get("top1_err_m") is not None else ""))
-        if hasattr(bar, "set_postfix_str"):
-            bar.set_postfix_str("%.1fs vram=%.1fGB load=%.1f%s" % (
-                dt, gr, l1,
-                (" err=%.0fm" % rec["top1_err_m"]) if rec.get("top1_err_m") is not None else ""))
-        if out_dir:
-            (out_dir / (Path(path).stem + ".json")).write_text(
-                json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
-        if args.empty_cache_every and n % args.empty_cache_every == 0 and torch.cuda.is_available():
+        for p, matches in zip(paths_ok, per_frame):
+            done += 1
+            gt = None if args.no_gt else _gt_latlon_from_name(p)
+            rec = {"image": p, "seconds": round(per_s, 3), "group_seconds": round(grp_s, 3),
+                   "group_size": len(imgs), "gpu_alloc_gb": round(ga, 2),
+                   "gpu_reserved_gb": round(gr, 2), "load1": round(l1, 2), "matches": matches}
+            if gt is not None:
+                rec["gt"] = {"lat": gt[0], "lon": gt[1]}
+                for m in matches:
+                    m["dist_m_to_gt"] = round(_haversine_m(gt[0], gt[1], m["coordinates"]["lat"],
+                                                           m["coordinates"]["lon"]), 1)
+                rec["top1_err_m"] = matches[0]["dist_m_to_gt"] if matches else None
+            results.append(rec)
+            top = matches[0] if matches else None
+            _emit("[%d/%d] %s  %.1fs/f%s%s" % (
+                done, len(images), Path(p).name, per_s,
+                ("  top=%s (%.4f) %.5f,%.5f L%gm" % (
+                    top["tile_key"], top["similarity"], top["coordinates"]["lat"],
+                    top["coordinates"]["lon"], top["level_m"]) if top else "  (no matches)"),
+                ("  err=%.0fm" % rec["top1_err_m"]) if rec.get("top1_err_m") is not None else ""))
+            if out_dir:
+                (out_dir / (Path(p).stem + ".json")).write_text(
+                    json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
+        if bar:
+            bar.update(len(chunk))
+            bar.set_postfix_str("G=%d %.1fs/f vram=%.1fGB load=%.1f" % (len(imgs), per_s, gr, l1))
+        if args.empty_cache_every and torch.cuda.is_available():
             torch.cuda.empty_cache()
+    if bar:
+        bar.close()
 
     summary = _summarize(results, args.topk)
     summary["wall_s"] = round(time.perf_counter() - t_start, 1)
