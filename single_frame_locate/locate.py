@@ -338,7 +338,8 @@ class SingleFrameLocator:
         union = list(dict.fromkeys(cid for ids in per_frame_ids for cid in ids if store.has(cid)))
 
         cfg, device, gen = _mpp_config(self.rerank_reproj)
-        mdtype = torch.float16 if str(device) != "cpu" else torch.float32
+        # match the single-frame paths: fp16 matmul like the server by default; fp32 when --no-fp16-match.
+        mdtype = torch.float16 if (self.match_fp16 and str(device) != "cpu") else torch.float32
         q_norm = [torch.nn.functional.normalize(t.detach().to(device).to(mdtype), dim=-1)
                   for t in tokens_list]
         q_xys = [np.asarray(x, np.float64) for x in xy_list]
