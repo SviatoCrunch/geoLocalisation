@@ -82,11 +82,15 @@ class SingleFrameLocator:
                  device: str = "auto", city: str = "kram", rerank_k: int = 100,
                  rerank_topk: int = 10, rerank_reproj: float = 2.0, chunk: int = 256,
                  index_cache: str | None = None, rebuild: bool = False,
-                 store_format: str = "packed"):
+                 store_format: str = "packed", cache_dir: str = "/tmp/cellcache",
+                 cache_cap: int = 256):
         self.device = _resolve_device(device)
         # the batched GPU MAGSAC++ reads its device from this env var (reranker._mpp_config);
         # pin it to the same device so coarse + fine run together on the GPU, as on the server.
         os.environ.setdefault("SIAM_RERANK_DEVICE", str(self.device))
+        # per-cell path verifier = GPU MAGSAC++ (the packed path always uses torch internally);
+        # keep the two paths numerically equivalent for a single frame.
+        os.environ.setdefault("SIAM_RERANK_VERIFY", "torch")
 
         def _env(k, d=None):
             if k == "SIAM_ASSIGN_PATH" and assign_path:
@@ -103,6 +107,8 @@ class SingleFrameLocator:
         self.rerank_reproj = float(rerank_reproj)
         self.store_path = store
         self.store_format = store_format
+        self.cache_dir = cache_dir
+        self.cache_cap = int(cache_cap)
         self._store = None
 
         self._build_or_load_gallery(map_h5, index_cache, rebuild)
@@ -129,9 +135,10 @@ class SingleFrameLocator:
             if self.store_format == "packed":
                 from .rerank.newformat import NewFormatCellStore
                 self._store = NewFormatCellStore(self.store_path)
-            else:
+            else:                                            # per-cell H5 store (local dir or s3://…/_index.json)
                 from .rerank import CellStore
-                self._store = CellStore(self.store_path)
+                self._store = CellStore(self.store_path, cache_dir=self.cache_dir,
+                                        cache_cap=self.cache_cap)
         return self._store
 
     # -- coarse: one DINO forward → top-K candidate cells + the query token grid --
@@ -142,14 +149,23 @@ class SingleFrameLocator:
         order = np.argsort(-sims)[:top]
         return [(int(i), float(sims[i])) for i in order], tokens, xy
 
-    # -- fine: GPU MAGSAC++ rerank of the candidate cells (single frame = F=1 list) --
+    # -- fine: GPU MAGSAC++ rerank of the candidate cells --
     def _rerank(self, tokens, xy, cand_tis: list[int], topk: int) -> list[dict]:
-        from .rerank import rerank_multiframe
         store = self._load_store()
         cell_ids = [f"{self.city}:{self.keys[ti]}" for ti in cand_tis]
-        return rerank_multiframe([tokens.detach()], [np.asarray(xy, np.float64)], cell_ids, store,
-                                 reproj_thresh=self.rerank_reproj, topk=topk,
-                                 level_agg="sum", cell_agg="mean")
+        if self.store_format == "packed":
+            # EXACT server path: packed /features block + batched multi-frame GPU MAGSAC++ (here F=1).
+            from .rerank import rerank_multiframe
+            return rerank_multiframe([tokens.detach()], [np.asarray(xy, np.float64)], cell_ids, store,
+                                     reproj_thresh=self.rerank_reproj, topk=topk,
+                                     level_agg="sum", cell_agg="mean")
+        # per-cell store: single-frame rerank() with the torch (GPU MAGSAC++) verifier — same math,
+        # same matcher/magsac/aggregation as the packed path; reads per-cell grids instead of a block.
+        # q_feat must be CPU (per-cell CellData.grid returns CPU tensors; matched_coords matmuls on CPU).
+        from .rerank import rerank as rerank_single
+        return rerank_single(tokens.detach().to("cpu").float(), np.asarray(xy, np.float64), cell_ids,
+                             store, reproj_thresh=self.rerank_reproj, topk=topk,
+                             level_agg="sum", cell_agg="mean")
 
     def _match_reranked(self, rec: dict, rank: int) -> dict:
         lat, lon = float(rec["lat"]), float(rec["lon"])
@@ -187,7 +203,13 @@ def main(argv=None) -> int:
     ap.add_argument("--topk", type=int, default=10, help="final reranked cell count")
     ap.add_argument("--reproj", type=float, default=2.0, help="MAGSAC inlier reproj threshold (px)")
     ap.add_argument("--device", default="auto", help="auto|cuda|cpu|mps")
-    ap.add_argument("--store-format", default="packed", choices=["packed", "percell"])
+    ap.add_argument("--store-format", default="packed", choices=["packed", "percell"],
+                    help="packed = /features GPU block (exact server path); percell = per-cell H5 "
+                         "store (local dir or s3://…/_index.json), single-frame rerank, same GPU math")
+    ap.add_argument("--cache-dir", default="/tmp/cellcache",
+                    help="percell-S3 only: local LRU cache dir for downloaded cells")
+    ap.add_argument("--cache-cap", type=int, default=256,
+                    help="percell-S3 only: max cells kept in the local cache (bounds disk)")
     ap.add_argument("--index-cache", default=None, help="optional path to cache/reuse the gallery V")
     ap.add_argument("--rebuild", action="store_true", help="force-rebuild the gallery V cache")
     ap.add_argument("--out", default=None,
@@ -209,7 +231,8 @@ def main(argv=None) -> int:
                              device=args.device, city=args.city, rerank_k=args.k,
                              rerank_topk=args.topk, rerank_reproj=args.reproj,
                              index_cache=args.index_cache, rebuild=args.rebuild,
-                             store_format=args.store_format)
+                             store_format=args.store_format, cache_dir=args.cache_dir,
+                             cache_cap=args.cache_cap)
     out_dir = Path(args.out_dir) if args.out_dir else None
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
