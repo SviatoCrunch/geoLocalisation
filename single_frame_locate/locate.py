@@ -37,6 +37,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -157,6 +158,54 @@ def _print_summary(s: dict) -> None:
                 print("  " + "  ".join(row))
 
 
+# ── GPU / load monitoring ───────────────────────────────────────────────────
+
+def _vram_load():
+    """(gpu_alloc_GB, gpu_reserved_GB, load1) — cheap per-frame GPU + host-load probe."""
+    a = r = 0.0
+    if torch.cuda.is_available():
+        a = torch.cuda.memory_allocated() / 1e9
+        r = torch.cuda.memory_reserved() / 1e9
+    try:
+        l1 = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        l1 = -1.0
+    return a, r, l1
+
+
+# ── per-cell store → packed-block view (run the server fp16 fine path on per-cell data) ──
+
+class _BlockCell:
+    """Wrap a per-cell CellData so it exposes a packed ``(P, L, H, W, D)`` fp16 ``_block`` — the only
+    extra thing ``rerank_multiframe`` needs. Lets the per-cell (S3) store run the EXACT server fp16
+    fine path (fp16 batched match + batched GPU MAGSAC++) over identical token data."""
+
+    def __init__(self, cd):
+        self.cell_id = cd.cell_id
+        self.lat, self.lon = cd.lat, cd.lon
+        self.levels, self.n_pos = cd.levels, cd.n_pos
+        h, w, d = cd.grid(0, self.levels[0]).shape
+        blk = np.empty((self.n_pos, len(self.levels), h, w, d), np.float16)
+        for i in range(self.n_pos):
+            for j, lv in enumerate(self.levels):
+                blk[i, j] = cd.grid(i, lv).numpy().astype(np.float16)
+        self._block = blk
+
+
+class _PackedLikeStore:
+    """Per-cell store → packed-block view so ``rerank_multiframe`` runs over it unchanged."""
+
+    def __init__(self, base):
+        self._base = base
+        self.cells = base.cells
+
+    def has(self, cid):
+        return self._base.has(cid)
+
+    def cell(self, cid):
+        return _BlockCell(self._base.cell(cid))
+
+
 class SingleFrameLocator:
     """Lazy load of the e2c coarse model + gallery V + packed pyramid store; localize one frame.
 
@@ -169,7 +218,7 @@ class SingleFrameLocator:
                  rerank_topk: int = 10, rerank_reproj: float = 2.0, chunk: int = 256,
                  index_cache: str | None = None, rebuild: bool = False,
                  store_format: str = "packed", cache_dir: str = "/tmp/cellcache",
-                 cache_cap: int = 256):
+                 cache_cap: int = 256, match_fp16: bool = True):
         self.device = _resolve_device(device)
         # the batched GPU MAGSAC++ reads its device from this env var (reranker._mpp_config);
         # pin it to the same device so coarse + fine run together on the GPU, as on the server.
@@ -195,6 +244,7 @@ class SingleFrameLocator:
         self.store_format = store_format
         self.cache_dir = cache_dir
         self.cache_cap = int(cache_cap)
+        self.match_fp16 = bool(match_fp16)
         self._store = None
 
         self._build_or_load_gallery(map_h5, index_cache, rebuild)
@@ -239,15 +289,17 @@ class SingleFrameLocator:
     def _rerank(self, tokens, xy, cand_tis: list[int], topk: int) -> list[dict]:
         store = self._load_store()
         cell_ids = [f"{self.city}:{self.keys[ti]}" for ti in cand_tis]
-        if self.store_format == "packed":
-            # EXACT server path: packed /features block + batched multi-frame GPU MAGSAC++ (here F=1).
+        if self.store_format == "packed" or self.match_fp16:
+            # SERVER-EXACT fine path: fp16 batched match + batched GPU MAGSAC++ (rerank_multiframe, F=1).
+            # Packed store feeds its /features block directly; a per-cell store is wrapped so each cell
+            # exposes a packed fp16 _block (same token data) — identical fp16 compute to the server.
             from .rerank import rerank_multiframe
-            return rerank_multiframe([tokens.detach()], [np.asarray(xy, np.float64)], cell_ids, store,
+            s = store if self.store_format == "packed" else _PackedLikeStore(store)
+            return rerank_multiframe([tokens.detach()], [np.asarray(xy, np.float64)], cell_ids, s,
                                      reproj_thresh=self.rerank_reproj, topk=topk,
                                      level_agg="sum", cell_agg="mean")
-        # per-cell store: single-frame rerank() with the torch (GPU MAGSAC++) verifier — same math,
-        # same matcher/magsac/aggregation as the packed path; reads per-cell grids instead of a block.
-        # q_feat must be CPU (per-cell CellData.grid returns CPU tensors; matched_coords matmuls on CPU).
+        # fp32 per-cell fallback (--no-fp16-match): single-frame rerank() with the torch verifier —
+        # same MAGSAC math, but the mutual-NN match is fp32 (matched_coords upcasts). q_feat on CPU.
         from .rerank import rerank as rerank_single
         return rerank_single(tokens.detach().to("cpu").float(), np.asarray(xy, np.float64), cell_ids,
                              store, reproj_thresh=self.rerank_reproj, topk=topk,
@@ -296,6 +348,12 @@ def main(argv=None) -> int:
                     help="percell-S3 only: local LRU cache dir for downloaded cells")
     ap.add_argument("--cache-cap", type=int, default=256,
                     help="percell-S3 only: max cells kept in the local cache (bounds disk)")
+    ap.add_argument("--no-fp16-match", action="store_true",
+                    help="use fp32 mutual-NN matching (default = fp16, exactly like the server)")
+    ap.add_argument("--empty-cache-every", type=int, default=25,
+                    help="torch.cuda.empty_cache() every N frames (0=never) — curbs VRAM fragmentation")
+    ap.add_argument("--min-free-gb", type=float, default=10.0,
+                    help="abort the batch if free disk on the cache/root drops below this (anti-hang guard)")
     ap.add_argument("--index-cache", default=None, help="optional path to cache/reuse the gallery V")
     ap.add_argument("--rebuild", action="store_true", help="force-rebuild the gallery V cache")
     ap.add_argument("--out", default=None,
@@ -320,17 +378,36 @@ def main(argv=None) -> int:
                              rerank_topk=args.topk, rerank_reproj=args.reproj,
                              index_cache=args.index_cache, rebuild=args.rebuild,
                              store_format=args.store_format, cache_dir=args.cache_dir,
-                             cache_cap=args.cache_cap)
+                             cache_cap=args.cache_cap, match_fp16=not args.no_fp16_match)
     out_dir = Path(args.out_dir) if args.out_dir else None
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    # tqdm time log — falls back to plain iteration if tqdm is absent
+    try:
+        from tqdm import tqdm
+        bar = tqdm(images, unit="frame", dynamic_ncols=True)
+        emit = tqdm.write
+    except Exception:                                    # noqa: BLE001
+        bar, emit = images, print
+
+    guard_path = loc.cache_dir if loc.store_format != "packed" else "/"
     results = []
     t_start = time.perf_counter()
-    for n, path in enumerate(images, 1):
+    for n, path in enumerate(bar, 1):
+        # anti-hang guard: stop cleanly before the cell cache fills the disk (what hung the box before)
+        if args.min_free_gb > 0:
+            try:
+                free_gb = shutil.disk_usage(guard_path).free / 1e9
+            except OSError:
+                free_gb = 1e9
+            if free_gb < args.min_free_gb:
+                emit("ABORT: free disk %.1fGB < --min-free-gb %.1f (stopping before the box hangs)"
+                     % (free_gb, args.min_free_gb))
+                break
         img = cv2.imread(path, cv2.IMREAD_COLOR)
         if img is None:
-            print(f"[{n}/{len(images)}] SKIP unreadable {path}", flush=True)
+            emit("[%d/%d] SKIP unreadable %s" % (n, len(images), path))
             results.append({"image": path, "error": "unreadable"})
             continue
         gt = None if args.no_gt else _gt_latlon_from_name(path)
@@ -338,11 +415,13 @@ def main(argv=None) -> int:
         try:
             matches = loc.localize(img)
         except Exception as e:                           # noqa: BLE001 — one bad frame must not kill the batch
-            print(f"[{n}/{len(images)}] ERROR {path}: {e}", flush=True)
+            emit("[%d/%d] ERROR %s: %s" % (n, len(images), path, e))
             results.append({"image": path, "error": str(e)})
             continue
         dt = time.perf_counter() - t0
-        rec = {"image": path, "seconds": round(dt, 3), "matches": matches}
+        ga, gr, l1 = _vram_load()
+        rec = {"image": path, "seconds": round(dt, 3), "gpu_alloc_gb": round(ga, 2),
+               "gpu_reserved_gb": round(gr, 2), "load1": round(l1, 2), "matches": matches}
         if gt is not None:
             rec["gt"] = {"lat": gt[0], "lon": gt[1]}
             for m in matches:
@@ -351,16 +430,21 @@ def main(argv=None) -> int:
             rec["top1_err_m"] = matches[0]["dist_m_to_gt"] if matches else None
         results.append(rec)
         top = matches[0] if matches else None
-        print("[%d/%d] %s → %d matches  %.1fs%s%s" % (
-            n, len(images), Path(path).name, len(matches), dt,
+        emit("[%d/%d] %s  %.1fs  vram=%.1f/%.1fGB load=%.1f%s%s" % (
+            n, len(images), Path(path).name, dt, ga, gr, l1,
             ("  top=%s (%.4f) %.5f,%.5f L%gm" % (
                 top["tile_key"], top["similarity"], top["coordinates"]["lat"],
-                top["coordinates"]["lon"], top["level_m"]) if top else ""),
-            ("  err=%.0fm" % rec["top1_err_m"]) if rec.get("top1_err_m") is not None else ""),
-            flush=True)
+                top["coordinates"]["lon"], top["level_m"]) if top else "  (no matches)"),
+            ("  err=%.0fm" % rec["top1_err_m"]) if rec.get("top1_err_m") is not None else ""))
+        if hasattr(bar, "set_postfix_str"):
+            bar.set_postfix_str("%.1fs vram=%.1fGB load=%.1f%s" % (
+                dt, gr, l1,
+                (" err=%.0fm" % rec["top1_err_m"]) if rec.get("top1_err_m") is not None else ""))
         if out_dir:
             (out_dir / (Path(path).stem + ".json")).write_text(
                 json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
+        if args.empty_cache_every and n % args.empty_cache_every == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     summary = _summarize(results, args.topk)
     summary["wall_s"] = round(time.perf_counter() - t_start, 1)
