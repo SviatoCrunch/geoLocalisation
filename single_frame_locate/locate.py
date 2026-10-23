@@ -174,7 +174,10 @@ class SingleFrameLocator:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--image", required=True, help="query drone frame (any cv2-readable image)")
+    ap.add_argument("--image", action="append", default=[],
+                    help="query drone frame (repeatable). Omit to use --images-dir.")
+    ap.add_argument("--images-dir", default=None,
+                    help="directory of query frames — localize ALL images in it (jpg/jpeg/png, recursive).")
     ap.add_argument("--ckpt", required=True, help="e2c checkpoint (resolved_config + model)")
     ap.add_argument("--map-h5", required=True, help="map token gallery H5 (map_extract d1024)")
     ap.add_argument("--assign", required=True, help="recast assign dict k32.pt (SIAM_ASSIGN_PATH)")
@@ -187,25 +190,61 @@ def main(argv=None) -> int:
     ap.add_argument("--store-format", default="packed", choices=["packed", "percell"])
     ap.add_argument("--index-cache", default=None, help="optional path to cache/reuse the gallery V")
     ap.add_argument("--rebuild", action="store_true", help="force-rebuild the gallery V cache")
-    ap.add_argument("--out", default=None, help="write JSON here (default: stdout)")
+    ap.add_argument("--out", default=None,
+                    help="write the combined JSON (list of per-image results) here (default: stdout)")
+    ap.add_argument("--out-dir", default=None,
+                    help="also write one <stem>.json per image into this dir")
     args = ap.parse_args(argv)
 
-    img = cv2.imread(args.image, cv2.IMREAD_COLOR)
-    if img is None:
-        raise SystemExit(f"cannot read image: {args.image}")
+    images = list(args.image)
+    if args.images_dir:
+        exts = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
+        images += [str(p) for p in sorted(Path(args.images_dir).rglob("*")) if p.suffix in exts]
+    images = list(dict.fromkeys(images))                 # dedup, keep order
+    if not images:
+        raise SystemExit("no query frames — pass --image <f> (repeatable) and/or --images-dir <dir>")
 
+    # load the model + gallery + store ONCE, then localize every frame
     loc = SingleFrameLocator(args.ckpt, args.map_h5, args.assign, store=args.store,
                              device=args.device, city=args.city, rerank_k=args.k,
                              rerank_topk=args.topk, rerank_reproj=args.reproj,
                              index_cache=args.index_cache, rebuild=args.rebuild,
                              store_format=args.store_format)
-    matches = loc.localize(img)
-    out = {"image": args.image, "city": args.city, "k": args.k, "topk": args.topk,
-           "device": loc.device, "matches": matches}
+    out_dir = Path(args.out_dir) if args.out_dir else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    results = []
+    for n, path in enumerate(images, 1):
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            print(f"[{n}/{len(images)}] SKIP unreadable {path}")
+            results.append({"image": path, "error": "unreadable"})
+            continue
+        try:
+            matches = loc.localize(img)
+        except Exception as e:                           # noqa: BLE001 — one bad frame must not kill the batch
+            print(f"[{n}/{len(images)}] ERROR {path}: {e}")
+            results.append({"image": path, "error": str(e)})
+            continue
+        rec = {"image": path, "matches": matches}
+        results.append(rec)
+        top = matches[0] if matches else None
+        print("[%d/%d] %s → %d matches%s" % (
+            n, len(images), Path(path).name, len(matches),
+            ("  top=%s (%.4f) %.5f,%.5f L%gm" % (
+                top["tile_key"], top["similarity"], top["coordinates"]["lat"],
+                top["coordinates"]["lon"], top["level_m"]) if top else "")))
+        if out_dir:
+            (out_dir / (Path(path).stem + ".json")).write_text(
+                json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    out = {"city": args.city, "k": args.k, "topk": args.topk, "device": loc.device,
+           "n_images": len(images), "results": results}
     text = json.dumps(out, indent=2, ensure_ascii=False)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
-        print(f"wrote {len(matches)} matches → {args.out}")
+        print(f"wrote {len(results)} results → {args.out}")
     else:
         print(text)
     return 0
