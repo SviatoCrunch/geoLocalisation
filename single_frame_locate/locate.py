@@ -34,8 +34,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -69,6 +72,89 @@ def _resolve_device(spec: str):
             return "mps"
         return "cpu"
     return spec
+
+
+# ── metrics + timing helpers ────────────────────────────────────────────────
+
+def _haversine_m(lat1, lon1, lat2, lon2) -> float:
+    """Great-circle distance in metres between two lat/lon points."""
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi, dlmb = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+_LAT_RANGE, _LON_RANGE = (44.0, 53.0), (20.0, 45.0)      # Ukraine AO sanity window
+
+
+def _gt_latlon_from_name(path: str):
+    """GT lat/lon from a ``<id>_<lat>_<lon>.jpg`` filename (the GT_flat convention) — the first
+    adjacent float pair that falls in the AO lat/lon window. None when no plausible pair is found."""
+    floats = [float(t) for t in re.findall(r"-?\d+\.\d+", Path(path).stem)]
+    for i in range(len(floats) - 1):
+        lat, lon = floats[i], floats[i + 1]
+        if _LAT_RANGE[0] <= lat <= _LAT_RANGE[1] and _LON_RANGE[0] <= lon <= _LON_RANGE[1]:
+            return lat, lon
+    return None
+
+
+_DISTS = (250, 500, 1000)                                 # recall distance bins (m)
+_KS = (1, 5, 10)                                          # top-K bins
+
+
+def _median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if not n:
+        return None
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
+
+
+def _summarize(results, topk: int) -> dict:
+    """Aggregate timing + localization metrics over the per-frame results."""
+    done = [r for r in results if "matches" in r]
+    secs = [r["seconds"] for r in results if "seconds" in r]
+    gted = [r for r in done if r.get("gt") and r["matches"]]
+    ks = [k for k in _KS if k <= topk] or [topk]
+    s = {"n_images": len(results), "n_localized": len(done), "n_with_gt": len(gted)}
+    if secs:
+        s["timing_s"] = {"total": round(sum(secs), 1), "mean": round(sum(secs) / len(secs), 2),
+                         "median": round(_median(secs), 2), "min": round(min(secs), 2),
+                         "max": round(max(secs), 2)}
+    if gted:
+        top1 = [r["top1_err_m"] for r in gted if r.get("top1_err_m") is not None]
+        s["top1_err_m"] = {"median": round(_median(top1), 1), "mean": round(sum(top1) / len(top1), 1),
+                           "min": round(min(top1), 1), "max": round(max(top1), 1)}
+        recall = {}
+        for k in ks:
+            for d in _DISTS:
+                hits = sum(1 for r in gted
+                           if any(m.get("dist_m_to_gt", 9e18) <= d for m in r["matches"][:k]))
+                recall["top%d@%dm" % (k, d)] = round(hits / len(gted), 4)
+        s["recall"] = recall
+    return s
+
+
+def _print_summary(s: dict) -> None:
+    print("\n==== SUMMARY ====")
+    print("images=%d  localized=%d  with_gt=%d" % (s["n_images"], s["n_localized"], s["n_with_gt"]))
+    t = s.get("timing_s")
+    if t:
+        print("time/frame s: mean=%.2f median=%.2f min=%.2f max=%.2f | total=%.1fs wall=%.1fs"
+              % (t["mean"], t["median"], t["min"], t["max"], t["total"], s.get("wall_s", t["total"])))
+    e = s.get("top1_err_m")
+    if e:
+        print("top1 err m: median=%.1f mean=%.1f min=%.1f max=%.1f"
+              % (e["median"], e["mean"], e["min"], e["max"]))
+    r = s.get("recall")
+    if r:
+        print("recall (fraction with a top-K cell within D of GT):")
+        for k in _KS:
+            row = ["top%d@%dm=%.3f" % (k, d, r["top%d@%dm" % (k, d)])
+                   for d in _DISTS if "top%d@%dm" % (k, d) in r]
+            if row:
+                print("  " + "  ".join(row))
 
 
 class SingleFrameLocator:
@@ -216,6 +302,8 @@ def main(argv=None) -> int:
                     help="write the combined JSON (list of per-image results) here (default: stdout)")
     ap.add_argument("--out-dir", default=None,
                     help="also write one <stem>.json per image into this dir")
+    ap.add_argument("--no-gt", action="store_true",
+                    help="do NOT parse GT lat/lon from filenames (skip accuracy metrics)")
     args = ap.parse_args(argv)
 
     images = list(args.image)
@@ -238,38 +326,52 @@ def main(argv=None) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
 
     results = []
+    t_start = time.perf_counter()
     for n, path in enumerate(images, 1):
         img = cv2.imread(path, cv2.IMREAD_COLOR)
         if img is None:
-            print(f"[{n}/{len(images)}] SKIP unreadable {path}")
+            print(f"[{n}/{len(images)}] SKIP unreadable {path}", flush=True)
             results.append({"image": path, "error": "unreadable"})
             continue
+        gt = None if args.no_gt else _gt_latlon_from_name(path)
+        t0 = time.perf_counter()
         try:
             matches = loc.localize(img)
         except Exception as e:                           # noqa: BLE001 — one bad frame must not kill the batch
-            print(f"[{n}/{len(images)}] ERROR {path}: {e}")
+            print(f"[{n}/{len(images)}] ERROR {path}: {e}", flush=True)
             results.append({"image": path, "error": str(e)})
             continue
-        rec = {"image": path, "matches": matches}
+        dt = time.perf_counter() - t0
+        rec = {"image": path, "seconds": round(dt, 3), "matches": matches}
+        if gt is not None:
+            rec["gt"] = {"lat": gt[0], "lon": gt[1]}
+            for m in matches:
+                m["dist_m_to_gt"] = round(_haversine_m(gt[0], gt[1], m["coordinates"]["lat"],
+                                                       m["coordinates"]["lon"]), 1)
+            rec["top1_err_m"] = matches[0]["dist_m_to_gt"] if matches else None
         results.append(rec)
         top = matches[0] if matches else None
-        print("[%d/%d] %s → %d matches%s" % (
-            n, len(images), Path(path).name, len(matches),
+        print("[%d/%d] %s → %d matches  %.1fs%s%s" % (
+            n, len(images), Path(path).name, len(matches), dt,
             ("  top=%s (%.4f) %.5f,%.5f L%gm" % (
                 top["tile_key"], top["similarity"], top["coordinates"]["lat"],
-                top["coordinates"]["lon"], top["level_m"]) if top else "")))
+                top["coordinates"]["lon"], top["level_m"]) if top else ""),
+            ("  err=%.0fm" % rec["top1_err_m"]) if rec.get("top1_err_m") is not None else ""),
+            flush=True)
         if out_dir:
             (out_dir / (Path(path).stem + ".json")).write_text(
                 json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    summary = _summarize(results, args.topk)
+    summary["wall_s"] = round(time.perf_counter() - t_start, 1)
     out = {"city": args.city, "k": args.k, "topk": args.topk, "device": loc.device,
-           "n_images": len(images), "results": results}
-    text = json.dumps(out, indent=2, ensure_ascii=False)
+           "n_images": len(images), "summary": summary, "results": results}
     if args.out:
-        Path(args.out).write_text(text, encoding="utf-8")
-        print(f"wrote {len(results)} results → {args.out}")
+        Path(args.out).write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"\nwrote {len(results)} results → {args.out}")
     else:
-        print(text)
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    _print_summary(summary)
     return 0
 
 
