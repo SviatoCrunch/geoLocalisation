@@ -49,6 +49,28 @@ def _haversine_m(a, b, c, d):
     return 2 * r * math.asin(min(1.0, math.sqrt(x)))
 
 
+def _cell_record(cid, s, levels, level_agg, cell_agg, plat, plon, *, dump_levels=False):
+    """Build the per-(query, cell) result from the (P, L) score matrix ``s``.
+
+    Collapses to one best position/level (math UNCHANGED): ``pyr`` aggregates levels per position,
+    ``bi`` is the winning position, ``lvl_i`` the winning level within it, ``cell_score`` the
+    position aggregate. When ``dump_levels``, ALSO records the full per-level vector of the winning
+    position (``level_scores``, length L), the per-position aggregate (``position_scores``, length P),
+    and the winning position index — all already computed here, no extra scoring.
+    """
+    pyr = s.sum(1) if level_agg == "sum" else s.max(1)            # (P,)
+    bi = int(pyr.argmax())
+    cs_ = {"mean": float(pyr.mean()), "min": float(pyr.min()), "max": float(pyr.max())}[cell_agg]
+    lvl_i = int(s[bi].argmax())
+    rec = {"cell_id": cid, "cell_score": cs_, "lat": float(plat[bi]),
+           "lon": float(plon[bi]), "level_m": int(levels[lvl_i])}
+    if dump_levels:
+        rec["level_scores"] = [float(x) for x in s[bi]]          # winning position, all L levels
+        rec["position_scores"] = [float(x) for x in pyr]         # all P positions (level-aggregated)
+        rec["winning_position_idx"] = bi
+    return rec
+
+
 def _candidates(ind, qid):
     """Top-K cell indices for one query, accepting either a shortlist dict or a plain {qid:[idx…]}."""
     if isinstance(ind, dict) and "shortlist" in ind:
@@ -75,7 +97,7 @@ def locate(queries, indices, dataset_dir, *, k_coarse=1000, topk=5, gpu_cells=4,
            level_agg="sum", cell_agg="mean", prefetch=True, device="cuda",
            reproj_thresh=2.0, mpp_sigma_max=2.0, mpp_hyps=256, mpp_irls=1,
            mpp_dtype="float32", mpp_solver="closed_form", mpp_seed=0,
-           match_budget=50_000_000, max_queries=0, out=None, progress=True) -> dict:
+           match_budget=50_000_000, max_queries=0, dump_levels=False, out=None, progress=True) -> dict:
     """Search ``queries`` over the local packed gallery at ``dataset_dir`` using the supplied top-K
     ``indices``. Returns ``{meta, summary, per_query, speed}`` and (if ``out``) writes it as JSON."""
     def say(*a):
@@ -202,13 +224,8 @@ def locate(queries, indices, dataset_dir, *, k_coarse=1000, topk=5, gpu_cells=4,
             for k in range(nc):
                 cid = sub_cids[k]; plat, plon = co[cs + k]
                 for q in qneed[cid]:
-                    s = accq[q][k]
-                    pyr = s.sum(1) if level_agg == "sum" else s.max(1)
-                    bi = int(pyr.argmax())
-                    cs_ = {"mean": float(pyr.mean()), "min": float(pyr.min()), "max": float(pyr.max())}[cell_agg]
-                    lvl_i = int(s[bi].argmax())
-                    qcell[q][cid] = {"cell_id": cid, "cell_score": cs_, "lat": float(plat[bi]),
-                                     "lon": float(plon[bi]), "level_m": int(levels[lvl_i])}
+                    qcell[q][cid] = _cell_record(cid, accq[q][k], levels, level_agg, cell_agg,
+                                                 plat, plon, dump_levels=dump_levels)
         del arr
         if str(dev).startswith("cuda"):
             torch.cuda.synchronize()
@@ -237,8 +254,11 @@ def locate(queries, indices, dataset_dir, *, k_coarse=1000, topk=5, gpu_cells=4,
     if d1:
         summary["top1"] = {f"distR@{int(t)}m": float((np.asarray(d1) <= t).mean()) for t in thr}
         summary[f"top{topk}"] = {f"distR@{int(t)}m": float((np.asarray(dk) <= t).mean()) for t in thr}
-    result = {"meta": {"dataset_dir": dataset_dir, "gpu_cells": gpu_cells, "prefetch": prefetch,
-                       "topk": topk, "level_agg": level_agg, "cell_agg": cell_agg, "device": str(dev)},
+    meta = {"dataset_dir": dataset_dir, "gpu_cells": gpu_cells, "prefetch": prefetch,
+            "topk": topk, "level_agg": level_agg, "cell_agg": cell_agg, "device": str(dev)}
+    if dump_levels:
+        meta["levels_m"] = [int(x) for x in levels]
+    result = {"meta": meta,
               "summary": summary, "per_query": per_query,
               "speed": {"wall_s": wall, "read_s": t_read, "gpu_s": t_gpu, "n_shards": len(files),
                         "n_cells": len(union)}}
@@ -277,6 +297,9 @@ def main(argv=None) -> int:
     ap.add_argument("--match-budget", type=int, default=50_000_000, dest="match_budget")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--max-queries", type=int, default=0, dest="max_queries")
+    ap.add_argument("--dump-levels", dest="dump_levels", action="store_true",
+                    help="also record per-cell full per-level scores (level_scores/position_scores/"
+                         "winning_position_idx) + meta levels_m; default off = byte-identical output")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
 
@@ -285,7 +308,8 @@ def main(argv=None) -> int:
                  level_agg=a.level_agg, cell_agg=a.cell_agg, prefetch=a.prefetch, device=a.device,
                  reproj_thresh=a.reproj_thresh, mpp_sigma_max=a.mpp_sigma_max, mpp_hyps=a.mpp_hyps,
                  mpp_irls=a.mpp_irls, mpp_dtype=a.mpp_dtype, mpp_solver=a.mpp_solver, mpp_seed=a.mpp_seed,
-                 match_budget=a.match_budget, max_queries=a.max_queries, out=a.out)
+                 match_budget=a.match_budget, max_queries=a.max_queries, dump_levels=a.dump_levels,
+                 out=a.out)
     return 0 if res["summary"].get("n_images") else 2
 
 

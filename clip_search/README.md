@@ -93,3 +93,45 @@ per agg×N). A compact table is printed to stdout.
 - `<DICT>/k32.pt` — VLAD assign dict.
 - `<KRAM_COARSE_GALLERY>.h5` — kram coarse cell gallery (group-per-tile `ift_dino`, `lat`/`lon` attrs).
 - `--dataset-dir` — local sync of `kram_newformat/pyramid_dinov2vitg14_p448/kram`.
+
+---
+
+## Alt. frame selection — MOTION-BUDGET over a whole video, driven by the detections CSV
+
+Instead of GT-centred windows, `clip_search.sample_motion` selects frames with the **production
+keyframe recipe** — the quality-gated motion budget from `pipeline1_interframe.build_label_set`
+(`place_in_motion`): DINOv2 quality-gate → good→good Farneback motion → split on quality gaps →
+keyframes spaced evenly in cumulative motion. Input is the labelled-detections CSV
+(`mapforml_public_Detection.csv`, no header, 31 cols); we keep one station-node zone (default the
+Kupyansk node `0-17-34-138`), download each chunk once, select frames, and tag every frame with the
+video's **verified GT** (CSV cols 27/28). Output is a `clips_manifest.json`-compatible manifest (one
+"clip" == one video), so steps 2–5 above run unchanged.
+
+The fine stage records the **full per-level breakdown**: run `pyramid_newformat.locate` with
+`--dump-levels` and it adds `level_scores` (all L pyramid levels of the winning position),
+`position_scores`, and `winning_position_idx` to every one of the top-100 cells per frame.
+`clip_search.report_levels` then joins everything into a detailed report.
+
+One-shot (runs the full 6-stage chain; launch in the background on the GPU box):
+```bash
+cd ~/work/geoLocalisation
+nohup bash clip_search/run_kup_vidloc.sh > ~/work/kup_vidloc/run.log 2>&1 &
+tail -f ~/work/kup_vidloc/run.log
+```
+Override paths via env vars (`CSV`, `OUT`, `CKPT`, `ASSIGN`, `GALLERY`, `DATASET_DIR`,
+`QUALITY_CKPT`, `TARGET_K`, `K`, `DECODE_EVERY`) — see the script header.
+
+Outputs under `$OUT/out/`:
+- `report.csv` — one row per video: GT, predicted (rank-1 of `sum@10`), `dist_m`, hit@{250,500,1000} m, dominant level.
+- `report.json` — per video → per frame → **top-100 cells, each with `levels` = {level_m: score}** for every pyramid level, plus the selected-frame metadata (`frame_index`, `quality`, `file`).
+- `clip_search_results.json` + `kmz/*.kmz` — per-video aggregation (sum/votes/wsum/max/gated) + distR + map pins.
+
+Notes:
+- Heavy stages need a GPU + a local sync of the packed `kup_newformat` store (~86 GiB); cannot run CPU-only.
+- `--decode-every N` subsamples frames before selection for speed (default 1 = faithful to production).
+- Southern zone `40-104-105` is skipped (no gallery coverage) — keep `--zone 0-17-34-138`.
+
+Dry-run (CPU-only, just parses + counts videos):
+```bash
+python -m clip_search.sample_motion --csv <csv> --zone 0-17-34-138 --dry-run
+```

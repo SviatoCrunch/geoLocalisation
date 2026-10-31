@@ -61,7 +61,8 @@ def aggregate_clip(frames_topk: list[list[dict]], top_n: int, *, gate_frac: floa
             if a is None:
                 a = acc[cid] = {"cell_id": cid, "score_sum": 0.0, "votes": 0, "wsum": 0.0,
                                 "score_max": -1e30, "gated_sum": 0.0,
-                                "lat": c["lat"], "lon": c["lon"], "level_m": c.get("level_m"), "_best": -1e30}
+                                "lat": c["lat"], "lon": c["lon"], "level_m": c.get("level_m"),
+                                "level_scores": c.get("level_scores"), "_best": -1e30}
             a["score_sum"] += sc
             a["votes"] += 1
             a["wsum"] += cf * sc
@@ -69,7 +70,8 @@ def aggregate_clip(frames_topk: list[list[dict]], top_n: int, *, gate_frac: floa
             if gk:
                 a["gated_sum"] += sc
             if sc > a["_best"]:                           # strongest frame's position
-                a["_best"] = sc; a["lat"] = c["lat"]; a["lon"] = c["lon"]; a["level_m"] = c.get("level_m")
+                a["_best"] = sc; a["lat"] = c["lat"]; a["lon"] = c["lon"]
+                a["level_m"] = c.get("level_m"); a["level_scores"] = c.get("level_scores")
     cells = list(acc.values())
     for c in cells:
         c.pop("_best", None)

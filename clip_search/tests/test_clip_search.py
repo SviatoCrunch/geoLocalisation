@@ -148,3 +148,17 @@ def test_run_end_to_end(tmp_path):
 
 def test_haversine_zero():
     assert haversine_m(48.0, 37.0, 48.0, 37.0) == 0.0
+
+
+def test_level_scores_flow_through_aggregation():
+    # level_scores from the STRONGEST frame should survive into the aggregated cell
+    frames = [
+        [{"cell_id": "A", "cell_score": 1.0, "lat": 0.0, "lon": 0.0, "level_m": 1000,
+          "level_scores": [1.0, 0.0]}],
+        [{"cell_id": "A", "cell_score": 9.0, "lat": 0.0, "lon": 0.0, "level_m": 500,
+          "level_scores": [0.0, 9.0]}],
+    ]
+    agg = aggregate_clip(frames, top_n=50)
+    a = agg["sum"][0]
+    assert a["cell_id"] == "A" and a["score_sum"] == 10.0
+    assert a["level_m"] == 500 and a["level_scores"] == [0.0, 9.0]   # from the score-9 frame
