@@ -45,19 +45,29 @@ else
 fi
 
 # 2. embed selected frames → query H5 (SAME backbone/proj as the kup gallery)
-$PYUV python -m map_extract.extract --images "$OUT/frames" \
-  --out "$OUT/query_d1024.h5" --backbone dinov2_vitg14 --desc_dim 1024 \
-  --proj_seed 0 --segment_sky --device cuda --amp
+if [ -f "$OUT/query_d1024.h5" ]; then
+  echo "[run] stage 2 skipped (exists: $OUT/query_d1024.h5)"
+else
+  $PYUV python -m map_extract.extract --images "$OUT/frames" \
+    --out "$OUT/query_d1024.h5" --backbone dinov2_vitg14 --desc_dim 1024 \
+    --proj_seed 0 --segment_sky --device cuda --amp
+fi
 
 # 3. coarse shortlist — top-K cells per frame
-$PYUV python -m geo_e2c_train.coarse_rank_gallery --ckpt "$CKPT" --assign "$ASSIGN" \
-  --gallery "$CITY=$GALLERY" --queries "$CITY=$OUT/query_d1024.h5" \
-  --city "$CITY" --k "$K" --device cuda --out "$OUT/shortlist_k${K}.json"
+if [ -f "$OUT/shortlist_k${K}.json" ]; then
+  echo "[run] stage 3 skipped (exists: $OUT/shortlist_k${K}.json)"
+else
+  $PYUV python -m geo_e2c_train.coarse_rank_gallery --ckpt "$CKPT" --assign "$ASSIGN" \
+    --gallery "$CITY=$GALLERY" --queries "$CITY=$OUT/query_d1024.h5" \
+    --city "$CITY" --k "$K" --device cuda --out "$OUT/shortlist_k${K}.json"
+fi
 
-# 4. fine MAGSAC++ rerank + FULL per-level dump (keep all K cells per frame)
+# 4. fine MAGSAC++ rerank + FULL per-level dump (keep all K cells per frame).
+# --no-prefetch: one shard read-buffer (~16.8 GB) instead of two — the 2-buffer prefetch
+# (~33.6 GB) OOMs a 30 GiB host. gpu_cells is GPU-mem, unrelated to this host-RAM buffer.
 $PYUV python -m pyramid_newformat.locate --queries "$CITY=$OUT/query_d1024.h5" \
   --indices "$OUT/shortlist_k${K}.json" --dataset-dir "$DATASET_DIR" \
-  --topk "$K" --dump-levels --device cuda --out "$OUT/locate_k${K}.json"
+  --topk "$K" --dump-levels --no-prefetch --device cuda --out "$OUT/locate_k${K}.json"
 
 # 5. per-video aggregation + distR + KMZ (keep top-100 aggregated cells)
 $PYUV python -m clip_search.aggregate --locate "$OUT/locate_k${K}.json" \
