@@ -26,19 +26,23 @@ QUALITY_SRC=${QUALITY_SRC:-$HOME/work/RevisitAnything/quality-cls/src}
 TARGET_K=${TARGET_K:-8}
 K=${K:-100}
 DECODE_EVERY=${DECODE_EVERY:-1}
-PYUV=${PYUV:-uv run --python 3.11 --with "torch==2.5.1" --with h5py --with numpy --with boto3 --with tqdm --with pillow}
+PYUV=${PYUV:-uv run --python 3.11 --extra-index-url https://download.pytorch.org/whl/cu121 --with torch==2.5.1+cu121 --with torchvision==0.20.1 --with h5py --with numpy --with boto3 --with tqdm --with pillow}
 
 mkdir -p "$OUT"
 echo "[run] CSV=$CSV OUT=$OUT zone=$ZONE city=$CITY target_k=$TARGET_K k=$K"
 
 # 1. motion-budget frame selection (production recipe: quality-gated place_in_motion)
-PYTHONPATH="$QUALITY_SRC" uv run --python 3.12 \
-  --extra-index-url https://download.pytorch.org/whl/cu121 \
-  --with torch==2.5.1+cu121 --with torchvision==0.20.1 --with opencv-python-headless \
-  --with numpy --with pillow --with pyyaml --with pandas \
-  python -m clip_search.sample_motion --csv "$CSV" --zone "$ZONE" --city "$CITY" \
-    --out-dir "$OUT" --quality-gate good --target-k "$TARGET_K" --decode-every "$DECODE_EVERY" \
-    --checkpoint "$QUALITY_CKPT"
+if [ -f "$OUT/clips_manifest.json" ]; then
+  echo "[run] stage 1 skipped (exists: $OUT/clips_manifest.json)"
+else
+  PYTHONPATH="$QUALITY_SRC" uv run --python 3.12 \
+    --extra-index-url https://download.pytorch.org/whl/cu121 \
+    --with torch==2.5.1+cu121 --with torchvision==0.20.1 --with opencv-python-headless \
+    --with numpy --with pillow --with pyyaml --with pandas \
+    python -m clip_search.sample_motion --csv "$CSV" --zone "$ZONE" --city "$CITY" \
+      --out-dir "$OUT" --quality-gate good --target-k "$TARGET_K" --decode-every "$DECODE_EVERY" \
+      --checkpoint "$QUALITY_CKPT"
+fi
 
 # 2. embed selected frames → query H5 (SAME backbone/proj as the kup gallery)
 $PYUV python -m map_extract.extract --images "$OUT/frames" \
