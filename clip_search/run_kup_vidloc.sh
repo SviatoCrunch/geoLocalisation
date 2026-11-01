@@ -26,7 +26,7 @@ QUALITY_SRC=${QUALITY_SRC:-$HOME/work/RevisitAnything/quality-cls/src}
 TARGET_K=${TARGET_K:-8}
 K=${K:-100}
 DECODE_EVERY=${DECODE_EVERY:-1}
-PYUV=${PYUV:-uv run --python 3.11 --extra-index-url https://download.pytorch.org/whl/cu121 --with torch==2.5.1+cu121 --with torchvision==0.20.1 --with opencv-python-headless --with scipy --with h5py --with numpy --with boto3 --with tqdm --with pillow}
+PYUV=${PYUV:-uv run --python 3.11 --extra-index-url https://download.pytorch.org/whl/cu121 --with torch==2.5.1+cu121 --with torchvision==0.20.1 --with opencv-python-headless --with scipy --with onnxruntime --with h5py --with numpy --with boto3 --with tqdm --with pillow}
 
 mkdir -p "$OUT"
 echo "[run] CSV=$CSV OUT=$OUT zone=$ZONE city=$CITY target_k=$TARGET_K k=$K"
