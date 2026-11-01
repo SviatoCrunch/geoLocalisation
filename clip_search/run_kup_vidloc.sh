@@ -41,7 +41,7 @@ else
     --with numpy --with pillow --with pyyaml --with pandas \
     python -m clip_search.sample_motion --csv "$CSV" --zone "$ZONE" --city "$CITY" \
       --out-dir "$OUT" --quality-gate good --target-k "$TARGET_K" --decode-every "$DECODE_EVERY" \
-      --checkpoint "$QUALITY_CKPT"
+      --checkpoint "$QUALITY_CKPT" ${LIMIT:+--limit $LIMIT}
 fi
 
 # 2. embed selected frames → query H5 (SAME backbone/proj as the kup gallery)
