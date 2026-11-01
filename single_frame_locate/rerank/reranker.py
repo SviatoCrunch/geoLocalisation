@@ -152,7 +152,7 @@ def _prefetched_cells(store, cand_cell_ids, bufsize: int = 2):
 
 
 def _score_cell_multiframe(cd, q_norm_list, q_xys, reproj_thresh, level_agg,
-                           cfg, device, gen, minm, mdtype):
+                           cfg, device, gen, minm, mdtype, raw_sink=None):
     """Score ONE cell against ALL F query frames, GPU-batched over the cell grids.
 
     q_norm_list: list of F L2-normalised query token grids on `device` (fp16 on
@@ -195,6 +195,12 @@ def _score_cell_multiframe(cd, q_norm_list, q_xys, reproj_thresh, level_agg,
     for f in range(F_):
         n_q = int(q_norm_list[f].shape[0])
         sc = {keys[gi]: (cnts[f * G + gi] / n_q if n_q else 0.0) for gi in range(G)}
+        if raw_sink is not None:                                  # full (pos×level) matrix, no collapse
+            raw_sink.append({"frame": f, "cell": cd.cell_id,
+                             "levels": [int(x) for x in cd.levels],
+                             "lat": [float(x) for x in cd.lat], "lon": [float(x) for x in cd.lon],
+                             "sc": {f"{i}_{int(Lm)}": float(sc[(i, Lm)])
+                                    for i in range(cd.n_pos) for Lm in cd.levels}})
         pyr, blv = [], []
         for i in range(cd.n_pos):
             per = {Lm: sc[(i, Lm)] for Lm in cd.levels}

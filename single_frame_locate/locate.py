@@ -327,7 +327,8 @@ class SingleFrameLocator:
     # -- fine rerank for a GROUP of frames: each cell of the UNION is read/built ONCE and matched
     #    against ALL frames in one batched fp16 pass (server _score_cell_multiframe compute); every
     #    frame then ranks ONLY its own coarse candidates → per-frame top-K, shared compute --
-    def _rerank_group(self, tokens_list, xy_list, cand_tis_list, topk: int) -> list[list[dict]]:
+    def _rerank_group(self, tokens_list, xy_list, cand_tis_list, topk: int,
+                      raw_sink=None) -> list[list[dict]]:
         import torch
 
         from .rerank.reranker import (_MIN_MATCHES, _mpp_config, _prefetched_cells,
@@ -350,7 +351,7 @@ class SingleFrameLocator:
             if cd is None:
                 continue
             scored[cid] = _score_cell_multiframe(cd, q_norm, q_xys, self.rerank_reproj, "sum",
-                                                 cfg, device, gen, minm, mdtype)
+                                                 cfg, device, gen, minm, mdtype, raw_sink=raw_sink)
         out = []
         for f in range(len(tokens_list)):
             recs = []
@@ -366,9 +367,11 @@ class SingleFrameLocator:
             out.append(recs)
         return out
 
-    def localize_group(self, frames_bgr: list, *, top: int | None = None) -> list[list[dict]]:
+    def localize_group(self, frames_bgr: list, *, top: int | None = None,
+                       raw_sink=None) -> list[list[dict]]:
         """Localize G frames together (shared cell reads + batched GPU match). Returns a per-frame
-        list of top-K match dicts — each frame keeps its OWN answer. For G==1 this equals localize()."""
+        list of top-K match dicts — each frame keeps its OWN answer. For G==1 this equals localize().
+        ``raw_sink`` (list) collects the FULL per-(frame,cell,pos,level) score matrix (no collapse)."""
         top = int(top or self.rerank_topk or 10)
         tokens_list, xy_list, cand_list = [], [], []
         for img in frames_bgr:
@@ -377,7 +380,8 @@ class SingleFrameLocator:
             tokens_list.append(tokens)
             xy_list.append(xy)
             cand_list.append([ti for ti, _ in coarse])
-        recs_per_frame = self._rerank_group(tokens_list, xy_list, cand_list, self.rerank_topk or top)
+        recs_per_frame = self._rerank_group(tokens_list, xy_list, cand_list, self.rerank_topk or top,
+                                            raw_sink=raw_sink)
         return [[self._match_reranked(rec, r) for r, rec in enumerate(recs, 1)]
                 for recs in recs_per_frame]
 
@@ -422,6 +426,10 @@ def main(argv=None) -> int:
                     help="also write one <stem>.json per image into this dir")
     ap.add_argument("--no-gt", action="store_true",
                     help="do NOT parse GT lat/lon from filenames (skip accuracy metrics)")
+    ap.add_argument("--dump-raw", default=None,
+                    help="also write a CSV of EVERY (frame,cell,position,level_m,score) — the full "
+                         "un-collapsed inlier-ratio matrix (frames×cells×positions×levels). Forces the "
+                         "grouped path so all frames are scored in one pass.")
     args = ap.parse_args(argv)
 
     images = list(args.image)
@@ -458,6 +466,12 @@ def main(argv=None) -> int:
     g_size = max(1, args.frame_batch)
     results = []
     done = 0
+    raw_fh = raw_w = None
+    if args.dump_raw:
+        import csv as _csv
+        raw_fh = open(args.dump_raw, "w", newline="", encoding="utf-8")
+        raw_w = _csv.writer(raw_fh)
+        raw_w.writerow(["frame", "cell", "pos", "level_m", "score", "pos_lat", "pos_lon"])
     t_start = time.perf_counter()
     for c0 in range(0, len(images), g_size):
         chunk = images[c0:c0 + g_size]
@@ -484,8 +498,12 @@ def main(argv=None) -> int:
                 bar.update(len(chunk))
             continue
         t0 = time.perf_counter()
+        grp_raw = [] if args.dump_raw else None
         try:
-            per_frame = loc.localize_group(imgs) if g_size > 1 else [loc.localize(imgs[0])]
+            if args.dump_raw:                            # force grouped path to capture the raw matrix
+                per_frame = loc.localize_group(imgs, raw_sink=grp_raw)
+            else:
+                per_frame = loc.localize_group(imgs) if g_size > 1 else [loc.localize(imgs[0])]
         except Exception as e:                           # noqa: BLE001 — one bad group must not kill the batch
             _emit("ERROR group @%d (%d frames): %s" % (c0, len(imgs), e))
             for p in paths_ok:
@@ -519,6 +537,17 @@ def main(argv=None) -> int:
             if out_dir:
                 (out_dir / (Path(p).stem + ".json")).write_text(
                     json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
+        if raw_w is not None and grp_raw:                # full (frame,cell,pos,level) matrix → CSV
+            for rr in grp_raw:
+                fi = rr["frame"]
+                if fi >= len(paths_ok):
+                    continue
+                stem = Path(paths_ok[fi]).stem
+                la, lo = rr["lat"], rr["lon"]
+                for key, val in rr["sc"].items():
+                    i_s, L_s = key.split("_")
+                    i = int(i_s)
+                    raw_w.writerow([stem, rr["cell"], i, int(L_s), val, la[i], lo[i]])
         if bar:
             bar.update(len(chunk))
             bar.set_postfix_str("G=%d %.1fs/f vram=%.1fGB load=%.1f" % (len(imgs), per_s, gr, l1))
@@ -526,6 +555,9 @@ def main(argv=None) -> int:
             torch.cuda.empty_cache()
     if bar:
         bar.close()
+    if raw_fh is not None:
+        raw_fh.close()
+        print(f"wrote full (frame,cell,pos,level) score matrix → {args.dump_raw}")
 
     summary = _summarize(results, args.topk)
     summary["wall_s"] = round(time.perf_counter() - t_start, 1)
